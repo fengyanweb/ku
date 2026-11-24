@@ -66,6 +66,35 @@ pub fn generate(root: &Path, out: &Path) {
     );
     replace(
         &mut code,
+        part(
+            &source,
+            "    fn interop_for_module(",
+            "    fn expand_program(",
+        ),
+        "",
+    );
+    replace(
+        &mut code,
+        "    interop_bindings: HashMap<PathBuf, String>,\n    interop_mode: DependencyResolveMode,\n    interop_delivery: Option<(PathBuf, bool)>,\n    uses_package_import: bool,\n",
+        "",
+    );
+    replace(
+        &mut code,
+        "            interop_bindings: HashMap::new(),\n            interop_mode: DependencyResolveMode::Update,\n            interop_delivery: None,\n            uses_package_import: false,\n",
+        "",
+    );
+    replace(
+        &mut code,
+        "        let bridge = if is_entry {\n            None\n        } else {\n            self.interop_for_module(path)?\n        };",
+        "        let bridge: Option<String> = None;",
+    );
+    replace(
+        &mut code,
+        "            self.uses_package_import |= import\n                .path\n                .strip_prefix('@')\n                .and_then(|path| path.split_once('/'))\n                .zip(self.package.as_ref())\n                .is_some_and(|((name, _), package)| name != package.manifest.name);\n",
+        "",
+    );
+    replace(
+        &mut code,
         "struct ModuleLoader {",
         "struct ModuleLoader<'a> {",
     );

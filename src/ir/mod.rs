@@ -23,10 +23,15 @@ use budget::{LowerBudget, LowerLimits};
 macro_rules! emit_ir_instruction {
     ($lower:expr, $instruction:expr) => {{
         $lower.admit_instruction()?;
-        $lower.current.instructions.push($instruction);
+        let instruction = $instruction;
+        $lower.record_scope_owner(&instruction);
+        $lower.current.instructions.push(instruction);
     }};
 }
 mod monomorph;
+mod nullable;
+mod object_pattern;
+mod optional_field;
 /// Internal typed frame IR. This does not open the CLI's native async boundary.
 pub mod task;
 /// Experimental bounded source Task lowering, distinct from synchronous IR.
@@ -97,6 +102,9 @@ pub struct IrFieldLayout {
     pub name: String,
     pub ty: IrType,
     pub offset: usize,
+    /// Async and synchronous function declarations share the closure shape in
+    /// `IrType` but require distinct calling conventions.
+    pub is_async_callable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -312,6 +320,8 @@ pub enum IrType {
     Null,
     Array(Box<IrType>),
     Result(Box<IrType>),
+    /// A flat null tag and one typed payload. Existing non-null ABIs stay unchanged.
+    Nullable(Box<IrType>),
     Named(String),
     Function,
     Closure {
@@ -338,15 +348,16 @@ struct FunctionSig {
 /// fresh owned rvalue (a literal, call, or arithmetic result). A place is still owned
 /// by its binding, so it must not be materialized/moved when only borrowed.
 fn ir_expr_is_place(expr: &IrExpr) -> bool {
-    matches!(
-        expr.kind,
-        IrExprKind::Local(_)
-            | IrExprKind::Temp(_)
-            | IrExprKind::Field { .. }
-            | IrExprKind::Index { .. }
-            | IrExprKind::CapturedCell(_)
-            | IrExprKind::CellLoad(_)
-    )
+    matches!(&expr.kind, IrExprKind::Call { kind: IrCallKind::Intrinsic(name), .. } if name == "__ku_nullable_get")
+        || matches!(
+            expr.kind,
+            IrExprKind::Local(_)
+                | IrExprKind::Temp(_)
+                | IrExprKind::Field { .. }
+                | IrExprKind::Index { .. }
+                | IrExprKind::CapturedCell(_)
+                | IrExprKind::CellLoad(_)
+        )
 }
 
 /// A fresh root created while evaluating this call must outlive its borrowed
@@ -372,6 +383,27 @@ pub(crate) fn ir_expr_is_borrowed(expr: &IrExpr) -> bool {
         IrExprKind::Field { target, .. } | IrExprKind::Index { target, .. } => {
             ir_expr_is_borrowed(target)
         }
+        IrExprKind::Call {
+            kind: IrCallKind::Intrinsic(name),
+            args,
+            ..
+        } if name == "__ku_nullable_get" => args.first().is_some_and(ir_expr_is_borrowed),
+        IrExprKind::Call {
+            kind: IrCallKind::Intrinsic(name),
+            args,
+            ..
+        } if name == "__ku_optional_select" => args.get(1).is_some_and(ir_expr_is_borrowed),
+        IrExprKind::Call {
+            kind: IrCallKind::Intrinsic(name),
+            args,
+            ..
+        } if matches!(
+            name.as_str(),
+            "__ku_object_optional_field_view" | "__ku_value_optional_field_view"
+        ) =>
+        {
+            args.first().is_some_and(ir_expr_is_borrowed)
+        }
         _ => false,
     }
 }
@@ -382,9 +414,10 @@ pub(crate) fn ir_expr_is_borrowed(expr: &IrExpr) -> bool {
 fn ir_type_is_owned(ty: &IrType) -> bool {
     match ty {
         IrType::Str | IrType::Array(_) | IrType::Result(_) | IrType::Closure { .. } => true,
-        // The native Time ABI is a tagged, by-value pair. It is intentionally
-        // distinct from a dynamic object and carries no heap ownership.
-        IrType::Named(name) => name != TIME_TYPE,
+        IrType::Nullable(inner) => ir_type_is_owned(inner),
+        // Native Time/Duration are tagged, by-value pairs, distinct from
+        // dynamic objects and carrying no heap ownership.
+        IrType::Named(name) => name != TIME_TYPE && name != DURATION_TYPE,
         _ => false,
     }
 }
@@ -406,11 +439,19 @@ pub struct MixedAsyncHandler {
 }
 
 pub fn lower_mixed_http_setup(program: &Program) -> KuResult<(IrProgram, Vec<MixedAsyncHandler>)> {
+    lower_mixed_http_setup_with_fields(program, Default::default())
+}
+
+pub(crate) fn lower_mixed_http_setup_with_fields(
+    program: &Program,
+    fields: crate::checker::NativeFieldFacts,
+) -> KuResult<(IrProgram, Vec<MixedAsyncHandler>)> {
     let handlers = Rc::new(RefCell::new(Vec::new()));
     let lowered = lower_program_mode(
         program,
         Rc::new(RefCell::new(LowerBudget::new(LowerLimits::default()))),
         Some(handlers.clone()),
+        Rc::new(fields),
     )?;
     let handlers = std::mem::take(&mut *handlers.borrow_mut());
     if handlers.is_empty() {
@@ -441,13 +482,14 @@ fn lower_program_with_budget(
     program: &Program,
     budget: Rc<RefCell<LowerBudget>>,
 ) -> KuResult<IrProgram> {
-    lower_program_mode(program, budget, None)
+    lower_program_mode(program, budget, None, Default::default())
 }
 
 fn lower_program_mode(
     program: &Program,
     budget: Rc<RefCell<LowerBudget>>,
     mixed_async: Option<Rc<RefCell<Vec<MixedAsyncHandler>>>>,
+    fields: Rc<crate::checker::NativeFieldFacts>,
 ) -> KuResult<IrProgram> {
     if mixed_async.is_none() {
         crate::ast::reject_compiled_async(
@@ -525,6 +567,7 @@ fn lower_program_mode(
                 function.span,
             )?;
             probe.mixed_async = mixed_async.clone();
+            probe.native_fields = fields.clone();
             if let Some(sig) = signatures.get(&function.name) {
                 budget
                     .borrow_mut()
@@ -553,6 +596,15 @@ fn lower_program_mode(
                         continue;
                     };
                     if value.ty == IrType::Unknown {
+                        continue;
+                    }
+                    // An untyped err() carries no success-payload evidence.
+                    // Retain it for err-only bodies, but let a later ok(value)
+                    // determine the real Result ABI before real lowering.
+                    if matches!(&value.ty, IrType::Result(inner) if **inner == IrType::Unknown) {
+                        if matches!(found, IrType::Void | IrType::Null) {
+                            found = value.ty.clone();
+                        }
                         continue;
                     }
                     if value.ty == IrType::Null {
@@ -609,6 +661,7 @@ fn lower_program_mode(
                 function.span,
             )?;
             lower.mixed_async = mixed_async.clone();
+            lower.native_fields = fields.clone();
             for param in &params {
                 lower.locals.insert(param.name.clone(), param.ty.clone());
             }
@@ -867,11 +920,18 @@ fn fold_binary(left: &IrExpr, op: BinaryOp, right: &IrExpr) -> Option<IrExpr> {
 }
 
 fn remove_unreachable_blocks(function: &mut IrFunction) {
-    let Some(entry) = function.blocks.first().map(|block| block.id) else {
-        return;
+    let reachable = reachable_block_ids(&function.blocks);
+    function
+        .blocks
+        .retain(|block| reachable.contains(&block.id));
+}
+
+fn reachable_block_ids(blocks: &[IrBlock]) -> HashSet<BlockId> {
+    let Some(entry) = blocks.first().map(|block| block.id) else {
+        return HashSet::new();
     };
     let mut index_by_id = HashMap::new();
-    for (index, block) in function.blocks.iter().enumerate() {
+    for (index, block) in blocks.iter().enumerate() {
         index_by_id.insert(block.id, index);
     }
     let mut stack = vec![entry];
@@ -884,15 +944,13 @@ fn remove_unreachable_blocks(function: &mut IrFunction) {
             continue;
         };
         for target in terminator_successors(
-            &function.blocks[index].terminator,
-            function.blocks.get(index + 1).map(|block| block.id),
+            &blocks[index].terminator,
+            blocks.get(index + 1).map(|block| block.id),
         ) {
             stack.push(target);
         }
     }
-    function
-        .blocks
-        .retain(|block| reachable.contains(&block.id));
+    reachable
 }
 
 fn terminator_successors(terminator: &IrTerminator, next: Option<BlockId>) -> Vec<BlockId> {
@@ -1033,6 +1091,7 @@ impl fmt::Display for IrType {
             IrType::Null => write!(f, "null"),
             IrType::Array(inner) => write!(f, "[{inner}]"),
             IrType::Result(inner) => write!(f, "{inner}!"),
+            IrType::Nullable(inner) => write!(f, "{inner} | null"),
             IrType::Named(name) => write!(f, "{}", enum_type_name(name).unwrap_or(name)),
             IrType::Function => write!(f, "function"),
             IrType::Closure { .. } => write!(f, "closure"),
@@ -1222,7 +1281,9 @@ struct FunctionLowerer<'a> {
     span: Span,
     signatures: &'a HashMap<String, FunctionSig>,
     layouts: &'a IrLayoutTable,
+    native_fields: Rc<crate::checker::NativeFieldFacts>,
     return_type: IrType,
+    inferred_closure_returns: Option<Vec<(BlockId, IrType)>>,
     locals: HashMap<String, IrType>,
     borrowed_params: HashSet<String>,
     /// Source spellings resolve to unique C/IR names while a lexical binding is
@@ -1237,6 +1298,10 @@ struct FunctionLowerer<'a> {
     next_temp_id: usize,
     try_handlers: Vec<IrTryHandler>,
     cleanup_attempts: Vec<IrCleanupAttempt>,
+    loops: Vec<IrLoopContext>,
+    /// Declaration order, including temporary owners. The C emitter applies
+    /// its final owning/borrowed classification to cleanup markers.
+    scope_owners: Vec<String>,
     pending_borrow_temporaries: Vec<PendingBorrowTemporary>,
     pattern_bindings: HashMap<String, IrExpr>,
     /// Program-global FunctionId allocator, shared between the top-level lowerer
@@ -1255,6 +1320,9 @@ struct FunctionLowerer<'a> {
     /// `CellLoad(CapturedCell(name))`; writes become
     /// `CellStore{CapturedCell(name), ..}`. Empty for top-level functions.
     captures: HashMap<String, IrType>,
+    /// Non-null/null read facts keyed by the stable IR binding name, never by a
+    /// source spelling that can be shadowed. Storage types remain Nullable.
+    nullable_facts: HashMap<String, bool>,
     /// Stage 6f: inside a lifted local-named-function body, the function's own
     /// name plus the lifted function id and its return type. A call to this name
     /// in the body lowers to a direct call to the lifted function threading the
@@ -1324,11 +1392,31 @@ impl BodyParameter for crate::ast::FunctionParam {
 struct IrTryHandler {
     error_block: BlockId,
     error_name: String,
+    loop_floor: usize,
     return_block: Option<BlockId>,
     return_name: Option<String>,
     /// The reason belongs to this pending return, never the whole frame.
     /// Every incoming return edge overwrites it, including loop reentry.
     return_reason: Option<String>,
+    finally_scope: Option<Rc<IrFinallyScope>>,
+}
+
+#[derive(Debug)]
+struct IrFinallyScope {
+    body: Vec<Stmt>,
+    aliases: HashMap<String, String>,
+    patterns: HashMap<String, IrExpr>,
+    owner_floor: usize,
+}
+
+#[derive(Debug, Clone)]
+struct IrLoopContext {
+    break_block: BlockId,
+    continue_block: BlockId,
+    foreach_block: Option<BlockId>,
+    handler_floor: usize,
+    cleanup_floor: usize,
+    owner_floor: usize,
 }
 
 /// A shared return-finally is a termination cleanup attempt only when its
@@ -1369,7 +1457,9 @@ impl<'a> FunctionLowerer<'a> {
             span,
             signatures,
             layouts,
+            native_fields: Default::default(),
             return_type,
+            inferred_closure_returns: None,
             locals: HashMap::new(),
             borrowed_params: HashSet::new(),
             local_names: HashMap::new(),
@@ -1385,12 +1475,15 @@ impl<'a> FunctionLowerer<'a> {
             next_temp_id: 0,
             try_handlers: Vec::new(),
             cleanup_attempts: Vec::new(),
+            loops: Vec::new(),
+            scope_owners: Vec::new(),
             pending_borrow_temporaries: Vec::new(),
             pattern_bindings: HashMap::new(),
             next_function_id,
             lifted_functions,
             boxed: HashSet::new(),
             captures: HashMap::new(),
+            nullable_facts: HashMap::new(),
             self_recurse: None,
             self_param_modes: Vec::new(),
             mixed_async: None,
@@ -1608,13 +1701,19 @@ impl<'a> FunctionLowerer<'a> {
                 self.store_or_define_name(name, value, span, define_boxed)?;
             }
             Stmt::AssignTarget { target, value, .. } => {
-                let value = self.lower_expr(value)?;
+                let expected = if matches!(value.kind, ExprKind::Array(_)) {
+                    self.static_assignment_array_type(target)
+                } else {
+                    None
+                };
+                let value = self.lower_expr_with_expected(value, expected.as_ref())?;
                 // Match the interpreter: evaluate the RHS completely before any
                 // index expression in the destination. Materializing here also
                 // prevents a later target-side effect from changing a local/field
                 // that the RHS merely referenced.
                 let value = self.emit_temp(value)?;
                 let target = self.lower_lvalue(target)?;
+                let value = nullable::coerce(value, Some(&self.lvalue_read_expr(&target).ty));
                 emit_ir_instruction!(self, IrInst::Store { target, value });
             }
             Stmt::CompoundAssign {
@@ -1668,7 +1767,14 @@ impl<'a> FunctionLowerer<'a> {
                     }
                 }
                 let target = self.lower_lvalue_cached(target)?;
-                let left = self.lvalue_read_expr(&target);
+                let mut left = self.lvalue_read_expr(&target);
+                if matches!(&left.kind,IrExprKind::Call {kind:IrCallKind::Intrinsic(name),..}
+                    if matches!(name.as_str(),"__ku_calendar_field_int"|"__ku_calendar_field_str"|"__ku_http_client_config_field_int"|"__ku_http_client_config_field_str"))
+                {
+                    // The string getter creates an independent owner. Register
+                    // it before arithmetic/store, including signal exits.
+                    left = self.emit_temp(left)?;
+                }
                 let value = self.emit_temp(IrExpr {
                     ty: binary_type(*op, &left.ty, &right.ty),
                     kind: IrExprKind::Binary {
@@ -1709,12 +1815,12 @@ impl<'a> FunctionLowerer<'a> {
                     self.store_or_define_name(name, value, *span, define_boxed)?;
                 }
             }
-            Stmt::ObjectDestructureAssign { span, .. } => {
-                return Err(KuError::runtime(
-                    "IR/native lowering does not support object destructuring yet; use interpreter mode or destructure fields explicitly",
-                    *span,
-                ));
-            }
+            Stmt::ObjectDestructureAssign {
+                bindings,
+                rest,
+                value,
+                span,
+            } => self.lower_object_pattern(bindings, rest.as_ref(), value, *span)?,
             Stmt::If {
                 condition,
                 then_branch,
@@ -1733,12 +1839,8 @@ impl<'a> FunctionLowerer<'a> {
                 let iterable = self.lower_expr(iterable)?;
                 self.lower_for(name, iterable, body, *span)?;
             }
-            Stmt::Break { span } | Stmt::Continue { span } => {
-                return Err(KuError::runtime(
-                    "break/continue are not supported by IR/native lowering yet",
-                    *span,
-                ));
-            }
+            Stmt::Break { span } => self.lower_loop_control(false, *span)?,
+            Stmt::Continue { span } => self.lower_loop_control(true, *span)?,
             Stmt::Function(function) => self.lower_local_function(function)?,
             Stmt::Try {
                 body,
@@ -1795,10 +1897,28 @@ impl<'a> FunctionLowerer<'a> {
                     .as_ref()
                     .map(|value| self.lower_expr_with_expected(value, Some(&expected)))
                     .transpose()?;
+                if let Some(returns) = &mut self.inferred_closure_returns {
+                    returns.push((
+                        self.current.id,
+                        value
+                            .as_ref()
+                            .map_or(IrType::Null, |value| value.ty.clone()),
+                    ));
+                }
+                let value = value.or_else(|| {
+                    matches!(expected, IrType::Nullable(_)).then(|| zero_expr(expected))
+                });
                 self.current.terminator = self.return_terminator(value)?;
             }
             Stmt::Print { value, .. } => {
-                let value = self.lower_expr(value)?;
+                let mut value = self.lower_expr(value)?;
+                if value.ty == IrType::Named(HTTP_RESPONSE_TYPE.into()) {
+                    value = self.emit_temp(intrinsic_expr(
+                        "__ku_http_response_public_value",
+                        vec![value],
+                        IrType::Named("__ku_value".into()),
+                    ))?;
+                }
                 emit_ir_instruction!(self, IrInst::Print(value));
             }
             Stmt::Expr { expr: value, .. } => {
@@ -1825,7 +1945,9 @@ impl<'a> FunctionLowerer<'a> {
         then_branch: &[Stmt],
         else_branch: &[Stmt],
     ) -> KuResult<()> {
-        let condition = self.lower_expr(condition)?;
+        let condition_expr = condition;
+        let condition = self.lower_expr(condition_expr)?;
+        let before_facts = self.nullable_facts.clone();
         let then_id = self.next_block("then")?;
         let else_id = self.next_block("else")?;
         let after_id = self.next_block("after")?;
@@ -1837,32 +1959,52 @@ impl<'a> FunctionLowerer<'a> {
         self.finish_current()?;
 
         self.start_block(then_id, "then");
+        self.apply_nullable_condition(condition_expr, true);
         self.lower_scoped_statements(then_branch)?;
+        let then_falls = self.current.terminator == IrTerminator::Next;
+        let then_facts = self.nullable_facts.clone();
         if self.current.terminator == IrTerminator::Next {
             self.current.terminator = IrTerminator::Jump(after_id);
         }
         self.finish_current()?;
 
         self.start_block(else_id, "else");
+        self.nullable_facts = before_facts.clone();
+        self.apply_nullable_condition(condition_expr, false);
         self.lower_scoped_statements(else_branch)?;
+        let else_falls = self.current.terminator == IrTerminator::Next;
+        let else_facts = self.nullable_facts.clone();
         if self.current.terminator == IrTerminator::Next {
             self.current.terminator = IrTerminator::Jump(after_id);
         }
         self.finish_current()?;
 
         self.start_block(after_id, "after");
+        self.nullable_facts = match (then_falls, else_falls) {
+            (true, true) => then_facts
+                .into_iter()
+                .filter(|(name, fact)| else_facts.get(name) == Some(fact))
+                .collect(),
+            (true, false) => then_facts,
+            (false, true) => else_facts,
+            (false, false) => before_facts,
+        };
         Ok(())
     }
 
     fn lower_while(&mut self, condition: &Expr, body: &[Stmt]) -> KuResult<()> {
+        let owner_floor = self.scope_owners.len();
         let cond_id = self.next_block("while_cond")?;
         let body_id = self.next_block("while_body")?;
+        let backedge_id = self.next_block("while_backedge")?;
         let after_id = self.next_block("while_after")?;
         self.current.terminator = IrTerminator::Jump(cond_id);
         self.finish_current()?;
 
         self.start_block(cond_id, "while_cond");
-        let condition = self.lower_expr(condition)?;
+        let condition_expr = condition;
+        let condition = self.lower_expr(condition_expr)?;
+        let before_facts = self.nullable_facts.clone();
         self.current.terminator = IrTerminator::Branch {
             condition,
             then_block: body_id,
@@ -1871,17 +2013,37 @@ impl<'a> FunctionLowerer<'a> {
         self.finish_current()?;
 
         self.start_block(body_id, "while_body");
-        self.lower_scoped_statements(body)?;
+        self.apply_nullable_condition(condition_expr, true);
+        self.loops.push(IrLoopContext {
+            break_block: after_id,
+            continue_block: backedge_id,
+            foreach_block: None,
+            handler_floor: self.try_handlers.len(),
+            cleanup_floor: self.cleanup_attempts.len(),
+            owner_floor,
+        });
+        let result = self.lower_scoped_statements(body);
+        self.loops.pop();
+        result?;
         if self.current.terminator == IrTerminator::Next {
-            // A tight compute loop remains cancellable even when its body has no
-            // calls. `emit_safepoint` creates an explicit timeout return edge, so
-            // an enclosing try/finally sees the same structured return route.
-            self.emit_safepoint()?;
-            self.current.terminator = IrTerminator::Jump(cond_id);
+            self.current.terminator = IrTerminator::Jump(backedge_id);
         }
         self.finish_current()?;
 
+        self.start_block(backedge_id, "while_backedge");
+        self.emit_loop_scope_cleanup(owner_floor)?;
+        // Both normal fallthrough and continue retain the same cooperative
+        // poll. An abrupt edge must never turn a call-free loop into a spin.
+        self.emit_safepoint()?;
+        self.current.terminator = IrTerminator::Jump(cond_id);
+        self.finish_current()?;
+
         self.start_block(after_id, "while_after");
+        self.nullable_facts = before_facts
+            .into_iter()
+            .filter(|(name, fact)| self.nullable_facts.get(name) == Some(fact))
+            .collect();
+        self.emit_loop_scope_cleanup(owner_floor)?;
         Ok(())
     }
 
@@ -1903,20 +2065,10 @@ impl<'a> FunctionLowerer<'a> {
                 ));
             }
         };
-        // A loop iterator is a fresh lexical binding on every interpreter
-        // iteration. The current native closure ABI boxes declaration sites,
-        // while `ForEach` binds its value in a terminator, so silently treating
-        // this as an ordinary local would either miss the capture or make all
-        // iterations share the wrong cell. Reject this one unsupported corner
-        // until the IR can model per-iteration cells explicitly.
-        if self.binding_is_boxed(name, span) {
-            return Err(KuError::runtime(
-                "IR/native lowering does not support closure capture of a for loop variable yet",
-                span,
-            ));
-        }
-
-        self.with_local_scope(|lower| lower.lower_for_body(name, element, iterable, body))
+        let captured_at = self.binding_is_boxed(name, span).then_some(span);
+        self.with_local_scope(|lower| {
+            lower.lower_for_body(name, element, iterable, body, captured_at)
+        })
     }
 
     fn lower_for_body(
@@ -1925,20 +2077,26 @@ impl<'a> FunctionLowerer<'a> {
         element: IrType,
         iterable: IrExpr,
         body: &[Stmt],
+        captured_at: Option<Span>,
     ) -> KuResult<()> {
         // `iterable` has already been lowered into the current block. Put the
         // actual iterator terminator in a fresh header block: the loop backedge
         // must not re-run calls/array construction used to compute the iterable.
         let iter_id = self.next_block("for_iter")?;
         let body_id = self.next_block("for_body")?;
+        let backedge_id = self.next_block("for_backedge")?;
         let after_id = self.next_block("for_after")?;
         self.current.terminator = IrTerminator::Jump(iter_id);
         self.finish_current()?;
 
         self.start_block(iter_id, "for_iter");
-        let ir_name = self.define_local(name, element);
+        let ir_name = if captured_at.is_some() {
+            self.define_local("__ku_for_element", element.clone())
+        } else {
+            self.define_local(name, element.clone())
+        };
         self.current.terminator = IrTerminator::ForEach {
-            name: ir_name,
+            name: ir_name.clone(),
             iterable,
             body_block: body_id,
             after_block: after_id,
@@ -1946,18 +2104,202 @@ impl<'a> FunctionLowerer<'a> {
         self.finish_current()?;
 
         self.start_block(body_id, "for_body");
-        self.lower_statements(body)?;
+        // The iterable and hidden ForEach snapshot predate this floor. Their
+        // owner survives continue; the emitter retires it at after_id.
+        let owner_floor = self.scope_owners.len();
+        if let Some(span) = captured_at {
+            // Each iteration defines a fresh binding. Move the yielded payload
+            // into that iteration's cell, leaving the iterator's slot empty.
+            // Only closures that captured this cell keep it after loop cleanup.
+            self.push_cell_new(
+                name.to_string(),
+                element.clone(),
+                IrExpr {
+                    kind: IrExprKind::Local(ir_name),
+                    ty: element,
+                },
+                span,
+            )?;
+        }
+        self.loops.push(IrLoopContext {
+            break_block: after_id,
+            continue_block: backedge_id,
+            foreach_block: Some(iter_id),
+            handler_floor: self.try_handlers.len(),
+            cleanup_floor: self.cleanup_attempts.len(),
+            owner_floor,
+        });
+        let result = self.lower_statements(body);
+        self.loops.pop();
+        result?;
         if self.current.terminator == IrTerminator::Next {
-            // `for` can iterate up to the full i64/array range. Poll on every
-            // back-edge just like `while`, otherwise a handler with a call-free
-            // loop can ignore its cooperative deadline indefinitely.
-            self.emit_safepoint()?;
-            self.current.terminator = IrTerminator::Jump(iter_id);
+            self.current.terminator = IrTerminator::Jump(backedge_id);
         }
         self.finish_current()?;
 
+        self.start_block(backedge_id, "for_backedge");
+        self.emit_loop_scope_cleanup(owner_floor)?;
+        self.emit_safepoint()?;
+        self.current.terminator = IrTerminator::Jump(iter_id);
+        self.finish_current()?;
+
         self.start_block(after_id, "for_after");
+        self.emit_loop_scope_cleanup(owner_floor)?;
         Ok(())
+    }
+
+    fn lower_loop_control(&mut self, is_continue: bool, span: Span) -> KuResult<()> {
+        let context =
+            self.loops.last().cloned().ok_or_else(|| {
+                KuError::runtime("break/continue requires an enclosing loop", span)
+            })?;
+
+        // Expand only the finally scopes actually crossed by this transfer.
+        // Each copy resolves names at the try's lexical entry, not at the exit
+        // site (which can contain shadowing body/catch locals). Removing that
+        // handler before lowering also prevents an overriding return, fail,
+        // break or continue from re-entering the same finally.
+        let handlers = self.try_handlers.clone();
+        let mut guarded_attempts = HashSet::new();
+        let result = (|| {
+            for index in (context.handler_floor..handlers.len()).rev() {
+                self.try_handlers = handlers[..index].to_vec();
+                let Some(scope) = &handlers[index].finally_scope else {
+                    continue;
+                };
+                self.guard_loop_cleanup_escape(
+                    context.cleanup_floor,
+                    Some(index),
+                    &mut guarded_attempts,
+                )?;
+                self.emit_loop_scope_cleanup(scope.owner_floor)?;
+                let aliases = std::mem::replace(&mut self.local_names, scope.aliases.clone());
+                let patterns =
+                    std::mem::replace(&mut self.pattern_bindings, scope.patterns.clone());
+                let finally_owner_floor = self.scope_owners.len();
+                let result = self.lower_scoped_statements(&scope.body);
+                self.local_names = aliases;
+                self.pattern_bindings = patterns;
+                result?;
+                if self.current.terminator != IrTerminator::Next {
+                    return Ok(());
+                }
+                self.emit_loop_scope_cleanup(finally_owner_floor)?;
+            }
+            self.guard_loop_cleanup_escape(context.cleanup_floor, None, &mut guarded_attempts)?;
+            self.emit_loop_scope_cleanup(context.owner_floor)?;
+            self.current.terminator = IrTerminator::Jump(if is_continue {
+                context.continue_block
+            } else {
+                context.break_block
+            });
+            Ok(())
+        })();
+        self.try_handlers = handlers;
+        result
+    }
+
+    fn guard_loop_cleanup_escape(
+        &mut self,
+        cleanup_floor: usize,
+        destination_handler: Option<usize>,
+        guarded: &mut HashSet<usize>,
+    ) -> KuResult<()> {
+        // A nested try's own finally still runs before crossing the attempt's
+        // lexical floor. Only the outward transfer is suppressed, never the
+        // nested cleanup preceding it. Loops born inside this attempt remain
+        // ordinary local control and are excluded by cleanup_floor.
+        for index in (cleanup_floor..self.cleanup_attempts.len()).rev() {
+            let attempt = self.cleanup_attempts[index].clone();
+            if destination_handler.is_some_and(|index| index >= attempt.handler_floor) {
+                break;
+            }
+            if !guarded.insert(index) {
+                continue;
+            }
+            let ordinary = self.next_block("loop_cleanup_escape")?;
+            self.current.terminator = IrTerminator::Branch {
+                condition: IrExpr {
+                    kind: IrExprKind::Local(attempt.reason),
+                    ty: IrType::Bool,
+                },
+                then_block: attempt.finish_block,
+                else_block: ordinary,
+            };
+            self.finish_current()?;
+            self.start_block(ordinary, "loop_cleanup_escape");
+        }
+        Ok(())
+    }
+
+    fn record_scope_owner(&mut self, instruction: &IrInst) {
+        let name = match instruction {
+            IrInst::Temp { id, ty, .. } | IrInst::BindOk { id, ty, .. } if ir_type_is_owned(ty) => {
+                format!("%t{}", id.0)
+            }
+            IrInst::Let { name, ty, .. } if ir_type_is_owned(ty) => name.clone(),
+            IrInst::BindError { name, .. } | IrInst::CellNew { name, .. } => name.clone(),
+            _ => return,
+        };
+        self.scope_owners.push(name);
+    }
+
+    fn emit_loop_scope_cleanup(&mut self, floor: usize) -> KuResult<()> {
+        if floor == self.scope_owners.len() {
+            return Ok(());
+        }
+        // These are compiler metadata strings, not runtime reads or moves.
+        // The emitter filters its existing OwnedLocal table, including borrowed
+        // aliases and moved-from slots, and clears each released owner in place.
+        let args = self.scope_owners[floor..]
+            .iter()
+            .map(|name| IrExpr {
+                kind: IrExprKind::Literal(format!("\"{name}\"")),
+                ty: IrType::Str,
+            })
+            .collect();
+        emit_ir_instruction!(
+            self,
+            IrInst::Expr(IrExpr {
+                ty: IrType::Void,
+                kind: IrExprKind::Call {
+                    callee: Box::new(IrExpr {
+                        kind: IrExprKind::Local("__ku_loop_scope_cleanup".into()),
+                        ty: IrType::Function,
+                    }),
+                    args,
+                    kind: IrCallKind::Intrinsic("__ku_loop_scope_cleanup".into()),
+                },
+            })
+        );
+        Ok(())
+    }
+
+    fn retire_foreach_before_try_transfer(&mut self, loop_floor: usize) -> KuResult<bool> {
+        let mut crossed = self.loops[loop_floor..].iter().filter_map(|context| {
+            context
+                .foreach_block
+                .map(|block| (block, context.owner_floor))
+        });
+        let Some((first, owner_floor)) = crossed.next() else {
+            return Ok(false);
+        };
+        let blocks = std::iter::once(first)
+            .chain(crossed.map(|(block, _)| block))
+            .map(|block| IrExpr {
+                kind: IrExprKind::Literal(block.0.to_string()),
+                ty: IrType::Int,
+            })
+            .collect();
+        // This transfer bypasses the ordinary for_after block. Release body
+        // owners and retire the snapshots before the destination can re-enter
+        // these loop sites. Loops enclosing the handler remain active.
+        self.emit_loop_scope_cleanup(owner_floor)?;
+        emit_ir_instruction!(
+            self,
+            IrInst::Expr(intrinsic_expr("__ku_retire_foreach", blocks, IrType::Void))
+        );
+        Ok(true)
     }
 
     fn lower_try(
@@ -2022,6 +2364,16 @@ impl<'a> FunctionLowerer<'a> {
                 }
             );
         }
+        let finally_scope = (!finally_body.is_empty()).then(|| {
+            Rc::new(IrFinallyScope {
+                body: finally_body.to_vec(),
+                aliases: self.local_names.clone(),
+                patterns: self.pattern_bindings.clone(),
+                // Error and pending-return owners belong to the enclosing try,
+                // not its body/catch, and must survive until finally resolves.
+                owner_floor: self.scope_owners.len(),
+            })
+        });
         emit_ir_instruction!(
             self,
             IrInst::BeginTry {
@@ -2033,9 +2385,11 @@ impl<'a> FunctionLowerer<'a> {
         self.try_handlers.push(IrTryHandler {
             error_block,
             error_name: error_name.clone(),
+            loop_floor: self.loops.len(),
             return_block: finally_return_id,
             return_name: return_name.clone(),
             return_reason: return_reason.clone(),
+            finally_scope: finally_scope.clone(),
         });
         let body_result = self.lower_scoped_statements(body);
         self.try_handlers.pop();
@@ -2070,9 +2424,11 @@ impl<'a> FunctionLowerer<'a> {
                     lower.try_handlers.push(IrTryHandler {
                         error_block: finally_err_id,
                         error_name: error_name.clone(),
+                        loop_floor: lower.loops.len(),
                         return_block: finally_return_id,
                         return_name: return_name.clone(),
                         return_reason: return_reason.clone(),
+                        finally_scope: finally_scope.clone(),
                     });
                 }
                 let result = lower.lower_statements(catch_body);
@@ -2207,13 +2563,15 @@ impl<'a> FunctionLowerer<'a> {
                     index: Box::new(index.clone()),
                 },
             },
-            IrLValue::Field { target, name } => IrExpr {
-                ty: self.field_type(&target.ty, name),
-                kind: IrExprKind::Field {
-                    target: Box::new(target.clone()),
-                    name: name.clone(),
-                },
-            },
+            IrLValue::Field { target, name } => self
+                .object_record_field_read(target, name)
+                .unwrap_or_else(|| IrExpr {
+                    ty: self.field_type(&target.ty, name),
+                    kind: IrExprKind::Field {
+                        target: Box::new(target.clone()),
+                        name: name.clone(),
+                    },
+                }),
         }
     }
 
@@ -2361,6 +2719,24 @@ impl<'a> FunctionLowerer<'a> {
         self.lower_expr(expr)
     }
 
+    /// Supply a literal's array type without evaluating the destination place.
+    fn static_assignment_array_type(&self, target: &AssignTarget) -> Option<IrType> {
+        let ty = match target {
+            AssignTarget::Variable(name) => self.locals.get(self.local_ir_name(name))?.clone(),
+            AssignTarget::Field { target, name } => {
+                self.field_type(&self.static_place_type(target)?, name)
+            }
+            AssignTarget::Index { target, .. } => match self.static_place_type(target)? {
+                IrType::Array(element) => *element,
+                _ => return None,
+            },
+        };
+        match &ty {
+            IrType::Array(element) if **element != IrType::Unknown => Some(ty),
+            _ => None,
+        }
+    }
+
     /// The readable type of a literal or plain place, without emitting anything.
     /// Cells expose their payload type here; taking a snapshot is a separate step.
     fn static_place_type(&self, expr: &Expr) -> Option<IrType> {
@@ -2380,7 +2756,14 @@ impl<'a> FunctionLowerer<'a> {
                 .map(|ty| match ty {
                     IrType::Cell(inner) => *inner,
                     other => other,
-                }),
+                })
+                .map(
+                    |ty| match (&ty, self.nullable_facts.get(self.local_ir_name(name))) {
+                        (IrType::Nullable(inner), Some(true)) => *inner.clone(),
+                        (IrType::Nullable(_), Some(false)) => IrType::Null,
+                        _ => ty,
+                    },
+                ),
             ExprKind::Field { target, name } => {
                 let target_ty = self.static_place_type(target)?;
                 Some(self.field_type(&target_ty, name))
@@ -2398,6 +2781,16 @@ impl<'a> FunctionLowerer<'a> {
             ExprKind::Variable(_) => self.lower_expr(expr),
             ExprKind::Field { target, name } => {
                 let target = self.lower_lvalue_target_expr(target)?;
+                if name == "headers" && target.ty == IrType::Named(HTTP_RESPONSE_TYPE.into()) {
+                    self.emit_temp(intrinsic_expr(
+                        "__ku_http_response_headers_prepare",
+                        vec![target.clone()],
+                        IrType::Null,
+                    ))?;
+                }
+                if let Some(read) = self.object_record_field_read(&target, name) {
+                    return self.emit_temp(read);
+                }
                 let ty = self.field_type(&target.ty, name);
                 Ok(IrExpr {
                     kind: IrExprKind::Field {
@@ -2438,6 +2831,16 @@ impl<'a> FunctionLowerer<'a> {
             ExprKind::Variable(_) => self.lower_expr(expr),
             ExprKind::Field { target, name } => {
                 let target = self.lower_lvalue_target_expr_cached(target)?;
+                if name == "headers" && target.ty == IrType::Named(HTTP_RESPONSE_TYPE.into()) {
+                    self.emit_temp(intrinsic_expr(
+                        "__ku_http_response_headers_prepare",
+                        vec![target.clone()],
+                        IrType::Null,
+                    ))?;
+                }
+                if let Some(read) = self.object_record_field_read(&target, name) {
+                    return self.emit_temp(read);
+                }
                 let ty = self.field_type(&target.ty, name);
                 Ok(IrExpr {
                     kind: IrExprKind::Field {
@@ -2474,45 +2877,32 @@ impl<'a> FunctionLowerer<'a> {
     /// direct/try lowering tells its backend that this is `fail`, not `err`.
     /// An existing Error keeps its original domain and code.
     fn lower_error_expr(&mut self, value: &Expr) -> KuResult<IrExpr> {
-        if let ExprKind::ObjectLiteral { fields } = &value.kind {
-            let mut domain = None;
-            let mut code = None;
-            let mut message = None;
-            for (index, (name, _)) in fields.iter().enumerate() {
-                match name.as_str() {
-                    "domain" => domain = Some(index),
-                    "code" => code = Some(index),
-                    "message" => message = Some(index),
-                    _ => {}
-                }
+        if let Some(InlineErrorFields {
+            fields,
+            layout_order: [domain, code, message],
+        }) = inline_error_fields(value)
+        {
+            // Freeze fields in source order before rearranging the Error ABI.
+            let mut values = Vec::with_capacity(fields.len());
+            for (_, value) in fields {
+                let value = self.lower_expr(value)?;
+                values.push(self.emit_temp(value)?);
             }
-            if let (Some(domain), Some(code), Some(message)) = (domain, code, message) {
-                if fields.len() == 3 {
-                    // Object fields evaluate in source order. Freeze each value
-                    // before later callbacks, then arrange the already-owned
-                    // temps for the fixed domain/code/message ABI.
-                    let mut values = Vec::with_capacity(fields.len());
-                    for (_, value) in fields {
-                        let value = self.lower_expr(value)?;
-                        values.push(self.emit_temp(value)?);
-                    }
-                    return Ok(IrExpr {
-                        kind: IrExprKind::Call {
-                            callee: Box::new(IrExpr {
-                                kind: IrExprKind::Local("__ku_error_make".to_string()),
-                                ty: IrType::Function,
-                            }),
-                            args: vec![
-                                values[domain].clone(),
-                                values[code].clone(),
-                                values[message].clone(),
-                            ],
-                            kind: IrCallKind::Intrinsic("__ku_error_make".to_string()),
-                        },
-                        ty: error_ir_type(),
-                    });
-                }
-            }
+            return Ok(IrExpr {
+                kind: IrExprKind::Call {
+                    callee: Box::new(IrExpr {
+                        kind: IrExprKind::Local("__ku_error_make".to_string()),
+                        ty: IrType::Function,
+                    }),
+                    args: vec![
+                        values[domain].clone(),
+                        values[code].clone(),
+                        values[message].clone(),
+                    ],
+                    kind: IrCallKind::Intrinsic("__ku_error_make".to_string()),
+                },
+                ty: error_ir_type(),
+            });
         }
         self.lower_expr(value)
     }
@@ -2575,9 +2965,54 @@ impl<'a> FunctionLowerer<'a> {
             ret: Box::new(IrType::Unknown),
         };
         let handler = self.lower_expr_with_expected(&args[1], Some(&expected))?;
-        let (arity, returns_result) = match &handler.ty {
-            IrType::Closure { params, ret, .. } => {
-                (params.len(), matches!(ret.as_ref(), IrType::Result(_)))
+        let (arity, response_abi) = match &handler.ty {
+            IrType::Closure {
+                params,
+                param_modes,
+                ret,
+            } => {
+                if params.len() > 1
+                    || param_modes.len() != params.len()
+                    || params
+                        .first()
+                        .is_some_and(|ty| *ty != IrType::Named(HTTP_REQUEST_TYPE.into()))
+                {
+                    return Err(KuError::runtime(
+                        "native HTTP handler parameter ABI requires zero parameters or one owned/View HttpRequest",
+                        args[1].span,
+                    ));
+                }
+                // Keep the callable's actual return type. Only HTTP dispatch
+                // adapts structural objects; standalone calls still return an
+                // ordinary owned object with the same inference and ABI.
+                let abi = match ret.as_ref() {
+                    IrType::Named(name) if name == "__ku_object" => 3,
+                    IrType::Result(inner) if matches!(inner.as_ref(),IrType::Named(name) if name=="__ku_object") => {
+                        4
+                    }
+                    IrType::Named(name) if name == "__ku_value" => 5,
+                    IrType::Result(inner) if matches!(inner.as_ref(),IrType::Named(name) if name=="__ku_value") => {
+                        6
+                    }
+                    IrType::Named(name) if name == HTTP_RESPONSE_TYPE => 0,
+                    IrType::Result(inner) if matches!(inner.as_ref(),IrType::Named(name) if name==HTTP_RESPONSE_TYPE) => {
+                        1
+                    }
+                    _ => {
+                        return Err(KuError::runtime(
+                            "native HTTP handler return type must have a supported HttpResponse, object or checked dynamic-value ABI, optionally wrapped in Result",
+                            args[1].span,
+                        ));
+                    }
+                };
+                (
+                    if param_modes.first() == Some(&ParamMode::View) {
+                        2
+                    } else {
+                        params.len()
+                    },
+                    abi,
+                )
             }
             _ => {
                 return Err(KuError::runtime(
@@ -2593,10 +3028,7 @@ impl<'a> FunctionLowerer<'a> {
             "del" => "DELETE",
             _ => "GET",
         };
-        let intrinsic = format!(
-            "__ku_http_route:{http_method}:{arity}:{}",
-            if returns_result { 1 } else { 0 }
-        );
+        let intrinsic = format!("__ku_http_route:{http_method}:{arity}:{response_abi}");
         self.emit_temp(IrExpr {
             kind: IrExprKind::Call {
                 callee: Box::new(IrExpr {
@@ -2610,17 +3042,53 @@ impl<'a> FunctionLowerer<'a> {
         })
     }
 
+    fn is_http_module_root(&self, expression: &Expr) -> bool {
+        matches!(&expression.kind, ExprKind::Variable(name) if name == "http")
+            && self.static_place_type(expression).is_none()
+            && !self.signatures.contains_key("http")
+    }
+
     fn field_type(&self, target: &IrType, field_name: &str) -> IrType {
         let IrType::Named(struct_name) = target else {
             return IrType::Unknown;
         };
+        if let Some(table) = http_constant_object_table(struct_name) {
+            return if crate::stdlib::http::constant_code(table, field_name).is_some() {
+                IrType::Int
+            } else {
+                IrType::Unknown
+            };
+        }
         if struct_name == "__ku_error_type" && matches!(field_name, "domain" | "code" | "message") {
             return IrType::Str;
         }
-        if struct_name == TIME_TYPE {
+        if struct_name == TIME_TYPE || struct_name == DURATION_TYPE {
             return match field_name {
                 "kind" => IrType::Str,
                 "millis" => IrType::Int,
+                _ => IrType::Unknown,
+            };
+        }
+        if struct_name == "__ku_http_client_config" {
+            return match field_name {
+                "kind" => IrType::Str,
+                "timeout_ms" | "max_body_bytes" | "max_idle_connections" => IrType::Int,
+                _ => IrType::Unknown,
+            };
+        }
+        if struct_name == "__ku_calendar_date" {
+            return match field_name {
+                "kind" => IrType::Str,
+                "year" | "month" | "day" => IrType::Int,
+                _ => IrType::Unknown,
+            };
+        }
+        if struct_name == "__ku_calendar_parts" {
+            return match field_name {
+                "kind" | "zone" => IrType::Str,
+                "year" | "month" | "day" | "hour" | "minute" | "second" | "millis" | "weekday" => {
+                    IrType::Int
+                }
                 _ => IrType::Unknown,
             };
         }
@@ -2631,6 +3099,7 @@ impl<'a> FunctionLowerer<'a> {
             return match field_name {
                 "status" => IrType::Int,
                 "body" => IrType::Str,
+                "headers" => IrType::Named("__ku_http_headers".into()),
                 _ => IrType::Unknown,
             };
         }
@@ -2649,6 +3118,51 @@ impl<'a> FunctionLowerer<'a> {
             .and_then(|layout| layout.fields.iter().find(|field| field.name == field_name))
             .map(|field| field.ty.clone())
             .unwrap_or(IrType::Unknown)
+    }
+
+    fn is_payloadless_enum(&self, ty: &IrType) -> bool {
+        let IrType::Named(name) = ty else {
+            return false;
+        };
+        let Some(name) = enum_type_name(name) else {
+            return false;
+        };
+        self.layouts.enums.iter().any(|layout| {
+            layout.name == name
+                && layout
+                    .variants
+                    .iter()
+                    .all(|variant| variant.fields.is_empty())
+        })
+    }
+
+    fn object_record_field_read(&self, target: &IrExpr, name: &str) -> Option<IrExpr> {
+        if !matches!(&target.ty,IrType::Named(marker) if matches!(marker.as_str(),"__ku_calendar_date"|"__ku_calendar_parts"|"__ku_http_client_config"))
+        {
+            return None;
+        }
+        let ty = self.field_type(&target.ty, name);
+        Some(intrinsic_expr(
+            if target.ty == IrType::Named("__ku_http_client_config".into()) {
+                if ty == IrType::Str {
+                    "__ku_http_client_config_field_str"
+                } else {
+                    "__ku_http_client_config_field_int"
+                }
+            } else if ty == IrType::Str {
+                "__ku_calendar_field_str"
+            } else {
+                "__ku_calendar_field_int"
+            },
+            vec![
+                target.clone(),
+                IrExpr {
+                    kind: IrExprKind::Literal(format!("{name:?}")),
+                    ty: IrType::Str,
+                },
+            ],
+            ty,
+        ))
     }
 
     /// Reuse storage only in an exact local/cell self-push assignment. The
@@ -2873,6 +3387,7 @@ impl<'a> FunctionLowerer<'a> {
         modes: Option<&[ParamMode]>,
         callee_has_effects: bool,
         allow_request_string_projection: bool,
+        freeze_array_views: bool,
     ) -> KuResult<Vec<IrExpr>> {
         // Refuse wide argument staging before allocating the parallel vectors.
         self.budget.borrow_mut().spend(args.len(), self.span)?;
@@ -2898,6 +3413,17 @@ impl<'a> FunctionLowerer<'a> {
                 self.lower_expr_with_expected(arg, expected.and_then(|params| params.get(index)))?
             };
             if view {
+                // concat reads each input value at its source evaluation point.
+                // A later callback may replace a captured array cell; preserve
+                // this one completed View instead of rereading that cell later.
+                // Ordinary View calls and pure concat arguments keep their loans.
+                if freeze_array_views
+                    && remaining_effects != 0
+                    && matches!(value.ty, IrType::Array(_))
+                    && ir_expr_is_place(&value)
+                {
+                    value = self.snapshot_receiver_before_effects(value, true)?;
+                }
                 if !ir_type_is_owned(&value.ty) && (remaining_effects != 0 || callee_has_effects) {
                     value = self.emit_temp(value)?;
                 }
@@ -3013,6 +3539,46 @@ impl<'a> FunctionLowerer<'a> {
         Ok(result)
     }
 
+    fn lower_interop(
+        &mut self,
+        kind: crate::interop::ReturnKind,
+        args: &[Expr],
+        span: Span,
+        deferred_safepoint: Option<&mut bool>,
+    ) -> KuResult<IrExpr> {
+        use crate::interop::ReturnKind;
+        let (library, operation) = crate::interop::binding_arguments(args, span)?;
+        let mut lowered = [library, operation]
+            .into_iter()
+            .map(|text| IrExpr {
+                kind: IrExprKind::Literal(format!("{text:?}")),
+                ty: IrType::Str,
+            })
+            .collect::<Vec<_>>();
+        let values = &args[2..];
+        let modes = vec![ParamMode::View; values.len()];
+        let first_argument_temp = self.next_temp_id;
+        lowered.extend(self.lower_call_arguments(
+            values,
+            None,
+            Some(&modes),
+            false,
+            true,
+            false,
+        )?);
+        let result = IrType::Result(Box::new(match kind {
+            ReturnKind::Null => IrType::Null,
+            ReturnKind::Int => IrType::Int,
+            ReturnKind::Str => IrType::Str,
+            ReturnKind::Bool => IrType::Bool,
+        }));
+        self.finish_borrowing_call(
+            intrinsic_expr(kind.intrinsic(), lowered, result),
+            first_argument_temp,
+            deferred_safepoint,
+        )
+    }
+
     fn emit_borrow_temporary_drop(&mut self, owner: IrExpr) -> KuResult<()> {
         emit_ir_instruction!(
             self,
@@ -3047,7 +3613,14 @@ impl<'a> FunctionLowerer<'a> {
         let module = match &receiver.ty {
             IrType::Array(_) => "array",
             IrType::Str => "string",
-            IrType::Named(n) if n == "__ku_object" => "object",
+            IrType::Named(n)
+                if n == "__ku_object"
+                    || n == "__ku_http_client_config"
+                    || n == "__ku_http_headers"
+                    || http_constant_object_table(n).is_some() =>
+            {
+                "object"
+            }
             IrType::Named(n) if n == "__ku_value" => "kuvalue",
             IrType::Named(n) if n == metadata::REDIS_CLIENT => "redis",
             IrType::Named(n) if n == metadata::BYTES => "bytes",
@@ -3185,7 +3758,78 @@ impl<'a> FunctionLowerer<'a> {
     }
 
     fn lower_expr(&mut self, expr: &Expr) -> KuResult<IrExpr> {
-        self.lower_expr_impl(expr, None)
+        let value = self.lower_expr_impl(expr, None)?;
+        let value = self.nullable_read(expr, value);
+        self.invalidate_nullable_call(expr);
+        Ok(value)
+    }
+
+    fn lower_index_expr(
+        &mut self,
+        target: &Expr,
+        index: &Expr,
+        optional: bool,
+    ) -> KuResult<IrExpr> {
+        let target = self.lower_expr(target)?;
+        let target =
+            self.snapshot_receiver_before_effects(target, !is_pure_append_argument(index, ""))?;
+        let index = self.lower_expr(index)?;
+        // `obj[key]` on a dynamic object yields Result<KuValue>: Ok(value)
+        // when present, Err{object, missing_key} when absent. `?` unwraps
+        // it to a KuValue.
+        if !optional && target.ty == IrType::Named("__ku_http_headers".into()) {
+            return self.emit_temp(intrinsic_expr(
+                "__ku_http_headers_get",
+                vec![target, index],
+                IrType::Named("__ku_value".into()),
+            ));
+        }
+        if let IrType::Named(name) = &target.ty {
+            if name == "__ku_object"
+                || name == "__ku_http_client_config"
+                || name == "__ku_http_headers"
+                || name == "__ku_value"
+                || http_constant_object_table(name).is_some()
+            {
+                // `obj[key]?` on a KuObject or a KuValue (e.g. json.parse
+                // result) yields Result<KuValue>. The KuValue variant checks
+                // the tag is an object at runtime.
+                let intrinsic = if name == "__ku_value" {
+                    // A KuValue index dispatches by key type: an int key
+                    // reads an array element (__ku_value_index), a str key
+                    // reads an object member (__ku_value_get).
+                    if matches!(&index.ty, IrType::Int) {
+                        "__ku_value_index"
+                    } else {
+                        "__ku_value_get"
+                    }
+                } else {
+                    "__ku_object_get"
+                };
+                return self.emit_temp(IrExpr {
+                    kind: IrExprKind::Call {
+                        callee: Box::new(IrExpr {
+                            kind: IrExprKind::Local(intrinsic.to_string()),
+                            ty: IrType::Function,
+                        }),
+                        args: vec![target, index],
+                        kind: IrCallKind::Intrinsic(intrinsic.to_string()),
+                    },
+                    ty: IrType::Result(Box::new(IrType::Named("__ku_value".to_string()))),
+                });
+            }
+        }
+        let ty = match &target.ty {
+            IrType::Array(inner) => *inner.clone(),
+            _ => IrType::Unknown,
+        };
+        self.emit_temp(IrExpr {
+            kind: IrExprKind::Index {
+                target: Box::new(target),
+                index: Box::new(index),
+            },
+            ty,
+        })
     }
 
     fn lower_expr_impl(
@@ -3205,6 +3849,12 @@ impl<'a> FunctionLowerer<'a> {
                 ty: literal_type(literal),
             }),
             ExprKind::Variable(name) => {
+                if self.is_http_module_root(expr) {
+                    return Err(KuError::runtime(
+                        "native C cannot store the complete http module as a value; use http.status, http.code or a direct http function call",
+                        expr.span,
+                    ));
+                }
                 if let Some(value) = self.pattern_bindings.get(name) {
                     return Ok(value.clone());
                 }
@@ -3273,15 +3923,66 @@ impl<'a> FunctionLowerer<'a> {
                 self.lower_logical_expr(left, *op, right)
             }
             ExprKind::Binary { left, op, right } => {
-                let mut left = self.lower_expr(left)?;
+                let equality = matches!(op, BinaryOp::Equal | BinaryOp::NotEqual);
+                let mut left = if equality
+                    && matches!(right.kind, ExprKind::Literal(Literal::Null))
+                    && matches!(left.kind, ExprKind::Variable(_))
+                {
+                    self.lower_expr_impl(left, None)?
+                } else {
+                    self.lower_expr(left)?
+                };
+                let compare_enum_tags = equality && self.is_payloadless_enum(&left.ty);
+                let mut left_tag = None;
                 if !is_pure_append_argument(right, "") {
                     if left.ty == IrType::Str {
                         left = self.snapshot_receiver_before_effects(left, true)?;
+                    } else if compare_enum_tags && !ir_expr_is_borrowed(&left) {
+                        // An owned enum read takes its value here. Save only
+                        // the tag before a RHS call can rebind a captured slot.
+                        left_tag = Some(self.emit_temp(enum_tag_expr(left.clone()))?);
                     } else if !ir_type_is_owned(&left.ty) {
                         left = self.emit_temp(left)?;
                     }
                 }
-                let right = self.lower_expr(right)?;
+                let right = if equality
+                    && matches!(left.ty, IrType::Null)
+                    && matches!(right.kind, ExprKind::Variable(_))
+                {
+                    self.lower_expr_impl(right, None)?
+                } else {
+                    self.lower_expr(right)?
+                };
+                if equality {
+                    let operand = match (&left.ty, &right.ty) {
+                        (IrType::Nullable(_), IrType::Null) => Some(left.clone()),
+                        (IrType::Null, IrType::Nullable(_)) => Some(right.clone()),
+                        _ => None,
+                    };
+                    if let Some(operand) = operand {
+                        let test =
+                            intrinsic_expr("__ku_nullable_is_null", vec![operand], IrType::Bool);
+                        return self.emit_temp(if *op == BinaryOp::Equal {
+                            test
+                        } else {
+                            IrExpr {
+                                kind: IrExprKind::Unary {
+                                    op: UnaryOp::Not,
+                                    expr: Box::new(test),
+                                },
+                                ty: IrType::Bool,
+                            }
+                        });
+                    }
+                }
+                let (left, right) = if compare_enum_tags && left.ty == right.ty {
+                    (
+                        left_tag.unwrap_or_else(|| enum_tag_expr(left)),
+                        enum_tag_expr(right),
+                    )
+                } else {
+                    (left, right)
+                };
                 let ty = binary_type(*op, &left.ty, &right.ty);
                 self.emit_temp(IrExpr {
                     kind: IrExprKind::Binary {
@@ -3293,6 +3994,11 @@ impl<'a> FunctionLowerer<'a> {
                 })
             }
             ExprKind::Call { callee, args } => {
+                if let ExprKind::Variable(name) = &callee.kind {
+                    if let Some(kind) = crate::interop::ReturnKind::for_bound(name) {
+                        return self.lower_interop(kind, args, expr.span, deferred_safepoint);
+                    }
+                }
                 // Stage 6f: a self-recursive call inside a lifted local-named
                 // function body. Resolve the callee to the lifted function itself
                 // and thread the running `__env` as the leading argument, instead
@@ -3313,6 +4019,7 @@ impl<'a> FunctionLowerer<'a> {
                             Some(&modes),
                             false,
                             true,
+                            false,
                         )?);
                         return self.finish_borrowing_call(
                             IrExpr {
@@ -3491,7 +4198,7 @@ impl<'a> FunctionLowerer<'a> {
                     IrCallKind::Intrinsic(name) => metadata::supports_borrowed_call(name),
                     IrCallKind::Direct(_) | IrCallKind::Indirect => true,
                 };
-                let lowered_args = self.lower_call_arguments(
+                let mut lowered_args = self.lower_call_arguments(
                     args,
                     expected_param_types.as_deref(),
                     match &bound_callee {
@@ -3514,6 +4221,7 @@ impl<'a> FunctionLowerer<'a> {
                     .as_deref(),
                     false,
                     allow_request_string_projection,
+                    matches!(&probe_kind, IrCallKind::Intrinsic(name) if name == "array.concat"),
                 )?;
                 if let Some((layout, variant)) = self.enum_variant(callee) {
                     let fields = variant
@@ -3551,6 +4259,19 @@ impl<'a> FunctionLowerer<'a> {
                 } else {
                     call_kind_and_type(callee, &lowered_args, self.signatures)
                 };
+                if matches!(&kind,IrCallKind::Intrinsic(name) if name=="println")
+                    && lowered_args
+                        .first()
+                        .is_some_and(|a| a.ty == IrType::Named(HTTP_RESPONSE_TYPE.into()))
+                {
+                    let value = lowered_args.remove(0);
+                    let boxed = self.emit_temp(intrinsic_expr(
+                        "__ku_http_response_public_value",
+                        vec![value],
+                        IrType::Named("__ku_value".into()),
+                    ))?;
+                    lowered_args.insert(0, boxed);
+                }
                 if matches!(&kind, IrCallKind::Intrinsic(name) if name == "http.json") {
                     // The interpreter reports invalid status/serialization as a
                     // runtime error, not a user Result. Preserve that fatal edge
@@ -3657,59 +4378,47 @@ impl<'a> FunctionLowerer<'a> {
                     ty: IrType::Array(Box::new(element)),
                 })
             }
-            ExprKind::Index { target, index } => {
-                let target = self.lower_expr(target)?;
-                let target = self.snapshot_receiver_before_effects(
-                    target,
-                    !is_pure_append_argument(index, ""),
-                )?;
-                let index = self.lower_expr(index)?;
-                // `obj[key]` on a dynamic object yields Result<KuValue>: Ok(value)
-                // when present, Err{object, missing_key} when absent. `?` unwraps
-                // it to a KuValue.
-                if let IrType::Named(name) = &target.ty {
-                    if name == "__ku_object" || name == "__ku_value" {
-                        // `obj[key]?` on a KuObject or a KuValue (e.g. json.parse
-                        // result) yields Result<KuValue>. The KuValue variant checks
-                        // the tag is an object at runtime.
-                        let intrinsic = if name == "__ku_value" {
-                            // A KuValue index dispatches by key type: an int key
-                            // reads an array element (__ku_value_index), a str key
-                            // reads an object member (__ku_value_get).
-                            if matches!(&index.ty, IrType::Int) {
-                                "__ku_value_index"
-                            } else {
-                                "__ku_value_get"
-                            }
-                        } else {
-                            "__ku_object_get"
-                        };
-                        return self.emit_temp(IrExpr {
-                            kind: IrExprKind::Call {
-                                callee: Box::new(IrExpr {
-                                    kind: IrExprKind::Local(intrinsic.to_string()),
-                                    ty: IrType::Function,
-                                }),
-                                args: vec![target, index],
-                                kind: IrCallKind::Intrinsic(intrinsic.to_string()),
-                            },
-                            ty: IrType::Result(Box::new(IrType::Named("__ku_value".to_string()))),
+            ExprKind::Index { target, index } => self.lower_index_expr(target, index, false),
+            ExprKind::Field { target, name } => {
+                // Constants are compiler-known only for the actual module root,
+                // never for a lexical value merely spelled `http`. Reading a
+                // direct scalar need not materialize the whole owned table.
+                if let ExprKind::Field {
+                    target: module,
+                    name: table,
+                } = &target.kind
+                {
+                    if self.is_http_module_root(module)
+                        && matches!(table.as_str(), "status" | "code")
+                    {
+                        let code =
+                            crate::stdlib::http::constant_code(table, name).ok_or_else(|| {
+                                KuError::runtime(
+                                    format!("http.{table} has no field '{name}'"),
+                                    expr.span,
+                                )
+                            })?;
+                        return Ok(IrExpr {
+                            kind: IrExprKind::Literal(code.to_string()),
+                            ty: IrType::Int,
                         });
                     }
                 }
-                let ty = match &target.ty {
-                    IrType::Array(inner) => *inner.clone(),
-                    _ => IrType::Unknown,
-                };
-                self.emit_temp(IrExpr {
-                    kind: IrExprKind::Index {
-                        target: Box::new(target),
-                        index: Box::new(index),
-                    },
-                    ty,
-                })
-            }
-            ExprKind::Field { target, name } => {
+                if self.is_http_module_root(target) {
+                    let (intrinsic, ty) = match name.as_str() {
+                        "status" => ("__ku_http_status_object", HTTP_STATUS_OBJECT_TYPE),
+                        "code" => ("__ku_http_code_object", HTTP_CODE_OBJECT_TYPE),
+                        _ => return Err(KuError::runtime(
+                            "native C http functions must be called directly; builtin function values are not supported",
+                            expr.span,
+                        )),
+                    };
+                    return self.emit_temp(intrinsic_expr(
+                        intrinsic,
+                        vec![],
+                        IrType::Named(ty.to_string()),
+                    ));
+                }
                 if let ExprKind::Variable(enum_name) = &target.kind {
                     if let Some(layout) = self
                         .layouts
@@ -3788,7 +4497,54 @@ impl<'a> FunctionLowerer<'a> {
                 // sibling fields — out. `lower_field_target` builds the projection
                 // chain without an intervening move.
                 let target = self.lower_field_target(target)?;
+                if let IrType::Named(ty) = &target.ty {
+                    if let Some(table) = http_constant_object_table(ty) {
+                        if crate::stdlib::http::constant_code(table, name).is_none() {
+                            return Err(KuError::runtime(
+                                format!("http.{table} has no field '{name}'"),
+                                expr.span,
+                            ));
+                        }
+                        return self.emit_temp(intrinsic_expr(
+                            "__ku_http_constant_get",
+                            vec![
+                                target,
+                                IrExpr {
+                                    kind: IrExprKind::Literal(format!("{name:?}")),
+                                    ty: IrType::Str,
+                                },
+                            ],
+                            IrType::Int,
+                        ));
+                    }
+                }
+                if name == "headers" && target.ty == IrType::Named(HTTP_RESPONSE_TYPE.into()) {
+                    // A read never writes a shared/borrowed response cache.
+                    return self.emit_temp(intrinsic_expr(
+                        "__ku_http_response_headers_read",
+                        vec![target],
+                        IrType::Named("__ku_http_headers".into()),
+                    ));
+                }
+                if matches!(&target.ty, IrType::Named(ty) if ty == "__ku_object") {
+                    if let Some(ty) = self.native_fields.ordinary_object_type(expr) {
+                        let ty = lower_type(ty, self.layouts);
+                        let key = IrExpr {
+                            kind: IrExprKind::Literal(format!("{name:?}")),
+                            ty: IrType::Str,
+                        };
+                        let value = self.emit_temp(intrinsic_expr(
+                            "__ku_object_required_field",
+                            vec![target, key],
+                            IrType::Named("__ku_value".into()),
+                        ))?;
+                        return self.convert_native_object_value(value, ty);
+                    }
+                }
                 let ty = self.field_type(&target.ty, name);
+                if let Some(read) = self.object_record_field_read(&target, name) {
+                    return self.emit_temp(read);
+                }
                 let field = IrExpr {
                     kind: IrExprKind::Field {
                         target: Box::new(target),
@@ -3823,16 +4579,19 @@ impl<'a> FunctionLowerer<'a> {
                     self.emit_temp(field)
                 }
             }
-            ExprKind::OptionalField { .. } => Err(KuError::runtime(
-                "optional chaining is not supported by IR/native lowering yet",
-                expr.span,
-            )),
+            ExprKind::OptionalField { target, name } => {
+                self.lower_optional_field(expr, target, name)
+            }
             ExprKind::Await(_) => Err(KuError::runtime(
                 "async/await is not supported by IR/native lowering yet",
                 expr.span,
             )),
             ExprKind::TryUnwrap { expr } => {
-                let expr = self.lower_expr(expr)?;
+                let expr = if let ExprKind::Index { target, index } = &expr.kind {
+                    self.lower_index_expr(target, index, true)?
+                } else {
+                    self.lower_expr(expr)?
+                };
                 let ty = match &expr.ty {
                     IrType::Result(inner) => *inner.clone(),
                     _ => IrType::Unknown,
@@ -3900,9 +4659,9 @@ impl<'a> FunctionLowerer<'a> {
             ExprKind::Match { value, arms } => self.lower_match(value, arms, expr.span),
             ExprKind::Function {
                 params,
-                return_type: _,
+                return_type,
                 body,
-            } => self.lower_closure_literal(params, body, expr.span, None),
+            } => self.lower_closure_literal(params, return_type.as_ref(), body, expr.span, None),
         }
     }
 
@@ -3914,7 +4673,9 @@ impl<'a> FunctionLowerer<'a> {
     fn lower_logical_expr(&mut self, left: &Expr, op: BinaryOp, right: &Expr) -> KuResult<IrExpr> {
         debug_assert!(matches!(op, BinaryOp::And | BinaryOp::Or));
 
-        let left = self.lower_expr(left)?;
+        let left_expr = left;
+        let left = self.lower_expr(left_expr)?;
+        let before_facts = self.nullable_facts.clone();
         let result_name = format!("__ku_logical_{}", self.next_temp_id);
         self.next_temp_id += 1;
         let right_id = self.next_block("logical_right")?;
@@ -3945,6 +4706,7 @@ impl<'a> FunctionLowerer<'a> {
         self.finish_current()?;
 
         self.start_block(right_id, "logical_right");
+        self.apply_nullable_condition(left_expr, op == BinaryOp::And);
         let right = self.lower_expr(right)?;
         emit_ir_instruction!(
             self,
@@ -3959,6 +4721,10 @@ impl<'a> FunctionLowerer<'a> {
         self.finish_current()?;
 
         self.start_block(after_id, "logical_after");
+        self.nullable_facts = before_facts
+            .into_iter()
+            .filter(|(name, fact)| self.nullable_facts.get(name) == Some(fact))
+            .collect();
         Ok(IrExpr {
             kind: IrExprKind::Local(result_name),
             ty: IrType::Bool,
@@ -3983,7 +4749,7 @@ impl<'a> FunctionLowerer<'a> {
         &mut self,
         expr: &Expr,
         expected: Option<&IrType>,
-        deferred_safepoint: Option<&mut bool>,
+        mut deferred_safepoint: Option<&mut bool>,
     ) -> KuResult<IrExpr> {
         self.budget.borrow_mut().spend(1, expr.span)?;
         if let (ExprKind::Call { callee, args }, Some(IrType::Result(expected_inner))) =
@@ -4030,14 +4796,47 @@ impl<'a> FunctionLowerer<'a> {
                 ty: IrType::Array(expected_element.clone()),
             });
         }
-        if let ExprKind::Function { params, body, .. } = &expr.kind {
+        if let ExprKind::Function {
+            params,
+            return_type,
+            body,
+        } = &expr.kind
+        {
             let expected_params = match expected {
                 Some(IrType::Closure { params, .. }) => Some(params.as_slice()),
                 _ => None,
             };
-            return self.lower_closure_literal(params, body, expr.span, expected_params);
+            return self.lower_closure_literal(
+                params,
+                return_type.as_ref(),
+                body,
+                expr.span,
+                expected_params,
+            );
         }
-        self.lower_expr_impl(expr, deferred_safepoint)
+        let value = self.lower_expr_impl(expr, deferred_safepoint.as_deref_mut())?;
+        let value = self.nullable_read(expr, value);
+        self.invalidate_nullable_call(expr);
+        if expected == Some(&IrType::Named(HTTP_RESPONSE_TYPE.into()))
+            && matches!(&value.ty,IrType::Named(name) if name=="__ku_object" || name=="__ku_value")
+        {
+            let dynamic = value.ty == IrType::Named("__ku_value".into());
+            let intrinsic = match (dynamic, deferred_safepoint.is_some()) {
+                (false, false) => "__ku_http_response_from_object_owned",
+                (false, true) => "__ku_http_response_from_object_view",
+                (true, false) => "__ku_http_response_from_value_owned",
+                (true, true) => "__ku_http_response_from_value_view",
+            };
+            return self.emit_temp_for_borrow_result(
+                intrinsic_expr(
+                    intrinsic,
+                    vec![value],
+                    IrType::Named(HTTP_RESPONSE_TYPE.into()),
+                ),
+                deferred_safepoint,
+            );
+        }
+        Ok(nullable::coerce(value, expected))
     }
 
     /// Resolve the cell pointer a newly-created nested closure must retain.
@@ -4131,7 +4930,7 @@ impl<'a> FunctionLowerer<'a> {
     }
 
     /// Lower a closure literal into a lifted, globally-unique IrFunction plus a
-    /// `MakeClosure` value (Stage 6a: no captures, env is NULL). An unannotated
+    /// `MakeClosure` value. An unannotated
     /// parameter is filled from `expected` — the parameter types of the expected
     /// function type supplied by context — matching the checker's rules; with no
     /// annotation and no expected type it is an error (the checker rejects this
@@ -4139,6 +4938,7 @@ impl<'a> FunctionLowerer<'a> {
     fn lower_closure_literal(
         &mut self,
         params: &[crate::ast::FunctionParam],
+        declared_return: Option<&TypeName>,
         body: &[Stmt],
         span: Span,
         expected: Option<&[IrType]>,
@@ -4185,38 +4985,71 @@ impl<'a> FunctionLowerer<'a> {
             .map(|(name, ty, _)| (name.clone(), ty.clone()))
             .collect::<Vec<_>>();
 
-        let mut child = FunctionLowerer::new(
-            self.signatures,
-            self.layouts,
-            IrType::Unknown,
-            self.next_function_id.clone(),
-            self.lifted_functions.clone(),
-            self.budget.clone(),
-            span,
-        )?;
-        child.mixed_async = self.mixed_async.clone();
-        child.captures = function_captures.iter().cloned().collect();
-        child.local_names = aliases;
-        for param in &ir_params {
-            child.locals.insert(param.name.clone(), param.ty.clone());
-        }
-        child.lower_block_body("entry", body, params)?;
+        let lower_body = |return_type, observe_returns| {
+            let mut child = FunctionLowerer::new(
+                self.signatures,
+                self.layouts,
+                return_type,
+                self.next_function_id.clone(),
+                self.lifted_functions.clone(),
+                self.budget.clone(),
+                span,
+            )?;
+            child.inferred_closure_returns = observe_returns;
+            child.mixed_async = self.mixed_async.clone();
+            child.native_fields = self.native_fields.clone();
+            child.captures = function_captures.iter().cloned().collect();
+            child.local_names = aliases.clone();
+            for param in &ir_params {
+                child.locals.insert(param.name.clone(), param.ty.clone());
+            }
+            child.lower_block_body("entry", body, params)?;
+            Ok::<_, KuError>(child)
+        };
 
-        // Recover the real return type from a source return. Cooperative timeout
-        // blocks are lowered while this child still has an Unknown seed, so their
-        // synthetic zero returns must not win inference over the closure body's
-        // concrete return.
-        let return_type = child
-            .blocks
-            .iter()
-            .find_map(|block| match &block.terminator {
-                IrTerminator::Return(Some(value)) if value.ty != IrType::Unknown => {
-                    Some(value.ty.clone())
+        let declared_return = declared_return.map(|ty| lower_type(ty, self.layouts));
+        let saved_id = self.next_function_id.get();
+        let saved_lifted = self.lifted_functions.borrow().len();
+        let saved_handlers = self
+            .mixed_async
+            .as_ref()
+            .map(|handlers| handlers.borrow().len());
+        let mut child = lower_body(
+            declared_return.clone().unwrap_or(IrType::Unknown),
+            declared_return.is_none().then(Vec::new),
+        )?;
+
+        let return_type = if let Some(declared) = declared_return {
+            declared
+        } else {
+            let reachable = reachable_block_ids(&child.blocks);
+            if let Some(nullable_return) = inferred_nullable_closure_return(&child, &reachable) {
+                // Choose the concrete type before lowering owned pending returns
+                // through finally. Discard provisional nested bodies but retain
+                // their charges against the original lowering budget.
+                self.next_function_id.set(saved_id);
+                self.lifted_functions.borrow_mut().truncate(saved_lifted);
+                if let (Some(handlers), Some(len)) = (&self.mixed_async, saved_handlers) {
+                    handlers.borrow_mut().truncate(len);
                 }
-                _ => None,
-            })
-            .unwrap_or(IrType::Null);
-        resolve_closure_safepoint_return_type(&mut child.blocks, &return_type);
+                child = lower_body(nullable_return.clone(), None)?;
+                nullable_return
+            } else {
+                let inferred = child
+                    .blocks
+                    .iter()
+                    .filter(|block| reachable.contains(&block.id))
+                    .find_map(|block| match &block.terminator {
+                        IrTerminator::Return(Some(value)) if value.ty != IrType::Unknown => {
+                            Some(value.ty.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(IrType::Null);
+                resolve_closure_safepoint_return_type(&mut child.blocks, &inferred);
+                inferred
+            }
+        };
 
         let cid = FunctionId(self.next_function_id.get());
         self.next_function_id.set(cid.0 + 1);
@@ -4285,8 +5118,7 @@ impl<'a> FunctionLowerer<'a> {
             .iter()
             .map(|param| param.ty.clone())
             .collect::<Vec<_>>();
-        // A declared return type is authoritative (and available up front, unlike
-        // a closure literal's recovered type); default to Null when omitted.
+        // A named function without a return declaration defaults to Null.
         let return_type = function
             .return_type
             .as_ref()
@@ -4318,6 +5150,7 @@ impl<'a> FunctionLowerer<'a> {
             function.span,
         )?;
         child.mixed_async = self.mixed_async.clone();
+        child.native_fields = self.native_fields.clone();
         child.captures = function_captures.iter().cloned().collect();
         child.local_names = aliases.clone();
         for param in &ir_params {
@@ -4376,6 +5209,9 @@ impl<'a> FunctionLowerer<'a> {
             },
             ty: closure_ty.clone(),
         })?;
+        if self.binding_is_boxed(&name, function.span) {
+            return self.push_cell_new(name, closure_ty, value, function.span);
+        }
         let name = self.define_local(&name, closure_ty.clone());
         emit_ir_instruction!(
             self,
@@ -4407,6 +5243,7 @@ impl<'a> FunctionLowerer<'a> {
         value: IrExpr,
         deferred_safepoint: Option<&mut bool>,
     ) -> KuResult<IrExpr> {
+        let value = self.mark_nullable_clone(value);
         if let Some(deferred) = deferred_safepoint {
             *deferred |= ir_expr_needs_post_call_safepoint(&value);
             self.emit_temp_with_safepoint(value, false)
@@ -4420,6 +5257,7 @@ impl<'a> FunctionLowerer<'a> {
         value: IrExpr,
         post_call_safepoint: bool,
     ) -> KuResult<IrExpr> {
+        let value = self.mark_nullable_clone(value);
         // A void value (a call to a function with no return) has no result to
         // bind — binding it would emit invalid `void t0 = f(...)`. Hand the value
         // straight back; its only consumer is a statement position, which emits it
@@ -4626,6 +5464,17 @@ impl<'a> FunctionLowerer<'a> {
         span: Span,
         define_boxed: bool,
     ) -> KuResult<()> {
+        self.nullable_facts
+            .remove(self.local_ir_name(name).to_string().as_str());
+        let expected = self
+            .locals
+            .get(self.local_ir_name(name))
+            .or_else(|| self.captures.get(self.local_ir_name(name)))
+            .map(|ty| match ty {
+                IrType::Cell(inner) => inner.as_ref(),
+                ty => ty,
+            });
+        let value = nullable::coerce(value, expected);
         if let Some(cell) = self.assignment_cell(name) {
             emit_ir_instruction!(self, IrInst::CellStore { cell, value });
         } else if define_boxed && !self.locals.contains_key(self.local_ir_name(name)) {
@@ -4721,10 +5570,60 @@ impl<'a> FunctionLowerer<'a> {
             let mut binding_names = bindings.keys().cloned().collect::<Vec<_>>();
             binding_names.sort();
             let pattern_undo = self.push_pattern_bindings(bindings);
+            if let Some(guard) = &arm.guard {
+                let pending_floor = self.pending_borrow_temporaries.len();
+                let mut probes = Vec::new();
+                for name in &binding_names {
+                    let bound = &self.pattern_bindings[name];
+                    if !ir_type_is_owned(&bound.ty)
+                        || !crate::checker::expr_uses_name(guard, name, false)
+                    {
+                        continue;
+                    }
+                    // Guards may consume a binding. Give them the same
+                    // independent candidate as the interpreter while keeping
+                    // the scrutinee available for subsequent arms.
+                    let copy = intrinsic_expr("__ku_clone", vec![bound.clone()], bound.ty.clone());
+                    let probe = self.emit_temp(copy)?;
+                    self.pending_borrow_temporaries
+                        .push(PendingBorrowTemporary {
+                            owner: probe.clone(),
+                            error_block: self
+                                .try_handlers
+                                .last()
+                                .map(|handler| handler.error_block),
+                        });
+                    probes.push(probe.clone());
+                    self.pattern_bindings.insert(name.clone(), probe);
+                }
+                let guard = self.lower_expr(guard)?;
+                self.pending_borrow_temporaries.truncate(pending_floor);
+                let value_id = self.next_block("match_value")?;
+                let rejected_id = if probes.is_empty() {
+                    next_id
+                } else {
+                    self.next_block("match_guard_rejected")?
+                };
+                self.current.terminator = IrTerminator::Branch {
+                    condition: guard,
+                    then_block: value_id,
+                    else_block: rejected_id,
+                };
+                self.finish_current()?;
+                if rejected_id != next_id {
+                    self.start_block(rejected_id, "match_guard_rejected");
+                    for probe in probes.into_iter().rev() {
+                        self.emit_borrow_temporary_drop(probe)?;
+                    }
+                    self.current.terminator = IrTerminator::Jump(next_id);
+                    self.finish_current()?;
+                }
+                self.start_block(value_id, "match_value");
+            }
             // Materialize each binding that is a computed projection (an enum
             // payload access, which moves-and-clears the slot when its type is
-            // owned) into a single temp, so using the binding more than once reads
-            // that temp instead of re-moving the value out of the enum each time.
+            // owned) only after the guard accepts. Candidate temps from the
+            // guard already represent the selected arm's bindings.
             for name in binding_names {
                 let bound = self.pattern_bindings[&name].clone();
                 if matches!(
@@ -4735,17 +5634,6 @@ impl<'a> FunctionLowerer<'a> {
                 }
                 let temp = self.emit_temp(bound)?;
                 self.pattern_bindings.insert(name, temp);
-            }
-            if let Some(guard) = &arm.guard {
-                let guard = self.lower_expr(guard)?;
-                let value_id = self.next_block("match_value")?;
-                self.current.terminator = IrTerminator::Branch {
-                    condition: guard,
-                    then_block: value_id,
-                    else_block: next_id,
-                };
-                self.finish_current()?;
-                self.start_block(value_id, "match_value");
             }
             let arm_value = self.lower_expr(&arm.value)?;
             if let Some(expected) = &result_ty {
@@ -4871,11 +5759,7 @@ impl<'a> FunctionLowerer<'a> {
                     })?;
                 let mut condition = IrExpr {
                     kind: IrExprKind::Binary {
-                        left: Box::new(intrinsic_expr(
-                            "__ku_enum_tag",
-                            vec![value.clone()],
-                            IrType::Int,
-                        )),
+                        left: Box::new(enum_tag_expr(value.clone())),
                         op: BinaryOp::Equal,
                         right: Box::new(IrExpr {
                             kind: IrExprKind::Literal(variant_layout.tag.to_string()),
@@ -4983,12 +5867,21 @@ impl<'a> FunctionLowerer<'a> {
                 emit_ir_instruction!(
                     self,
                     IrInst::Let {
-                        name: error_name,
-                        ty: error_ty,
+                        name: error_name.clone(),
+                        ty: error_ty.clone(),
                         value: error_value,
                     }
                 );
             }
+            let result = if self.retire_foreach_before_try_transfer(handler.loop_floor)? {
+                // The original Result owner may have retired with the body.
+                IrExpr {
+                    kind: IrExprKind::Local(error_name),
+                    ty: error_ty,
+                }
+            } else {
+                result
+            };
             Ok(IrTerminator::JumpErr {
                 result,
                 target: handler.error_block,
@@ -5078,6 +5971,7 @@ impl<'a> FunctionLowerer<'a> {
                 value: reason,
             }
         );
+        self.retire_foreach_before_try_transfer(handler.loop_floor)?;
         Ok(IrTerminator::Jump(return_block))
     }
 
@@ -5162,12 +6056,38 @@ impl<'a> FunctionLowerer<'a> {
     }
 }
 
+fn http_response_clone_may_signal(ty: &IrType) -> bool {
+    match ty {
+        IrType::Named(name) => name == HTTP_RESPONSE_TYPE,
+        IrType::Result(inner) => http_response_clone_may_signal(inner),
+        _ => false,
+    }
+}
+
 /// Operations whose fresh native result cannot be used until the synchronous
 /// return mailbox has been consumed. This classifies only typed i64 arithmetic;
 /// float/mixed/dynamic expressions retain their separate existing semantics.
 pub(crate) fn ir_expr_needs_sync_guard(expr: &IrExpr) -> bool {
+    if let IrExprKind::Call {
+        kind: IrCallKind::Intrinsic(name),
+        args,
+        ..
+    } = &expr.kind
+    {
+        if name == "__ku_optional_select" {
+            return args.get(1).is_some_and(ir_expr_needs_sync_guard);
+        }
+    }
+    if matches!(&expr.kind,IrExprKind::Call{kind:IrCallKind::Intrinsic(name),args,..} if name=="__ku_clone" && args.first().is_some_and(|x| http_response_clone_may_signal(&x.ty)))
+    {
+        return true;
+    }
     if matches!(&expr.kind, IrExprKind::Call { kind: IrCallKind::Intrinsic(name), .. }
-        if matches!(name.as_str(), "__ku_http_json_status" | "__ku_http_json_response"))
+        if matches!(name.as_str(), "__ku_http_json_status" | "__ku_http_json_response" | "__ku_http_response_from_object_owned" | "__ku_http_response_from_object_view" | "__ku_http_response_from_value_owned" | "__ku_http_response_from_value_view" | "__ku_http_response_headers_read" | "__ku_http_headers_get" | "__ku_http_response_headers_prepare" | "__ku_http_client_config_field_int" | "__ku_http_client_config_field_str" | "__ku_http_response_public_value" | "http.get" | "http.post" | "http.request" | "http.client"
+            | "__ku_object_take_required" | "__ku_object_pattern_convert" | "__ku_object_required_field"
+            | "__ku_object_optional_field" | "__ku_value_optional_field"
+            | "__ku_object_optional_field_view" | "__ku_value_optional_field_view"
+            | "time.from_unix" | "time.from_millis" | "time.add" | "time.sub" | "time.diff"))
     {
         return true;
     }
@@ -5211,12 +6131,78 @@ fn ir_expr_needs_post_call_safepoint(expr: &IrExpr) -> bool {
         IrExprKind::Call {
             kind: IrCallKind::Intrinsic(name),
             ..
-        } => name == "array.map",
+        } => matches!(
+            name.as_str(),
+            "http.get"
+                | "http.post"
+                | "http.request"
+                | "array.map"
+                | "array.concat"
+                | "array.first"
+                | "array.last"
+                | "__ku_clone_nullable"
+                | "time.date"
+                | "time.datetime"
+                | "time.format"
+                | "time.parse"
+                | "time.parts"
+                | "time.weekday"
+                | "__ku_calendar_field_int"
+                | "__ku_calendar_field_str"
+                | "time.sleep"
+                | "string.trim"
+                | "string.lower"
+                | "string.upper"
+                | "zstd.compress"
+                | "zstd.decompress"
+                | "gzip.compress"
+                | "gzip.decompress"
+                | "deflate.compress"
+                | "deflate.decompress"
+        ),
         _ => false,
     }
 }
 
-/// Closure bodies are initially lowered with an Unknown return seed so their
+fn inferred_nullable_closure_return(
+    lowered: &FunctionLowerer<'_>,
+    reachable: &HashSet<BlockId>,
+) -> Option<IrType> {
+    let returns = lowered.inferred_closure_returns.as_ref()?;
+    if returns.is_empty() {
+        return None;
+    }
+    let mut has_null = lowered.blocks.last().is_some_and(|block| {
+        block.terminator == IrTerminator::Next && reachable.contains(&block.id)
+    });
+    let mut payload = None;
+    for (block, ty) in returns {
+        if !reachable.contains(block) {
+            continue;
+        }
+        if matches!(ty, IrType::Null | IrType::Void) {
+            has_null = true;
+            continue;
+        }
+        let ty = match ty {
+            IrType::Nullable(inner) => inner.as_ref(),
+            other => other,
+        };
+        if !matches!(ty, IrType::Int | IrType::Float | IrType::Bool | IrType::Str)
+            || payload.is_some_and(|previous| previous != ty)
+        {
+            return None;
+        }
+        payload = Some(ty);
+    }
+    if has_null {
+        payload.cloned().map(nullable::nullable_type)
+    } else {
+        None
+    }
+}
+
+/// Unannotated closure bodies are lowered with an Unknown return seed so their
 /// source returns can drive inference. Timeout/signal cleanup paths created during
 /// that pass therefore contain Unknown-typed zero payloads (and a try/finally
 /// return slot may be Unknown too). Once inference succeeds, make only those
@@ -5290,7 +6276,17 @@ fn lower_type(ty: &TypeName, layouts: &IrLayoutTable) -> IrType {
             param_modes: param_modes.clone(),
             ret: Box::new(lower_type(return_type, layouts)),
         },
-        TypeName::Union(_) => IrType::Unknown,
+        TypeName::Union(parts) => {
+            let non_null: Vec<_> = parts
+                .iter()
+                .filter(|part| !matches!(part, TypeName::Null))
+                .collect();
+            if non_null.len() == 1 && parts.iter().any(|part| matches!(part, TypeName::Null)) {
+                nullable::nullable_type(lower_type(non_null[0], layouts))
+            } else {
+                IrType::Unknown
+            }
+        }
         TypeName::Custom(name) if layouts.enums.iter().any(|layout| layout.name == *name) => {
             enum_ir_type(name)
         }
@@ -5367,6 +6363,10 @@ fn lower_struct_layout(
                 name: field.name.clone(),
                 ty: lower_layout_type(&field.ty, enum_names, struct_names),
                 offset,
+                is_async_callable: matches!(
+                    field.ty,
+                    Some(TypeName::Function { is_async: true, .. })
+                ),
             })
             .collect(),
     }
@@ -5394,6 +6394,10 @@ fn lower_enum_layout(
                         name: field.name.clone(),
                         ty: lower_layout_type(&field.ty, enum_names, struct_names),
                         offset,
+                        is_async_callable: matches!(
+                            field.ty,
+                            Some(TypeName::Function { is_async: true, .. })
+                        ),
                     })
                     .collect(),
             })
@@ -5436,7 +6440,17 @@ fn lower_layout_type(
                 param_modes: param_modes.clone(),
                 ret: Box::new(lower(return_type, enum_names, struct_names)),
             },
-            TypeName::Union(_) => IrType::Unknown,
+            TypeName::Union(parts) => {
+                let non_null: Vec<_> = parts
+                    .iter()
+                    .filter(|part| !matches!(part, TypeName::Null))
+                    .collect();
+                if non_null.len() == 1 && parts.iter().any(|part| matches!(part, TypeName::Null)) {
+                    nullable::nullable_type(lower(non_null[0], enum_names, struct_names))
+                } else {
+                    IrType::Unknown
+                }
+            }
             TypeName::Custom(name) if enum_names.contains(name) => enum_ir_type(name),
             TypeName::Custom(name) if name == "KuValue" && !struct_names.contains(name) => {
                 IrType::Named("__ku_value".to_string())
@@ -5483,6 +6497,10 @@ fn enum_type_name(name: &str) -> Option<&str> {
     name.strip_prefix(ENUM_TYPE_PREFIX)
 }
 
+fn enum_tag_expr(value: IrExpr) -> IrExpr {
+    intrinsic_expr("__ku_enum_tag", vec![value], IrType::Int)
+}
+
 fn intrinsic_expr(name: impl Into<String>, args: Vec<IrExpr>, ty: IrType) -> IrExpr {
     let name = name.into();
     IrExpr {
@@ -5499,10 +6517,38 @@ fn intrinsic_expr(name: impl Into<String>, args: Vec<IrExpr>, ty: IrType) -> IrE
 }
 
 fn zero_expr(ty: IrType) -> IrExpr {
+    if matches!(ty, IrType::Nullable(_)) {
+        return intrinsic_expr("__ku_nullable_null", vec![], ty);
+    }
     IrExpr {
         kind: IrExprKind::Literal("<native-zero>".to_string()),
         ty,
     }
+}
+
+pub(crate) const ERROR_FIELDS: [&str; 3] = ["domain", "code", "message"];
+
+struct InlineErrorFields<'a> {
+    fields: &'a [(String, Expr)],
+    layout_order: [usize; 3],
+}
+
+fn inline_error_fields(value: &Expr) -> Option<InlineErrorFields<'_>> {
+    let ExprKind::ObjectLiteral { fields } = &value.kind else {
+        return None;
+    };
+    if fields.len() != ERROR_FIELDS.len() {
+        return None;
+    }
+    let mut indices = [None; ERROR_FIELDS.len()];
+    for (index, (name, _)) in fields.iter().enumerate() {
+        let offset = ERROR_FIELDS.iter().position(|field| *field == name)?;
+        indices[offset] = Some(index);
+    }
+    Some(InlineErrorFields {
+        fields,
+        layout_order: [indices[0]?, indices[1]?, indices[2]?],
+    })
 }
 
 fn error_ir_type() -> IrType {
@@ -5610,18 +6656,56 @@ const HTTP_RESPONSE_TYPE: &str = "__ku_http_response";
 /// Stage 8a: the synthetic IR type of the request struct passed to `fn(req)`
 /// route handlers (fields `method`/`path`/`body`).
 const HTTP_REQUEST_TYPE: &str = "__ku_http_request";
+pub(crate) const HTTP_STATUS_OBJECT_TYPE: &str = "__ku_http_status";
+pub(crate) const HTTP_CODE_OBJECT_TYPE: &str = "__ku_http_code";
+
+/// These are ordinary owned KuObject values. The nominal marker only preserves
+/// the known integer fields while lowering aliases; the backend ABI is unchanged.
+pub(crate) fn http_constant_object_table(name: &str) -> Option<&'static str> {
+    match name {
+        HTTP_STATUS_OBJECT_TYPE => Some("status"),
+        HTTP_CODE_OBJECT_TYPE => Some("code"),
+        _ => None,
+    }
+}
 /// Dedicated by-value native Time ABI. Kept separate from `__ku_object` so
 /// ordinary dynamic objects with fields named `kind`/`millis` are never
 /// misclassified as values returned by `time.instant()`.
 const TIME_TYPE: &str = "__ku_time";
+const DURATION_TYPE: &str = "__ku_duration";
 
 fn time_builtin_ir_type(module: &str, function: &str, args: &[IrExpr]) -> Option<IrType> {
     if module != "time" {
         return None;
     }
     match function {
+        "date" if args.is_empty() => Some(IrType::Named("__ku_calendar_date".into())),
+        "date" => Some(IrType::Result(Box::new(IrType::Named(
+            "__ku_calendar_date".into(),
+        )))),
+        "datetime" | "parse" => Some(IrType::Result(Box::new(IrType::Named(TIME_TYPE.into())))),
+        "format" if args.len() == 1 => Some(IrType::Str),
+        "format" => Some(IrType::Result(Box::new(IrType::Str))),
+        "parts" if args.len() == 1 => Some(IrType::Named("__ku_calendar_parts".into())),
+        "parts" => Some(IrType::Result(Box::new(IrType::Named(
+            "__ku_calendar_parts".into(),
+        )))),
+        "weekday" if args.len() == 1 => Some(IrType::Int),
+        "weekday" => Some(IrType::Result(Box::new(IrType::Int))),
         "instant" if args.is_empty() => Some(IrType::Named(TIME_TYPE.to_string())),
-        "now" | "elapsed" | "millis" | "steady_millis" => Some(IrType::Int),
+        "from_unix" | "from_millis" if args.len() == 1 => {
+            Some(IrType::Named(TIME_TYPE.to_string()))
+        }
+        "duration" if args.len() == 1 || args.len() == 2 => Some(IrType::Result(Box::new(
+            IrType::Named(DURATION_TYPE.to_string()),
+        ))),
+        "add" | "sub" if args.len() == 2 => Some(IrType::Named(TIME_TYPE.to_string())),
+        "diff" if args.len() == 2 => Some(IrType::Named(DURATION_TYPE.to_string())),
+        "compare" if args.len() == 2 => Some(IrType::Int),
+        "is_leap" if args.len() == 1 => Some(IrType::Bool),
+        "days_in_month" if args.len() == 2 => Some(IrType::Result(Box::new(IrType::Int))),
+        "sleep" if args.len() == 1 => Some(IrType::Result(Box::new(IrType::Null))),
+        "now" | "elapsed" | "unix" | "millis" | "steady_millis" => Some(IrType::Int),
         _ => None,
     }
 }
@@ -5631,6 +6715,10 @@ fn time_builtin_ir_type(module: &str, function: &str, args: &[IrExpr]) -> Option
 fn http_builtin_ir_type(module: &str, function: &str) -> Option<IrType> {
     match (module, function) {
         ("http", "server" | "service") => Some(IrType::Named(HTTP_SERVER_TYPE.to_string())),
+        ("http", "get" | "post" | "request") => Some(IrType::Result(Box::new(IrType::Named(
+            HTTP_RESPONSE_TYPE.into(),
+        )))),
+        ("http", "client") => Some(IrType::Named("__ku_http_client_config".into())),
         ("http", "text" | "html" | "json" | "empty" | "redirect") => {
             Some(IrType::Named(HTTP_RESPONSE_TYPE.to_string()))
         }
@@ -5666,6 +6754,9 @@ fn pattern_to_ir_type(pattern: &TypePattern, args: &[IrExpr]) -> Option<IrType> 
         TypePattern::ResultOf(inner) => {
             Some(IrType::Result(Box::new(pattern_to_ir_type(inner, args)?)))
         }
+        TypePattern::NullableOf(inner) => {
+            Some(nullable::nullable_type(pattern_to_ir_type(inner, args)?))
+        }
         TypePattern::SameAsArg(index) => args.get(*index).map(|arg| arg.ty.clone()),
     }
 }
@@ -5695,19 +6786,21 @@ fn dotted_name(expr: &Expr) -> Option<String> {
 /// `push_cell_new` separately admits owned ABI types, whose generated cell
 /// helpers move/drop the payload.
 fn is_copy_ir_type(ty: &IrType) -> bool {
+    if let IrType::Nullable(inner) = ty {
+        return is_copy_ir_type(inner);
+    }
     matches!(
         ty,
         IrType::Int | IrType::Float | IrType::Bool | IrType::Null
-    ) || matches!(ty, IrType::Named(name) if name == TIME_TYPE)
+    ) || matches!(ty, IrType::Named(name) if name == TIME_TYPE || name == DURATION_TYPE)
 }
 
 /// A visible name either resolves to a binding site owned and boxable by this
 /// function body (`Some`) or to a lexical binding this scan cannot box (`None`).
 /// Body declarations and this function's parameters are `Some`; enclosing
-/// captures and catch/match bindings are `None`. A loop iterator uses a stable
-/// `Some` sentinel only so `lower_for` can reject its unsupported per-iteration
-/// capture explicitly. Non-boxable bindings still matter because they shadow an
-/// outer homonym.
+/// captures and catch/match bindings are `None`. A captured loop iterator
+/// uses its binding site to allocate a fresh cell in the loop body.
+/// Non-boxable bindings still matter because they shadow an outer homonym.
 type VisibleBoxBindings = HashMap<String, Option<BoxedBindingSite>>;
 
 /// Stage 6b: find the exact body-owned bindings captured by closures at their
@@ -5826,7 +6919,7 @@ fn collect_boxed_candidates_stmt(
             bindings,
             rest,
             value,
-            span,
+            ..
         } => {
             collect_boxed_candidates_expr(value, visible, out)?;
             for binding in bindings {
@@ -5834,11 +6927,14 @@ fn collect_boxed_candidates_stmt(
                     collect_boxed_candidates_expr(default, visible, out)?;
                 }
                 if let Some(local) = &binding.local {
-                    define_assignment_binding(local, *span, visible);
+                    define_assignment_binding(local, binding.span, visible);
                 }
             }
-            if let Some(local) = rest.as_ref().and_then(|rest| rest.local.as_ref()) {
-                define_assignment_binding(local, *span, visible);
+            if let Some((rest, local)) = rest
+                .as_ref()
+                .and_then(|rest| rest.local.as_ref().map(|name| (rest, name)))
+            {
+                define_assignment_binding(local, rest.span, visible);
             }
         }
         Stmt::If {
@@ -5865,10 +6961,8 @@ fn collect_boxed_candidates_stmt(
         } => {
             collect_boxed_candidates_expr(iterable, visible, out)?;
             let mut scoped = visible.clone();
-            // The iterator is created by lower_for rather than a body statement,
-            // but still has a stable binding site. Recording it lets lower_for
-            // reject closure capture explicitly instead of emitting a closure
-            // that reads an unbound C local.
+            // The iterator has a stable site, but its cell is created anew in
+            // the body on each iteration.
             scoped.insert(name.clone(), Some(BoxedBindingSite::new(name, *span)));
             collect_boxed_candidates_block(body, &mut scoped, out)?;
         }
@@ -5878,9 +6972,12 @@ fn collect_boxed_candidates_stmt(
                 visible,
                 out,
             );
-            // A named local function comes into scope only after its closure is
-            // created. Self-recursion is handled by self_recurse, not a cell.
-            visible.insert(function.name.clone(), None);
+            // The name becomes visible to later siblings once its closure has
+            // been made. Capturing that sibling value may box the binding, but
+            // self-recursion in the function itself still uses self_recurse.
+            let binding =
+                (!function.is_async).then(|| BoxedBindingSite::new(&function.name, function.span));
+            visible.insert(function.name.clone(), binding);
         }
         Stmt::Try {
             body,

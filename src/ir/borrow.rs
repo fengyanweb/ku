@@ -42,7 +42,9 @@ fn check_type(ty: &IrType) -> KuResult<()> {
                 pending.extend(params.iter().map(|p| (p, depth + 1)));
                 pending.push((ret, depth + 1));
             }
-            IrType::Array(x) | IrType::Result(x) | IrType::Cell(x) => pending.push((x, depth + 1)),
+            IrType::Array(x) | IrType::Result(x) | IrType::Nullable(x) | IrType::Cell(x) => {
+                pending.push((x, depth + 1))
+            }
             _ => {}
         }
     }
@@ -68,6 +70,27 @@ impl Verifier<'_> {
                 }
                 IrExprKind::Field { target, .. } | IrExprKind::Index { target, .. } => {
                     cursor = target
+                }
+                IrExprKind::Call {
+                    kind: IrCallKind::Intrinsic(name),
+                    args,
+                    ..
+                } if name == "__ku_nullable_get" && args.len() == 1 => cursor = &args[0],
+                IrExprKind::Call {
+                    kind: IrCallKind::Intrinsic(name),
+                    args,
+                    ..
+                } if name == "__ku_optional_select" && args.len() == 2 => cursor = &args[1],
+                IrExprKind::Call {
+                    kind: IrCallKind::Intrinsic(name),
+                    args,
+                    ..
+                } if matches!(
+                    name.as_str(),
+                    "__ku_object_optional_field_view" | "__ku_value_optional_field_view"
+                ) && args.len() == 2 =>
+                {
+                    cursor = &args[0]
                 }
                 _ => return false,
             }
@@ -177,9 +200,36 @@ impl Verifier<'_> {
                         }
                     }
                 } else if let IrCallKind::Intrinsic(name) = kind {
-                    let borrowed_read = name == "__ku_clone"
-                        || name == "__ku_enum_tag"
-                        || (name.starts_with("__ku_enum_payload:") && !ir_type_is_owned(&expr.ty));
+                    let borrowed_read = matches!(name.as_str(), "__ku_clone" | "__ku_clone_nullable")
+                            || crate::interop::ReturnKind::for_builtin(name).is_some()
+                            || name == "__ku_enum_tag"
+                            || matches!(
+                                name.as_str(),
+                                "__ku_nullable_get"
+                                    | "__ku_nullable_is_null"
+                                    | "__ku_optional_select"
+                                    | "__ku_object_optional_field_view"
+                                    | "__ku_value_optional_field_view"
+                                    | "__ku_calendar_field_str"
+                                    | "__ku_calendar_field_int"
+                                    | "__ku_http_response_from_object_view"
+                                    | "__ku_http_response_from_value_view"
+                                    | "__ku_http_headers_get"
+                                    | "__ku_http_response_headers_read"
+                                    | "__ku_http_response_public_value"
+                                    | "__ku_http_client_config_field_int"
+                                    | "__ku_http_client_config_field_str"
+                            )
+                            // The request StringMap dot projection is a separate
+                            // HTTP getter, not __ku_object_get: it borrows map/key
+                            // and returns a cloned owned KuString (or static "").
+                            || (name == "__ku_http_map_get"
+                                && args.len() == 2
+                                && args[0].ty == IrType::Named("__ku_object".into())
+                                && args[1].ty == IrType::Str
+                                && expr.ty == IrType::Str)
+                            || (name.starts_with("__ku_enum_payload:")
+                                && !ir_type_is_owned(&expr.ty));
                     if !borrowed_read {
                         let signature = metadata::builtin_signature(name).or_else(|| {
                             name.split_once('.')
@@ -191,9 +241,9 @@ impl Verifier<'_> {
                                 && signature.as_ref().and_then(|s| s.arg_modes.get(i))
                                     != Some(&ParamMode::View)
                             {
-                                return Err(invalid(
-                                    "borrowed value passed to an owning intrinsic",
-                                ));
+                                return Err(invalid(&format!(
+                                    "borrowed value passed to an owning intrinsic {name} argument {i}"
+                                )));
                             }
                         }
                     }

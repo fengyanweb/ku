@@ -1,13 +1,16 @@
-//! One socket owner for the interpreter HTTP transport. Ku handlers and their
-//! Values remain on the caller; only parsed/wire data crosses this boundary.
+//! One socket owner for the interpreter HTTP transport. Only parsed requests,
+//! wire responses and cancellation markers cross this boundary.
 
 use super::http_flight::{self, FlightRecord, Stage};
 use super::{
     encode_http_response, entry_span, finish_http_request, http_deadline, netpoll, parse_http_head,
     status_response, HttpConnectionPermit, HttpRejection, HttpServerRuntimeLimits, HttpSlowTrace,
     HttpSlowTraceSample, HttpWireResponse, ParsedHttpHead, ParsedHttpRequest,
-    PendingHttpConnection, HTTP_ACCEPT_BATCH,
+    PendingHttpConnection, RuntimeTermination, TerminationReason, HTTP_ACCEPT_BATCH,
+    HTTP_HANDLER_CLEANUP_GRACE,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
 use std::{
     borrow::Cow,
     collections::VecDeque,
@@ -19,10 +22,103 @@ use std::{
         Arc, OnceLock,
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::Duration,
 };
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
 const READ_CHUNK: usize = 8192;
+const PAUSED_PEER_PROBE: Duration = Duration::from_millis(100);
+
+/// The reactor publishes only a marker. Task cancellation and capture
+/// destruction remain on the handler owner, never the socket thread.
+#[derive(Default)]
+pub(super) struct HandlerCancellation {
+    watched: AtomicBool,
+    context: OnceLock<RuntimeTermination>,
+}
+
+impl HandlerCancellation {
+    pub(super) fn context(&self) -> Option<RuntimeTermination> {
+        self.context.get().copied()
+    }
+
+    fn signal(&self, reason: TerminationReason, stopped_at: Instant) {
+        let _ = self.context.set(RuntimeTermination {
+            reason,
+            cleanup_deadline: http_deadline_from(stopped_at, HTTP_HANDLER_CLEANUP_GRACE),
+        });
+    }
+
+    fn watching(&self) -> bool {
+        self.watched.load(Ordering::Acquire)
+    }
+}
+
+fn http_deadline_from(start: Instant, limit: Duration) -> Instant {
+    start.checked_add(limit).unwrap_or(start)
+}
+
+struct DrainControl {
+    token: String,
+    timeout: Duration,
+}
+
+impl DrainControl {
+    fn from_env() -> io::Result<Option<Self>> {
+        let Some(token) = std::env::var_os("KU_SERVICE_CONTROL_TOKEN") else {
+            return Ok(None);
+        };
+        let token = token
+            .into_string()
+            .ok()
+            .filter(|s| (1..=128).contains(&s.len()))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "service control token length must be 1..128 UTF-8 bytes",
+                )
+            })?;
+        let timeout = std::env::var("KU_HTTP_DRAIN_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|ms| (1..=300_000).contains(ms))
+            .unwrap_or(5_000);
+        Ok(Some(Self {
+            token,
+            timeout: Duration::from_millis(timeout),
+        }))
+    }
+
+    fn response(
+        &self,
+        request: &ParsedHttpRequest,
+        stream: &TcpStream,
+    ) -> Option<(HttpWireResponse, bool)> {
+        if request.path != "/__ku/drain" {
+            return None;
+        }
+        let authorized = stream.peer_addr().is_ok_and(|peer| peer.ip().is_loopback())
+            && request
+                .headers
+                .get("x-ku-control-token")
+                .is_some_and(|value| {
+                    value.len() == self.token.len()
+                        && value
+                            .bytes()
+                            .zip(self.token.bytes())
+                            .fold(0, |diff, (a, b)| diff | (a ^ b))
+                            == 0
+                });
+        Some(if !authorized {
+            (status_response(403, "Forbidden"), false)
+        } else if request.method != "POST" {
+            (status_response(404, "Not Found"), false)
+        } else {
+            (status_response(200, "Draining"), true)
+        })
+    }
+}
 
 // Requested backing capacities of transport-owned strings/bytes. Allocator
 // metadata, map buckets, Ku values retained by user code and library internals
@@ -584,9 +680,16 @@ pub(super) struct HttpIoReply {
     trace_config: Option<HttpTraceConfig>,
     handler_credit: Option<HttpTraceCredit>,
     flight: Option<Arc<FlightRecord>>,
+    cancellation: Arc<HandlerCancellation>,
 }
 
 impl HttpIoReply {
+    pub(super) fn watch_peer(&self) -> io::Result<Arc<HandlerCancellation>> {
+        self.cancellation.watched.store(true, Ordering::Release);
+        self.wake.notify()?;
+        Ok(Arc::clone(&self.cancellation))
+    }
+
     pub(super) fn handler_started(&mut self) {
         if let (Some(trace), Some(config)) = (&mut self.trace, &self.trace_config) {
             trace.handler_started = Some(Instant::now());
@@ -730,6 +833,7 @@ impl HttpIo {
             limits,
             TcpListener::accept,
             HttpTraceConfig::from_env(),
+            DrainControl::from_env()?,
         )
     }
 
@@ -744,7 +848,7 @@ impl HttpIo {
     where
         F: FnMut(&TcpListener) -> io::Result<(TcpStream, std::net::SocketAddr)> + Send + 'static,
     {
-        Self::start_with_accept_and_trace(listener, limits, accept, None)
+        Self::start_with_accept_and_trace(listener, limits, accept, None, None)
     }
 
     fn start_with_accept_and_trace<F>(
@@ -752,6 +856,7 @@ impl HttpIo {
         limits: HttpServerRuntimeLimits,
         accept: F,
         trace: Option<HttpTraceConfig>,
+        drain_control: Option<DrainControl>,
     ) -> io::Result<Self>
     where
         F: FnMut(&TcpListener) -> io::Result<(TcpStream, std::net::SocketAddr)> + Send + 'static,
@@ -776,6 +881,7 @@ impl HttpIo {
             Arc::clone(&budget),
         );
         reactor.trace = trace;
+        reactor.drain_control = drain_control;
         let thread = thread::Builder::new()
             .name("ku-http-io".into())
             .spawn(move || reactor.run(accept))?;
@@ -795,16 +901,16 @@ impl HttpIo {
     }
 
     pub(super) fn next_job(&mut self, timeout: Duration) -> io::Result<Option<HttpIoJob>> {
-        if self
-            .thread
-            .as_ref()
-            .is_some_and(|thread| thread.is_finished())
-        {
+        if self.thread.as_ref().is_none_or(JoinHandle::is_finished) {
             self.join()?;
-            return Err(io::Error::other("HTTP I/O reactor stopped"));
+            return Ok(None);
         }
         match self.jobs.recv_timeout(timeout) {
             Ok(mut job) => {
+                if self.thread.as_ref().is_some_and(JoinHandle::is_finished) {
+                    self.join()?;
+                    return Ok(None);
+                }
                 if let Some(flight) = &job.flight {
                     flight.mark(Stage::Dequeued);
                 }
@@ -814,9 +920,13 @@ impl HttpIo {
             Err(RecvTimeoutError::Timeout) => Ok(None),
             Err(RecvTimeoutError::Disconnected) => {
                 self.join()?;
-                Err(io::Error::other("HTTP I/O reactor stopped"))
+                Ok(None)
             }
         }
+    }
+
+    pub(super) fn is_finished(&self) -> bool {
+        self.thread.is_none()
     }
 
     fn join(&mut self) -> io::Result<()> {
@@ -863,6 +973,8 @@ struct Reactor {
     trace: Option<HttpTraceConfig>,
     trace_started: Instant,
     trace_next_snapshot: Instant,
+    drain_control: Option<DrainControl>,
+    drain_deadline: Option<Instant>,
 }
 
 #[derive(Clone, Copy)]
@@ -904,6 +1016,8 @@ impl Reactor {
             trace: None,
             trace_started: Instant::now(),
             trace_next_snapshot: Instant::now(),
+            drain_control: None,
+            drain_deadline: None,
         }
     }
 
@@ -974,6 +1088,17 @@ impl Reactor {
             self.promote_pending()?;
             self.advance_buffered_headers();
             self.dispatch_requests()?;
+            if let Some(deadline) = self.drain_deadline {
+                if self.connection_count.load(Ordering::Acquire) == 0 && self.rejecting.is_none() {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "HTTP drain expired",
+                    ));
+                }
+            }
             self.trace_snapshot(Instant::now());
             if let Some(rejection) = self.rejecting.as_mut() {
                 if rejection.poll() {
@@ -987,6 +1112,7 @@ impl Reactor {
             let mut interests = Vec::with_capacity(self.slots.len() + 3);
             let mut owners = Vec::with_capacity(self.slots.len() + 3);
             let mut deadline = self.trace.as_ref().map(|_| self.trace_next_snapshot);
+            tighten_deadline(&mut deadline, self.drain_deadline);
             interests.push(netpoll::Interest {
                 socket: netpoll::Socket::Stream(&self.wake.reader),
                 read: true,
@@ -995,7 +1121,7 @@ impl Reactor {
             owners.push(PollOwner::Wake);
             // Match the existing single extra rejection owner: do not accept
             // another excess socket while its drain/write is still resident.
-            if self.rejecting.is_none() {
+            if self.rejecting.is_none() && self.drain_deadline.is_none() {
                 if let Some(retry) = self
                     .accept_retry_deadline
                     .filter(|retry| Instant::now() < *retry)
@@ -1058,7 +1184,7 @@ impl Reactor {
                     PollOwner::Wake => self.wake.drain()?,
                     PollOwner::Listener => self.accept_connections(&mut accept)?,
                     PollOwner::Connection(token) => {
-                        let allow_reuse = self.pending.is_empty();
+                        let allow_reuse = self.pending.is_empty() && self.drain_deadline.is_none();
                         let Some(slot) = self.slots.get_mut(token.slot) else {
                             continue;
                         };
@@ -1089,7 +1215,7 @@ impl Reactor {
     }
 
     fn observe_completions(&mut self) {
-        let allow_reuse = self.pending.is_empty();
+        let allow_reuse = self.pending.is_empty() && self.drain_deadline.is_none();
         for (index, slot) in self.slots.iter_mut().enumerate() {
             let Some(connection) = slot.connection.as_mut() else {
                 continue;
@@ -1134,11 +1260,17 @@ impl Reactor {
 
     fn expire_connections(&mut self) {
         let now = Instant::now();
+        let draining = self.drain_deadline.is_some();
         for index in 0..self.slots.len() {
             let close = self.slots[index]
                 .connection
                 .as_mut()
-                .is_some_and(|connection| connection.expire(now, self.limits));
+                .is_some_and(|connection| {
+                    (draining && connection.reused
+                        && matches!(&connection.state, State::Header(header) if header.bytes.bytes.is_empty()))
+                        || connection.expire(now, self.limits)
+                        || connection.check_paused_peer(now)
+                });
             if close {
                 self.close_slot(index);
             }
@@ -1241,7 +1373,7 @@ impl Reactor {
     }
 
     fn advance_buffered_headers(&mut self) {
-        let allow_reuse = self.pending.is_empty();
+        let allow_reuse = self.pending.is_empty() && self.drain_deadline.is_none();
         for index in 0..self.slots.len() {
             let close = self.slots[index].connection.as_mut().is_some_and(|connection| {
                 matches!(&connection.state, State::Header(header) if header.scanned < header.bytes.bytes.len())
@@ -1270,6 +1402,26 @@ impl Reactor {
             };
             let request = request.take().expect("one request dispatch");
             let deadline = *deadline;
+            if let Some((response, drain_timeout)) =
+                self.drain_control.as_ref().and_then(|control| {
+                    let (response, drain) = control.response(&request, &connection.stream)?;
+                    Some((response, drain.then_some(control.timeout)))
+                })
+            {
+                connection.carry = Buffer::empty(&self.budget);
+                let writing =
+                    Writing::new(response, self.limits.write_timeout, false, &self.budget);
+                if self.drain_deadline.is_none() && writing.wire_status() == 200 {
+                    self.drain_deadline = drain_timeout.map(http_deadline);
+                }
+                connection.state = State::Write(writing);
+                continue;
+            }
+            if self.drain_deadline.is_some() {
+                connection.carry = Buffer::empty(&self.budget);
+                connection.state = State::Write(Writing::unavailable(self.limits.write_timeout));
+                continue;
+            }
             connection.keep_alive = request.keep_alive;
             connection.carry = std::mem::replace(carry, Buffer::empty(&self.budget));
             let input_charge = input_charge.take().expect("one input charge transfer");
@@ -1313,6 +1465,7 @@ impl Reactor {
             });
             connection.flight = flight.clone();
             let (sender, receiver) = mpsc::sync_channel(1);
+            let cancellation = Arc::new(HandlerCancellation::default());
             let job = HttpIoJob {
                 token,
                 request,
@@ -1326,6 +1479,7 @@ impl Reactor {
                     trace_config: connection.trace_config.clone(),
                     handler_credit: None,
                     flight: flight.clone(),
+                    cancellation: Arc::clone(&cancellation),
                 },
                 flight: flight.clone(),
                 queued_credit: connection
@@ -1341,7 +1495,12 @@ impl Reactor {
                     if let Some(flight) = &flight {
                         flight.mark(Stage::Enqueued);
                     }
-                    connection.state = State::Handler { receiver, deadline };
+                    connection.state = State::Handler {
+                        receiver,
+                        deadline,
+                        cancellation,
+                        peer_probe: None,
+                    };
                 }
                 Err(TrySendError::Full(_)) => {
                     if let Some(config) = &connection.trace_config {
@@ -1409,6 +1568,20 @@ fn tighten_deadline(saved: &mut Option<Instant>, deadline: Option<Instant>) {
     }
 }
 
+fn transient_peer_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+    )
+}
+
+fn peer_socket_failed(stream: &TcpStream) -> bool {
+    match stream.take_error() {
+        Ok(None) => false,
+        Ok(Some(error)) | Err(error) => !transient_peer_error(&error),
+    }
+}
+
 struct Connection {
     stream: TcpStream,
     accepted_at: Instant,
@@ -1438,6 +1611,8 @@ enum State {
     Handler {
         receiver: Receiver<Completion>,
         deadline: Instant,
+        cancellation: Arc<HandlerCancellation>,
+        peer_probe: Option<Instant>,
     },
     Write(Writing),
 }
@@ -1655,7 +1830,11 @@ impl Connection {
         match &self.state {
             State::Header(header) => Some(header.header_deadline.unwrap_or(header.idle_deadline)),
             State::Body(body) => Some(body.deadline),
-            State::Handler { deadline, .. } => Some(*deadline),
+            State::Handler {
+                deadline,
+                peer_probe,
+                ..
+            } => Some(peer_probe.map_or(*deadline, |probe| probe.min(*deadline))),
             State::Write(write) => Some(write.deadline),
             State::Request { deadline, .. } => Some(*deadline),
         }
@@ -1665,17 +1844,47 @@ impl Connection {
         match &self.state {
             State::Header(_) | State::Body(_) => (true, false),
             State::Write(_) => (false, true),
-            State::Request { .. } | State::Handler { .. } => (false, false),
+            State::Handler {
+                cancellation,
+                peer_probe,
+                ..
+            } => (cancellation.watching() && peer_probe.is_none(), false),
+            State::Request { .. } => (false, false),
         }
     }
 
+    fn check_paused_peer(&mut self, now: Instant) -> bool {
+        let State::Handler {
+            peer_probe: Some(probe),
+            ..
+        } = &mut self.state
+        else {
+            return false;
+        };
+        if now < *probe {
+            return false;
+        }
+        *probe = http_deadline_from(now, PAUSED_PEER_PROBE);
+        peer_socket_failed(&self.stream)
+    }
+
     fn expire(&mut self, now: Instant, limits: HttpServerRuntimeLimits) -> bool {
-        if self.deadline().is_none_or(|deadline| now < deadline) {
+        // Peer probes are wake-up times, never request deadlines.
+        let request_deadline = match &self.state {
+            State::Handler { deadline, .. } => Some(*deadline),
+            _ => self.deadline(),
+        };
+        if request_deadline.is_none_or(|deadline| now < deadline) {
             return false;
         }
         let response = match self.state {
             State::Header(_) | State::Body(_) => status_response(408, "Request Timeout"),
-            State::Handler { .. } => {
+            State::Handler {
+                ref cancellation,
+                deadline,
+                ..
+            } => {
+                cancellation.signal(TerminationReason::TimedOut, deadline);
                 if let Some(flight) = &self.flight {
                     flight.expire(Stage::ReactorExpired);
                     flight.mark(Stage::WriteStart);
@@ -1773,7 +1982,27 @@ impl Connection {
                     }
                 };
             }
-            State::Request { .. } | State::Handler { .. } => None,
+            State::Handler {
+                cancellation,
+                peer_probe,
+                ..
+            } => {
+                if !cancellation.watching() || peer_probe.is_some() {
+                    return false;
+                }
+                // Take SO_ERROR before peeking so buffered pipeline data
+                // cannot mask a reported reset. FIN may be a valid half-close.
+                if peer_socket_failed(&self.stream) {
+                    return true;
+                }
+                match self.stream.peek(&mut [0; 1]) {
+                    Ok(_) => *peer_probe = Some(http_deadline(PAUSED_PEER_PROBE)),
+                    Err(error) if !transient_peer_error(&error) => return true,
+                    Err(_) => {}
+                }
+                None
+            }
+            State::Request { .. } => None,
         };
         if let Some(next) = next {
             self.state = match next {
@@ -1791,6 +2020,14 @@ impl Connection {
             };
         }
         false
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if let State::Handler { cancellation, .. } = &self.state {
+            cancellation.signal(TerminationReason::Cancelled, Instant::now());
+        }
     }
 }
 
@@ -2228,6 +2465,7 @@ mod buffer_tests {
             limits,
             TcpListener::accept,
             Some(config),
+            None,
         )
         .unwrap();
         let budget = Arc::clone(&io.budget);
@@ -2320,6 +2558,7 @@ mod buffer_tests {
             trace_config: None,
             handler_credit: None,
             flight: Some(Arc::clone(&failed_wake_flight)),
+            cancellation: Arc::new(HandlerCancellation::default()),
         };
         assert!(reply
             .respond(token, status_response(200, "channel accepted"))
@@ -2494,5 +2733,72 @@ mod buffer_tests {
         assert_eq!(budget.snapshot().peak, 192);
         drop(bytes);
         assert_eq!(budget.snapshot().current, 0);
+    }
+
+    #[test]
+    fn watched_handler_preserves_peer_fin_and_pipeline_until_original_deadline() {
+        for pipeline in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            if pipeline {
+                client
+                    .write_all(b"GET /next HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    .unwrap();
+            }
+            client.shutdown(Shutdown::Write).unwrap();
+            let mut byte = [0; 1];
+            // Witness the actual FIN or read-ready byte before exercising the
+            // handler state. Neither witness is a broken-peer cancellation.
+            assert_eq!(stream.peek(&mut byte).unwrap(), usize::from(pipeline));
+            stream.set_nonblocking(true).unwrap();
+            let limits = super::super::finally_tests::http_test_limits();
+            let budget = BufferBudget::new(limits.max_buffer_bytes);
+            let count = Arc::new(AtomicUsize::new(0));
+            let mut connection = Connection::new(
+                PendingHttpConnection {
+                    stream,
+                    accepted_at: Instant::now(),
+                    _permit: HttpConnectionPermit::try_acquire(Arc::clone(&count), 1).unwrap(),
+                },
+                limits,
+                Arc::clone(&budget),
+                None,
+            );
+            let (_sender, receiver) = mpsc::sync_channel(1);
+            let cancellation = Arc::new(HandlerCancellation::default());
+            cancellation.watched.store(true, Ordering::Release);
+            let deadline = http_deadline(Duration::from_secs(1));
+            connection.state = State::Handler {
+                receiver,
+                deadline,
+                cancellation: Arc::clone(&cancellation),
+                peer_probe: None,
+            };
+
+            assert_eq!(connection.interest(), (true, false));
+            assert!(!connection.poll(limits, true));
+            assert_eq!(connection.interest(), (false, false));
+            assert_eq!(
+                connection.stream.peek(&mut byte).unwrap(),
+                usize::from(pipeline)
+            );
+            let probe = connection.deadline().unwrap();
+            assert!(probe < deadline);
+            assert!(!connection.expire(probe, limits));
+            assert!(!connection.check_paused_peer(probe));
+            assert!(cancellation.context().is_none());
+            assert!(!connection.expire(deadline, limits));
+            assert_eq!(
+                cancellation.context().unwrap().reason,
+                TerminationReason::TimedOut
+            );
+            drop(connection);
+            assert_eq!(count.load(Ordering::Acquire), 0);
+            assert_eq!(budget.snapshot().current, 0);
+        }
     }
 }

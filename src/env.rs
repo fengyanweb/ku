@@ -273,6 +273,8 @@ impl Drop for BorrowLease {
 #[derive(Debug)]
 pub struct Env {
     scopes: Vec<Scope>,
+    #[cfg(feature = "browser")]
+    browser_origin: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -286,6 +288,8 @@ struct Scope {
 impl Clone for Env {
     fn clone(&self) -> Self {
         Self {
+            #[cfg(feature = "browser")]
+            browser_origin: self.browser_origin.clone(),
             scopes: self
                 .scopes
                 .iter()
@@ -302,7 +306,19 @@ impl Env {
     pub fn new() -> Self {
         Self {
             scopes: vec![Scope::default()],
+            #[cfg(feature = "browser")]
+            browser_origin: None,
         }
+    }
+
+    #[cfg(feature = "browser")]
+    pub(crate) fn browser_origin(&self) -> Option<&str> {
+        self.browser_origin.as_deref()
+    }
+
+    #[cfg(feature = "browser")]
+    pub(crate) fn set_browser_origin(&mut self, origin: &str) {
+        self.browser_origin = Some(origin.to_owned());
     }
 
     pub fn push_scope(&mut self) {
@@ -383,6 +399,8 @@ impl Env {
                 span,
             ));
         }
+        #[cfg(feature = "browser")]
+        crate::browser::preflight_args(std::slice::from_ref(&value), span)?;
         scope.bindings.insert(
             name.clone(),
             Arc::new(Mutex::new(Binding {
@@ -511,6 +529,8 @@ impl Env {
             }
         }
         Env {
+            #[cfg(feature = "browser")]
+            browser_origin: self.browser_origin.clone(),
             scopes: vec![Scope {
                 bindings: captured,
                 owned_bindings: HashSet::new(),
@@ -533,6 +553,8 @@ impl Env {
     }
 
     pub(crate) fn assign_owned(&mut self, name: &str, value: Value, span: Span) -> KuResult<()> {
+        #[cfg(feature = "browser")]
+        crate::browser::preflight_args(std::slice::from_ref(&value), span)?;
         value.require_owned_root(span)?;
         for scope in self.scopes.iter_mut().rev() {
             if let Some(binding) = scope.bindings.get(name) {
@@ -568,7 +590,11 @@ impl Env {
     }
 
     pub fn get(&self, name: &str, span: Span) -> KuResult<Value> {
-        self.with_value(name, span, |value| Ok(value.clone()))
+        self.with_value(name, span, |value| {
+            #[cfg(feature = "browser")]
+            crate::browser::preflight_args(std::slice::from_ref(value), span)?;
+            Ok(value.clone())
+        })
     }
 
     /// A synchronous scalar subtree may share this cell only while its type
@@ -1071,6 +1097,14 @@ impl Env {
         let Value::String(value) = &mut binding.value else {
             unreachable!("string type was checked while holding the binding lock")
         };
+        #[cfg(feature = "browser")]
+        crate::browser::allocation(
+            value
+                .len()
+                .checked_add(text.len())
+                .ok_or_else(|| crate::browser::fail(span))?,
+            span,
+        )?;
         value
             .try_reserve(text.len())
             .map_err(|_| KuError::runtime("string append out of memory", span))?;
@@ -1094,6 +1128,17 @@ impl Env {
         let Value::Array(values) = &mut binding.value else {
             return Err(KuError::runtime("type error: expected array", span));
         };
+        #[cfg(feature = "browser")]
+        if crate::browser::active() {
+            let piece = crate::browser::value_cost(&value, 1, span)?;
+            let mut bytes = piece;
+            for item in values.iter() {
+                bytes = bytes
+                    .checked_add(crate::browser::value_cost(item, 1, span)?)
+                    .ok_or_else(|| crate::browser::fail(span))?;
+            }
+            crate::browser::allocation(bytes, span)?;
+        }
         values
             .try_reserve(1)
             .map_err(|_| KuError::runtime("array append out of memory", span))?;

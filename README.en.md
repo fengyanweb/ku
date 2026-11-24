@@ -32,15 +32,16 @@ From this repository:
 ku run examples/hello.ku
 ku check examples/json.ku
 ku build --backend c --profile release examples/hello.ku -o hello
+ku build --backend runner --profile release examples/hello.ku -o hello-runner
 ```
 
-Backend coverage differs. Database drivers need native output and their client libraries. Multi-loop HTTP and owner Task execution refer to the native C backend; a successful `ku check` does not prove that every backend supports a program.
+Current source builds default to native C. Published 0.0.20 packages retain their Runner default; use `--backend c` or `--backend runner` to choose explicitly across versions. Backend coverage differs. Database drivers need native output and their client libraries. Multi-loop HTTP and owner Task execution refer to the native C backend; a successful `ku check` does not prove that every backend supports a program.
 
 ## Documentation
 
 - [Guides and library reference](web/src/content/docs/en/docs): language syntax, ownership, errors, HTTP, Task, JSON, time, databases, and platform limits.
 - [Runnable examples](examples), [syntax contract](docs/syntax.md), and [semantic contract](docs/semantics.md).
-- [Task semantics and backend coverage](docs/concurrency.md).
+- [Task semantics and backend coverage](docs/concurrency.md), [native C capabilities and platforms](docs/native-capabilities.en.md).
 - [Network and database protocols](docs/protocol-foundation.md): connection options, TLS, and verified platform support.
 - [VS Code extension](editors/vscode-ku/README.md).
 - [Historical 0.0.19 seven-language fixed-load comparison](docs/performance-v0.0.19.en.md).
@@ -50,7 +51,7 @@ Use `ku --help` and subcommand help for the installed version's options. Common 
 
 ## Build from source
 
-Source builds are pinned to Rust 1.99.1. Installed `ku run` and `ku check` do not require Rust. Default Runner `ku build` requires a compiler with the exact identity recorded by its SDK and a system linker; a precompiled rlib is not portable across arbitrary rustc versions. Native C output needs a supported C compiler and the native libraries used by the program. See [CLI and SDK compatibility](docs/cli-runtime-bundle.en.md).
+Source builds are pinned to Rust 1.99.1. Installed `ku run` and `ku check` do not require Rust. `ku build --backend runner` requires a compiler with the exact identity recorded by its SDK and a system linker; a precompiled rlib is not portable across arbitrary rustc versions. Native C output needs a supported C compiler and the native libraries used by the program; unsupported native programs do not silently fall back to the Runner. See [CLI and SDK compatibility](docs/cli-runtime-bundle.en.md).
 
 ```sh
 cargo +1.99.1 build --locked --release
@@ -70,6 +71,6 @@ Report problems through [GitHub Issues](https://github.com/fengyanweb/ku/issues)
 
 ## Support Ku
 
-You can support Ku development and documentation through [Afdian](https://afdian.com/a/ku-lang) or WeChat. Support is voluntary and does not affect access to Ku.
+You can support Ku development and documentation through WeChat. Support is voluntary and does not affect access to Ku.
 
 <a href="web/public/images/wechat-donation.png"><img src="web/public/images/wechat-donation.png" alt="WeChat appreciation QR code for Ku" width="220"></a>

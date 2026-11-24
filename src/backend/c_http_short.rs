@@ -1182,7 +1182,14 @@ fn task_request_fields(function: &crate::ir::task::TaskFunction) -> Option<u32> 
     for state in &function.states {
         for operation in &state.operations {
             match operation {
-                TaskOp::HttpMapGet { map, .. } => {
+                TaskOp::HttpMapGet {
+                    request: source,
+                    map,
+                    ..
+                } => {
+                    if !request(source) {
+                        continue;
+                    }
                     fields |= match map.as_str() {
                         "headers" => 1,
                         "params" => 2,
@@ -1216,7 +1223,7 @@ fn task_request_fields(function: &crate::ir::task::TaskFunction) -> Option<u32> 
                     }
                 }
                 // The typed verifier restricts all remaining operands to
-                // primitives, errors, responses, flat arrays, PG/net handles,
+                // primitives, bounded enums, errors, responses, flat arrays, PG/net handles,
                 // or Task/callable identities; they cannot observe a request.
                 // Drop accepts the zero owners of omitted fields.
                 TaskOp::Drop { .. }
@@ -1232,9 +1239,14 @@ fn task_request_fields(function: &crate::ir::task::TaskFunction) -> Option<u32> 
                 | TaskOp::InitCallable { .. }
                 | TaskOp::CloneCallable { .. }
                 | TaskOp::ArrayMake { .. }
+                | TaskOp::RecordMake { .. }
+                | TaskOp::RecordField { .. }
+                | TaskOp::EnumStringMove { .. }
                 | TaskOp::ArrayClone { .. }
+                | TaskOp::Collection { .. }
                 | TaskOp::ArrayLen { .. }
                 | TaskOp::StringLen { .. }
+                | TaskOp::StringContainsStep { .. }
                 | TaskOp::StringClone { .. }
                 | TaskOp::PrimitiveString { .. }
                 | TaskOp::StringConcat { .. }
@@ -1252,6 +1264,7 @@ fn task_request_fields(function: &crate::ir::task::TaskFunction) -> Option<u32> 
                 | TaskOp::JsonValue { .. }
                 | TaskOp::JsonObject { .. }
                 | TaskOp::HttpResponse { .. }
+                | TaskOp::HttpHeaderSet { .. }
                 | TaskOp::CheckForLimit { .. }
                 | TaskOp::Print { .. } => {}
             }

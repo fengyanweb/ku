@@ -1,4 +1,6 @@
 //! Opt-in, bounded request timeline. These clocks never control a deadline.
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
 use std::{
     cell::RefCell,
     io::{self, Write},
@@ -6,8 +8,10 @@ use std::{
         atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc, OnceLock,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
 const STAGES: usize = 24;
 const MAX_SNAPSHOTS: usize = 32;

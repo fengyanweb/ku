@@ -32,7 +32,9 @@ macro_rules! alias_contracts {
             "  ku ir <file.ku>       Print checked Ku IR draft\n",
             "  ku llvm <file.ku>     Emit prototype LLVM text IR\n",
             "  ku build [options] [file.ku|project-directory]\n",
-            "                        Default: debug profile, runner backend\n",
+            "                        Default: debug profile, native C backend\n",
+            "  ku i [source] [--dev|--locked|--offline] [--prod]\n",
+            "  ku package install [source] [options]\n",
             "  ku package gc [path]\n",
             "  ku package pack [path]\n",
             "  ku package publish [path]\n",
@@ -51,9 +53,9 @@ macro_rules! alias_contracts {
             "Aliases and scopes:\n",
             $("  ", $scope, ": ", $canonical, " = ", $aliases, "\n    ", $note, "\n",)*
             "\nBuild output:\n",
-            "  Default runner packages the interpreter using the matching Rust toolchain.\n",
-            "  --backend c builds a native executable with a supported C compiler.\n",
-            "  --emit-c also emits C; it does not switch away from runner.\n",
+            "  Default native C builds an executable using a supported C compiler.\n",
+            "  --backend runner packages the interpreter using its matching Rust toolchain.\n",
+            "  --emit-c emits C without changing the selected backend.\n",
             "  --backend llvm currently emits text IR, not a linked executable.\n",
             "  Historical `ku build --native FILE` emits C only; adding -o/--output\n",
             "  selects a C executable. --native must immediately follow `build`.\n",
@@ -74,6 +76,7 @@ alias_contracts! {
     ("create", "--template TEMPLATE", "-t TEMPLATE", "Example: ku create hello -t http."),
     ("init", "--template TEMPLATE", "-t TEMPLATE", "Example: ku init -t cli."),
     ("template", "ku template list", "ku create --list", "Lists basic, cli, http, json, fs and lib templates."),
+    ("package", "ku package install", "ku i", "Both spellings add or restore the same dependencies."),
     ("build", "--output PATH", "-o PATH", "Pass output paths as separate arguments; quote paths containing spaces."),
     ("build", "--profile release", "--release", "Select the release profile."),
     ("build", "--profile debug", "--debug", "Debug is the default profile."),
@@ -81,8 +84,8 @@ alias_contracts! {
     ("build", "--profile fast", "--fast", "Select the fast profile; this is separate from --release."),
     ("build", "--emit-llvm", "--emit-ll", "Also emit prototype LLVM text IR."),
     ("build", "--verbose", "-v", "Within build, -v prints build logs; it does not print Ku version."),
-    ("build", "--backend runner", "--backend interp, --backend interpreter", "Runner is the default and requires the bundle-matching Rust compiler for building."),
-    ("build", "--backend c", "--backend native-c", "Native C executable; requires a supported C toolchain."),
+    ("build", "--backend runner", "--backend interp, --backend interpreter", "Explicit interpreter wrapper; building requires the bundle-matching Rust compiler."),
+    ("build", "--backend c", "--backend native-c", "Default native C executable; requires a supported C toolchain."),
     ("build", "--backend llvm", "--backend ll", "Prototype text IR output; not a complete executable link path."),
 }
 
@@ -164,15 +167,24 @@ pub const COMMANDS: &[CommandContract] = &[
     },
     CommandContract {
         name: "build", usage: "ku build [options] [file.ku|project-directory]",
-        description: "Build a runnable program; defaults to debug profile and runner backend.",
-        notes: "Options: --output/-o PATH; --profile debug|release|small|fast; --target host|TARGET; --backend runner|c|llvm; --emit-c; --emit-ir; --emit-llvm/--emit-ll; --clean; --verbose/-v; --lto; --strip; --static; --locked|--offline.\nA pathless build or `ku build .` needs a valid ku.mod entry. --target host is the default host choice. Runner packages the interpreter and requires its bundle-matching Rust compiler. --backend c creates a native executable using a C compiler. --emit-c does not select the C backend. --backend llvm emits text IR only.\nCompatibility: --native must immediately follow build. `ku build --native FILE` emits C only; adding -o/--output builds a C executable. It is not an unconditional --backend c alias.\nExamples:\n  ku build ./hello.ku\n  ku build -v --release ./hello.ku -o ./dist/hello\n  ku build --backend c --release ./hello.ku -o ./dist/hello\n  ku doctor --backend runner",
+        description: "Build a native executable; defaults to debug profile and native C backend.",
+        notes: "Options: --output/-o PATH; --profile debug|release|small|fast; --target host|TARGET; --backend runner|c|llvm; --emit-c; --emit-ir; --emit-llvm/--emit-ll; --clean; --verbose/-v; --lto; --strip; --static; --locked|--offline.\nA pathless build or `ku build .` needs a valid ku.mod entry. --target host is the default host choice. Default C builds a native executable with a supported C compiler and its program dependencies. --backend runner explicitly packages the interpreter and requires its bundle-matching Rust compiler. --emit-c does not change the selected backend. --backend llvm emits text IR only.\nCompatibility: --native must immediately follow build. `ku build --native FILE` emits C only; adding -o/--output builds a C executable. It is not an unconditional --backend c alias.\nExamples:\n  ku build ./hello.ku\n  ku build -v --release ./hello.ku -o ./dist/hello\n  ku build --backend c --release ./hello.ku -o ./dist/hello\n  ku doctor --backend runner",
         value_options: BUILD_VALUES, flags: BUILD_FLAGS, maximum_paths: 1,
     },
     CommandContract {
-        name: "package", usage: "ku package <gc|pack|publish|yank|resolve> [path]",
+        name: "package", usage: "ku package <install|gc|pack|publish|yank|resolve> [path]",
         description: "Manage project source/dependency packages.",
         notes: "Omitted paths use the current project context. `package pack` creates a source/dependency archive, not a runnable executable. Use `ku help package SUBCOMMAND` for details.",
         value_options: &[], flags: &[], maximum_paths: 0,
+    },
+    CommandContract {
+        name: "package install",
+        usage: "ku package install [source] [--dev] [--python PATH] [--module NAME]\n  ku package install [--locked|--offline] [--prod]\n  ku i [source] [options]",
+        description: "Add a direct project dependency or restore the existing lock.",
+        notes: "Sources include a package name from the configured signed registry, ./vendor/library, an HTTPS Git URL with optional #TAG or #FULL_COMMIT[:SUBDIR], ./module.py, or pypi:DISTRIBUTION. For a Python distribution use --module when its import name must be supplied, and --python to select a compatible interpreter. --dev adds a development dependency. --prod restores production dependencies from the same lock. --locked requires the existing lock; --offline also prohibits network access. Without a source, restore preserves valid pins. Use package resolve to refresh.",
+        value_options: &["--python", "--module"],
+        flags: &["--dev", "--prod", "--locked", "--offline"],
+        maximum_paths: 1,
     },
     CommandContract {
         name: "package gc", usage: "ku package gc [path]", description: "Remove unused package cache entries for a project.",
@@ -199,10 +211,10 @@ pub const COMMANDS: &[CommandContract] = &[
         value_options: &[], flags: DEPENDENCY_FLAGS, maximum_paths: 1,
     },
     CommandContract {
-        name: "doctor", usage: "ku doctor [--json] [--backend runner|c]\n  ku doctor --install-runner-toolchain",
+        name: "doctor", usage: "ku doctor [--json] [--backend runner|c]\n  ku doctor --build-identity\n  ku doctor --install-runner-toolchain",
         description: "Diagnose the current Ku installation and available build tools.",
-        notes: "Default diagnostics are read-only; optional unrequested backends may warn. --backend runner or --backend c requires that backend to be ready. --json emits a stable JSON object only. --install-runner-toolchain explicitly installs this bundle's required Rust toolchain without changing global defaults or project overrides. KU_RUNNER_RUSTC is an explicit absolute compiler path: it has priority and a mismatched compiler is rejected rather than ignored. Help never probes or installs tools and cannot be combined with --json.",
-        value_options: &["--backend"], flags: &["--json", "--install-runner-toolchain"], maximum_paths: 0,
+        notes: "Default diagnostics are read-only; optional unrequested backends may warn. --backend runner or --backend c requires that backend to be ready. --json emits a stable JSON object only. --build-identity reports the CLI's compiled-in identity as JSON without loading a runtime bundle or probing build tools. --install-runner-toolchain explicitly installs this bundle's required Rust toolchain without changing global defaults or project overrides. KU_RUNNER_RUSTC is an explicit absolute compiler path: it has priority and a mismatched compiler is rejected rather than ignored. Help never probes or installs tools and cannot be combined with --json.",
+        value_options: &["--backend"], flags: &["--json", "--build-identity", "--install-runner-toolchain"], maximum_paths: 0,
     },
     CommandContract {
         name: "version", usage: "ku version", description: "Print Ku version.",
@@ -225,6 +237,7 @@ pub const COMMANDS: &[CommandContract] = &[
 ];
 
 pub fn command_contract(name: &str) -> Option<&'static CommandContract> {
+    let name = if name == "i" { "package install" } else { name };
     COMMANDS.iter().find(|contract| contract.name == name)
 }
 
@@ -440,7 +453,7 @@ mod tests {
         }
         assert!(help(&["ku", "build", "-o", "--help", "hello.ku", "-h"])
             .unwrap()
-            .contains("runner backend"));
+            .contains("native C backend"));
     }
 
     #[test]
@@ -528,7 +541,7 @@ mod tests {
         }
         let build = help(&["ku", "build", "--help"]).unwrap();
         assert!(build.contains("Within build, -v"));
-        assert!(build.contains("--emit-c does not select the C backend"));
+        assert!(build.contains("--emit-c does not change the selected backend"));
         assert!(build.contains("--native must immediately follow build"));
         let doctor = help(&["ku", "doctor", "--help"]).unwrap();
         assert!(doctor.contains("KU_RUNNER_RUSTC"));

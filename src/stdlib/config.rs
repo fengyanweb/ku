@@ -59,6 +59,10 @@ fn read_env_file(path: &Path, explicit: bool, span: Span) -> KuResult<Value> {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "config.yaml intentionally returns recoverable Ku error values"
+)]
 fn read_yaml_file(path: &Path, span: Span) -> Result<Value, Value> {
     read_limited(path, span)
         .and_then(|text| parse_yaml(&text, span))

@@ -4513,9 +4513,9 @@ mod tests {
     use super::*;
     use crate::cli::run_cli;
     use crate::package::{
-        discover_from_dir, pack_package, publish_package, resolve_remote_dependencies_with_mode,
-        write_lock, yank_package, DependencyResolveMode, PackageArtifact,
-        TestRegistryHttpAgentGuard,
+        discover_from_dir, install_dependency, pack_package, publish_package,
+        resolve_remote_dependencies_with_mode, write_lock, yank_package, DependencyResolveMode,
+        PackageArtifact, TestRegistryHttpAgentGuard,
     };
     use rcgen::{generate_simple_self_signed, CertifiedKey};
     use rustls::{pki_types::ServerName, ClientConnection};
@@ -6675,6 +6675,181 @@ mod tests {
             output.stderr.is_empty(),
             "source-free native consumer wrote stderr"
         );
+    }
+
+    #[test]
+    fn registry_signed_foreign_package_installs_and_runs_without_author() {
+        const INTERPRETER_ENTRY: &str = "KU_TEST_SIGNED_FOREIGN_ENTRY";
+        if let Some(entry) = env::var_os(INTERPRETER_ENTRY) {
+            run_cli(vec![
+                "ku".into(),
+                "run".into(),
+                "--offline".into(),
+                entry
+                    .into_string()
+                    .expect("foreign entry path must be UTF-8"),
+            ])
+            .expect("interpret the verified foreign package offline");
+            return;
+        }
+        let root = TestRoot::new("signed-foreign");
+        let files = test_server_files(
+            &root.0,
+            &[("token-foreign", "foreign")],
+            Duration::from_secs(5),
+        );
+        let mut server = TestServer::start(files.config, files.certificate);
+        let author = root.0.join("author");
+        let sdk = author.join("foreign");
+        fs::create_dir_all(&sdk).unwrap();
+        fs::write(
+            sdk.join("vendor.h"),
+            "#include <stdint.h>\nint64_t signed_twice(int64_t value);\n",
+        )
+        .unwrap();
+        fs::write(
+            sdk.join("vendor.c"),
+            "#include \"vendor.h\"\nint64_t signed_twice(int64_t value) { return 2 * value; }\n",
+        )
+        .unwrap();
+        let provider = crate::interop::c_ffi::prepare_install(&author, &sdk)
+            .expect("generate foreign package");
+        let manifest = provider.join("ku.mod");
+        let registry_config = format!(
+            "registry.url = {:?}\nregistry.public_key = {:?}\n",
+            server.base_url, server.public_key,
+        );
+        let author_manifest = fs::read_to_string(&manifest).unwrap();
+        fs::write(&manifest, format!("{author_manifest}{registry_config}")).unwrap();
+        let provider = discover_from_dir(&provider).unwrap().unwrap();
+        let published =
+            with_fresh_registry_http_agent(&server, || publish_package(&provider, "token-foreign"))
+                .expect("publish source-only foreign package through real signed registry");
+        fs::remove_dir_all(&author).expect("remove author source and artifacts before consumption");
+
+        let consumer = root.0.join("consumer");
+        fs::create_dir_all(consumer.join("src")).unwrap();
+        fs::write(
+            consumer.join("ku.mod"),
+            format!("name = \"consumer\"\nversion = \"1.0.0\"\n{registry_config}"),
+        )
+        .unwrap();
+        let mut project = discover_from_dir(&consumer).unwrap().unwrap();
+        assert!(!project.cache_dir.exists() && !project.lock_path.exists());
+        let receipt = with_fresh_registry_http_agent(&server, || {
+            install_dependency(
+                &mut project,
+                Some("foreign"),
+                false,
+                false,
+                DependencyResolveMode::Update,
+            )
+        })
+        .expect("install foreign package into an empty consumer cache");
+        let [package] = receipt.as_slice() else {
+            panic!("expected one signed registry install receipt");
+        };
+        assert_eq!(package.version, "0.1.0");
+        assert_eq!(
+            project.resolved_registry_dependencies[0].checksum,
+            published.checksum
+        );
+        let [module] = package.imports.as_slice() else {
+            panic!("expected one generated Ku module");
+        };
+        assert_eq!(module.path, "@foreign/native");
+        assert_eq!(module.exports, ["SignedTwice"]);
+        server.stop();
+
+        let main = consumer.join("src/main.ku");
+        fs::write(
+            &main,
+            format!(
+                "import {{ {} }} from {:?}\nfn main(): null! {{\n    result = SignedTwice(21)?\n    if (result != 42) {{ panic(\"wrong foreign result\") }}\n    println(result)\n    return ok(null)\n}}\n",
+                module.exports.join(", "), module.path,
+            ),
+        )
+        .unwrap();
+        let entry = main.to_string_lossy().into_owned();
+        run_cli(vec![
+            "ku".into(),
+            "check".into(),
+            "--locked".into(),
+            entry.clone(),
+        ])
+        .expect("prepare and check the published foreign source with the registry stopped");
+        // Windows keeps the loaded bridge DLL locked until the interpreter exits.
+        let mut interpreter = Command::new(env::current_exe().expect("resolve test executable"));
+        interpreter
+            .args([
+                "--exact",
+                "registry_server::tests::registry_signed_foreign_package_installs_and_runs_without_author",
+                "--nocapture",
+            ])
+            .env(INTERPRETER_ENTRY, &main)
+            .current_dir(&consumer);
+        let interpreted = run_bounded(&mut interpreter, RUN_TIMEOUT, RUN_LIMITS)
+            .expect("bounded signed foreign interpretation");
+        let stdout = String::from_utf8_lossy(&interpreted.stdout);
+        assert!(
+            interpreted.status.success() && stdout.split_whitespace().any(|word| word == "42"),
+            "offline interpretation failed:\n{stdout}{}",
+            String::from_utf8_lossy(&interpreted.stderr)
+        );
+        let delivery = TestRoot::new("signed-foreign-delivery");
+        let native = delivery
+            .0
+            .join(format!("foreign-native{}", env::consts::EXE_SUFFIX));
+        run_cli(vec![
+            "ku".into(),
+            "build".into(),
+            "--offline".into(),
+            "-o".into(),
+            native.to_string_lossy().into_owned(),
+            entry.clone(),
+        ])
+        .expect("build a default native consumer of the verified foreign package offline");
+
+        let mut executables = vec![native];
+        // The four-platform installed-SDK gate can also exercise the Runner
+        // without requiring a unique runtime rlib in ordinary Cargo test dirs.
+        if let Some(cli) = env::var_os("KU_TEST_INTEROP_CLI") {
+            let runner = delivery
+                .0
+                .join(format!("foreign-runner{}", env::consts::EXE_SUFFIX));
+            let mut command = Command::new(cli);
+            command
+                .args(["build", "--backend", "runner", "--offline", "-o"])
+                .arg(&runner)
+                .arg(&main)
+                .current_dir(&consumer);
+            let output = run_bounded(
+                &mut command,
+                native_test_harness::BUILD_TIMEOUT,
+                native_test_harness::BUILD_LIMITS,
+            )
+            .expect("bounded foreign Runner build");
+            assert!(
+                output.status.success(),
+                "foreign Runner build failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            executables.push(runner);
+        }
+        fs::remove_dir_all(&root.0).expect("remove consumer project, cache and registry");
+        for executable in executables {
+            let mut command = Command::new(executable);
+            command.current_dir(&delivery.0);
+            let output = run_bounded(&mut command, RUN_TIMEOUT, RUN_LIMITS)
+                .expect("bounded signed foreign package execution");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim_end(), "42");
+            assert!(output.stderr.is_empty());
+        }
     }
 
     #[test]

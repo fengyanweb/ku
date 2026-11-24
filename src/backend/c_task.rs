@@ -12,21 +12,65 @@ use std::{
 
 use crate::error::KuResult;
 use crate::ir::task::{
-    SlotId, TaskBinaryOp, TaskBytesOperation, TaskConstant, TaskFinallyPlan, TaskFramePlan,
-    TaskFunction, TaskFunctionFrame, TaskIndirectCallPlan, TaskJsonOperation, TaskLimits,
-    TaskNetOperation, TaskOp, TaskProgram, TaskScopeExitPlan, TaskScopeFrame, TaskSlotType,
-    TaskTerminator, TaskUnaryOp,
+    SlotId, TaskBinaryOp, TaskBytesOperation, TaskCollectionOperation, TaskConstant,
+    TaskFinallyPlan, TaskFramePlan, TaskFunction, TaskFunctionFrame, TaskIndirectCallPlan,
+    TaskJsonOperation, TaskLimits, TaskNetOperation, TaskOp, TaskProgram, TaskScopeExitPlan,
+    TaskScopeFrame, TaskSlotType, TaskTerminator, TaskUnaryOp,
 };
 use crate::ir::IrType;
 
 use super::output::COutput;
 use super::{
-    c_drop_value, c_move_value, c_static_utf8_string, c_type, c_type_suffix, c_zero_initializer,
-    unsupported,
+    c_drop_value, c_ident, c_move_value, c_static_utf8_string, c_type, c_type_suffix,
+    c_zero_initializer, unsupported,
 };
 
 #[path = "c_task_region.rs"]
 mod scalar_region;
+
+// Compare no more than one fixed chunk in a verified Task state. A long
+// partial match keeps only integer cursors; both strings stay in their owners.
+const STRING_CONTAINS_STEP: &str = r#"
+static int64_t ku_task_string_contains_step(KuString haystack, KuString needle,
+    int64_t* offset, int64_t* matched) {
+  if (!needle.len) return 1;
+  if (needle.len>haystack.len) return -1;
+  if (!haystack.ptr || !needle.ptr || haystack.len>(uint64_t)INT64_MAX
+      || *offset<0 || *matched<0 || (uint64_t)*matched>=needle.len) return -2;
+
+  const size_t last=haystack.len-needle.len;
+  if ((uint64_t)*offset>last) return -1;
+  size_t position=(size_t)*offset, prefix=(size_t)*matched;
+  size_t remaining=256u;
+  while (remaining) {
+    if (position>last) return -1;
+    if (!prefix) {
+      size_t length=last-position+1u;
+      if (length>remaining) length=remaining;
+      const uint8_t* start=haystack.ptr+position;
+      const uint8_t* hit=(const uint8_t*)memchr(start,needle.ptr[0],length);
+      if (!hit) { position+=length; remaining-=length; continue; }
+      const size_t skipped=(size_t)(hit-start);
+      position+=skipped;
+      remaining-=skipped+1u;
+      prefix=1u;
+      if (prefix==needle.len) return 1;
+      if (!remaining) break;
+    }
+    size_t length=needle.len-prefix;
+    if (length>remaining) length=remaining;
+    if (!memcmp(haystack.ptr+position+prefix,needle.ptr+prefix,length)) {
+      prefix+=length;
+      if (prefix==needle.len) return 1;
+    } else { position++; prefix=0u; }
+    remaining-=length;
+  }
+  if (position>last) return -1;
+  *offset=(int64_t)position;
+  *matched=(int64_t)prefix;
+  return 0;
+}
+"#;
 
 #[derive(Clone, Copy, Default)]
 struct CopyInitTransfer {
@@ -266,6 +310,22 @@ pub(super) fn uses_blocking_net(tasks: &TaskProgram) -> bool {
         })
     })
 }
+pub(super) fn uses_outbound_http(tasks: &TaskProgram) -> bool {
+    tasks.functions.iter().any(|f| {
+        f.states.iter().any(|s| {
+            matches!(
+                s.terminator,
+                TaskTerminator::BlockingNet {
+                    operation: TaskNetOperation::HttpGet
+                        | TaskNetOperation::HttpPost
+                        | TaskNetOperation::HttpRequest
+                        | TaskNetOperation::HttpRequestObject,
+                    ..
+                }
+            )
+        })
+    })
+}
 pub(super) fn uses_postgres(tasks: &TaskProgram) -> bool {
     tasks.functions.iter().any(|function| {
         function
@@ -331,6 +391,7 @@ pub(super) fn emit_frames(
     out: &mut COutput,
     tasks: &TaskProgram,
     plan: &TaskFramePlan,
+    layouts: &crate::ir::IrLayoutTable,
     cooperative: bool,
 ) -> KuResult<()> {
     if tasks.functions.is_empty() {
@@ -348,7 +409,16 @@ pub(super) fn emit_frames(
         uses_blocking_net(tasks),
         uses_postgres(tasks),
     )?;
-    super::task_adapter::emit_host(out, tasks)?;
+    super::task_adapter::emit_host(out, tasks, layouts)?;
+    if tasks
+        .functions
+        .iter()
+        .flat_map(|function| &function.states)
+        .flat_map(|state| &state.operations)
+        .any(|operation| matches!(operation, TaskOp::StringContainsStep { .. }))
+    {
+        out.push_str(STRING_CONTAINS_STEP);
+    }
     let range_work = RefCell::new(super::task_range::WorkBudget::default());
     for function in &tasks.functions {
         out.check()?;
@@ -357,7 +427,7 @@ pub(super) fn emit_frames(
             .iter()
             .find(|frame| frame.function == function.id)
             .ok_or_else(|| unsupported("native task frame plan is missing a function"))?;
-        let mut emitter = FrameEmitter::new(function, frame)?;
+        let mut emitter = FrameEmitter::new(function, frame, layouts)?;
         emitter.cooperative = cooperative;
         if cooperative {
             // The existing verifier computes liveness across every CFG edge.
@@ -394,12 +464,13 @@ pub(super) fn emit_frames(
         emitter.range_work = Some(&range_work);
         emitter.emit(out)?;
     }
-    super::task_adapter::emit_adapters(out, tasks)?;
+    super::task_adapter::emit_adapters_with_layouts(out, tasks, layouts)?;
     out.check()
 }
 
 struct FrameEmitter<'a> {
     function: &'a TaskFunction,
+    layouts: &'a crate::ir::IrLayoutTable,
     persistent: HashSet<usize>,
     prefix: String,
     frame_type: String,
@@ -429,7 +500,11 @@ struct FrameEmitter<'a> {
 }
 
 impl<'a> FrameEmitter<'a> {
-    fn new(function: &'a TaskFunction, frame: &'a TaskFunctionFrame) -> KuResult<Self> {
+    fn new(
+        function: &'a TaskFunction,
+        frame: &'a TaskFunctionFrame,
+        layouts: &'a crate::ir::IrLayoutTable,
+    ) -> KuResult<Self> {
         if function.slots.len() > MAX_FRAME_SLOTS {
             return Err(unsupported("native task frame exceeds its 64-slot bitmap"));
         }
@@ -491,6 +566,7 @@ impl<'a> FrameEmitter<'a> {
                     if frame.hosted
                         && !*borrowed
                         && (matches!(ty, IrType::Str | IrType::Result(_))
+                            || (crate::ir::task::nullable_leaf(ty) && super::is_c_owned_type(ty))
                             || crate::ir::task::flat_array(ty)
                             || crate::ir::task::pg_params_array(ty)
                             || crate::ir::task::error_type(ty)
@@ -498,7 +574,10 @@ impl<'a> FrameEmitter<'a> {
                             || crate::ir::task::local_net_type(ty)
                             || crate::ir::task::local_pg_type(ty)
                             || crate::ir::task::local_json_type(ty)
-                            || crate::ir::task::http_type(ty))
+                            || crate::ir::task::http_type(ty)
+                            || crate::ir::task::record_type(ty)
+                            || crate::ir::task::nullable_record(ty)
+                            || crate::ir::task::enum_name(ty).is_some())
                         && !persistent.contains(&index)
                     {
                         return Err(unsupported(
@@ -532,7 +611,11 @@ impl<'a> FrameEmitter<'a> {
                 != (task_mask != 0
                     || exit_bridge
                     || crate::ir::task::array_result(&function.result) || crate::ir::task::http_type(&function.result)
-                    || function.slots.iter().any(|slot| matches!(&slot.ty,TaskSlotType::Value {ty,..} if crate::ir::task::flat_array(ty) || crate::ir::task::pg_params_array(ty) || crate::ir::task::array_result(ty) || crate::ir::task::http_type(ty)))
+                    || crate::ir::task::string_enum_value(layouts, &function.result)
+                    || function.slots.iter().any(|slot| matches!(&slot.ty,TaskSlotType::Value {ty,..} if crate::ir::task::flat_array(ty) || crate::ir::task::pg_params_array(ty) || crate::ir::task::array_result(ty) || crate::ir::task::http_type(ty)
+                            || crate::ir::task::record_type(ty)
+                            || crate::ir::task::nullable_record(ty)
+                            || crate::ir::task::string_enum_value(layouts, ty)))
                     || function.states.iter().any(|state| {
                         matches!(
                             state.terminator,
@@ -562,6 +645,7 @@ impl<'a> FrameEmitter<'a> {
         require_result_type(&function.result)?;
         Ok(Self {
             function,
+            layouts,
             persistent,
             prefix: format!("ku_task_frame_{}", function.id.0),
             frame_type: format!("KuTaskFrame_{}", function.id.0),
@@ -726,6 +810,53 @@ impl<'a> FrameEmitter<'a> {
         }
     }
 
+    fn emit_record_field_clone(
+        &self,
+        out: &mut COutput,
+        ty: &IrType,
+        source: &str,
+        destination: &str,
+    ) -> KuResult<()> {
+        match ty {
+            IrType::Str => {
+                out.push_str(&format!("  {{ uint32_t cloned=ku_task_host_clone_string((KuTaskAdapterHostV1*)clock->host,{source},&{destination});\n"));
+                self.emit_string_allocation_check(out, "cloned")?;
+                out.push_str("  }\n");
+            }
+            IrType::Nullable(inner) if super::is_c_owned_type(inner) => {
+                out.push_str(&format!(
+                    "  {destination}.is_null={source}.is_null;\n  if (!{source}.is_null) {{\n"
+                ));
+                self.emit_record_field_clone(
+                    out,
+                    inner,
+                    &format!("{source}.value"),
+                    &format!("{destination}.value"),
+                )?;
+                out.push_str("  }\n");
+            }
+            IrType::Named(name) if crate::ir::task::record_type(ty) => {
+                let layout = self
+                    .layouts
+                    .structs
+                    .iter()
+                    .find(|layout| layout.name == *name)
+                    .ok_or_else(|| unsupported("missing Task field clone layout"))?;
+                for field in &layout.fields {
+                    let member = super::c_ident(&field.name);
+                    self.emit_record_field_clone(
+                        out,
+                        &field.ty,
+                        &format!("{source}.{member}"),
+                        &format!("{destination}.{member}"),
+                    )?;
+                }
+            }
+            _ => out.push_str(&format!("  {destination}={source};\n")),
+        }
+        out.check()
+    }
+
     fn owns_slot(&self, slot: SlotId) -> bool {
         match &self.function.slots[slot.0].ty {
             TaskSlotType::Task { .. } => true,
@@ -733,6 +864,7 @@ impl<'a> FrameEmitter<'a> {
             TaskSlotType::Value { ty, borrowed } => {
                 !*borrowed
                     && (matches!(ty, IrType::Str | IrType::Result(_))
+                        || (crate::ir::task::nullable_leaf(ty) && super::is_c_owned_type(ty))
                         || crate::ir::task::flat_array(ty)
                         || crate::ir::task::pg_params_array(ty)
                         || crate::ir::task::error_type(ty)
@@ -740,7 +872,10 @@ impl<'a> FrameEmitter<'a> {
                         || crate::ir::task::local_net_type(ty)
                         || crate::ir::task::local_pg_type(ty)
                         || crate::ir::task::local_json_type(ty)
-                        || crate::ir::task::http_type(ty))
+                        || crate::ir::task::http_type(ty)
+                        || crate::ir::task::record_type(ty)
+                        || crate::ir::task::nullable_record(ty)
+                        || crate::ir::task::enum_name(ty).is_some())
             }
         }
     }
@@ -1092,6 +1227,12 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
             }
         }
         for (index, slot) in self.function.parameters.iter().enumerate() {
+            out.push_str(&super::task_adapter::enum_parameter_check(
+                self.layouts,
+                &self.function.slots[slot.0].ty,
+                index,
+                "KU_TASK_FRAME_INVALID_ARGUMENT",
+            )?);
             if matches!(
                 self.function.slots[slot.0].ty,
                 TaskSlotType::Callable { .. }
@@ -2837,7 +2978,18 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                     cleanup,
                 } => {
                     out.push_str("  if (cleanup) goto ku_task_terminated;\n");
-                    out.push_str(&format!("  {{\n  frame->header.cleanup_state={}u;\n  uint32_t read_status=ku_task_host_blocking_read((KuTaskAdapterHostV1*)clock->host,{}, &{});\n  if (read_status==KU_TASK_CONTROL_PENDING) {{ frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING; }}\n  if (read_status!=KU_TASK_CONTROL_OK) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n", cleanup.0, self.place(*path), self.place(*dst)));
+                    out.push_str(&format!(
+                        "  {{\n  frame->header.cleanup_state={}u;\n",
+                        cleanup.0
+                    ));
+                    let mut path_place = self.place(*path);
+                    if matches!(self.slot_type(*path)?, IrType::Nullable(_)) {
+                        // A raw frame cannot submit an absent path even if it
+                        // skips the source-level null refinement.
+                        out.push_str(&format!("  if ({path_place}.is_null) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n"));
+                        path_place.push_str(".value");
+                    }
+                    out.push_str(&format!("  uint32_t read_status=ku_task_host_blocking_read((KuTaskAdapterHostV1*)clock->host,{path_place}, &{});\n  if (read_status==KU_TASK_CONTROL_PENDING) {{ frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING; }}\n  if (read_status!=KU_TASK_CONTROL_OK) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n",self.place(*dst)));
                     self.set_init(out, *dst, true);
                     out.push_str(&format!(
                         "  frame->header.state={}u;\n  goto ku_task_dispatch;\n  }}\n",
@@ -2875,8 +3027,51 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                         TaskNetOperation::Read => 6,
                         TaskNetOperation::Write => 7,
                         TaskNetOperation::Close => 8,
+                        TaskNetOperation::HttpGet
+                        | TaskNetOperation::HttpPost
+                        | TaskNetOperation::HttpRequest
+                        | TaskNetOperation::HttpRequestObject => 10,
                     };
-                    if *operation == TaskNetOperation::Connect {
+                    if *operation == TaskNetOperation::HttpRequestObject {
+                        let object = self.place(
+                            inputs[0].ok_or_else(|| unsupported("HTTP configuration absent"))?,
+                        );
+                        out.push_str(&format!("  uint32_t net_status=ku_task_host_http_object((KuTaskAdapterHostV1*)clock->host,{object},&{});\n",self.place(*dst)));
+                    } else if matches!(
+                        operation,
+                        TaskNetOperation::HttpGet
+                            | TaskNetOperation::HttpPost
+                            | TaskNetOperation::HttpRequest
+                    ) {
+                        let url =
+                            self.place(inputs[0].ok_or_else(|| unsupported("HTTP URL absent"))?);
+                        let body = inputs[1]
+                            .map(|v| self.place(v))
+                            .unwrap_or_else(|| "(KuString){0}".into());
+                        let method = inputs[2].map(|v| self.place(v)).unwrap_or_else(|| {
+                            if *operation == TaskNetOperation::HttpPost {
+                                "ku_string_static((const uint8_t*)\"POST\",4)".into()
+                            } else {
+                                "ku_string_static((const uint8_t*)\"GET\",3)".into()
+                            }
+                        });
+                        let timeout = inputs[3]
+                            .map(|v| self.place(v))
+                            .unwrap_or_else(|| "5000".into());
+                        let max = inputs[4]
+                            .map(|v| self.place(v))
+                            .unwrap_or_else(|| "1000000".into());
+                        let names = inputs[5]
+                            .map(|v| self.place(v))
+                            .unwrap_or_else(|| "(KuArray_str){0}".into());
+                        let values = inputs[6]
+                            .map(|v| self.place(v))
+                            .unwrap_or_else(|| "(KuArray_str){0}".into());
+                        let config_fault = inputs[8]
+                            .map(|v| self.place(v))
+                            .unwrap_or_else(|| "0".into());
+                        out.push_str(&format!("  uint32_t net_status=ku_task_host_http((KuTaskAdapterHostV1*)clock->host,{method},{url},{body},{},{names},{values},{timeout},{max},{config_fault},&{});\n",u32::from(inputs[1].is_some()),self.place(*dst)));
+                    } else if *operation == TaskNetOperation::Connect {
                         out.push_str("  KuValue config[9]; uint16_t present=0; memset(config,0,sizeof(config));\n");
                         for (index, input) in inputs.iter().enumerate() {
                             if let Some(input) = input {
@@ -2910,6 +3105,20 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                             };
                             out.push_str(&format!("  uint32_t net_status=ku_task_host_net_write_close((KuTaskAdapterHostV1*)clock->host,&{client},{bytes},{kind}u,&net_result);\n"));
                         }
+                    }
+                    if matches!(
+                        operation,
+                        TaskNetOperation::HttpGet
+                            | TaskNetOperation::HttpPost
+                            | TaskNetOperation::HttpRequest
+                            | TaskNetOperation::HttpRequestObject
+                    ) {
+                        out.push_str("  if (net_status==KU_TASK_HTTP_CONFIG_ERROR) {\n");
+                        self.emit_runtime_error(
+                            out,
+                            &format!("ku_error_move(&{}.error)", self.place(*dst)),
+                        )?;
+                        out.push_str("  }\n");
                     }
                     out.push_str("  if (net_status==KU_TASK_CONTROL_PENDING) { frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING; }\n  if (net_status!=KU_TASK_CONTROL_OK) { frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }\n");
                     if *operation == TaskNetOperation::Write {
@@ -2992,13 +3201,25 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                     let suffix = c_type_suffix(inner)?;
                     out.push_str(&format!("  {{\n  frame->header.cleanup_state={}u;\n  KuTaskAdapterOutcomeV1 received={{0}};\n  uint32_t awaited=ku_task_host_await((KuTaskAdapterHostV1*)clock->host,&{},&received);\n  if (awaited==KU_TASK_CONTROL_PENDING) {{ frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING; }}\n  if (awaited!=KU_TASK_CONTROL_OK) {{ ku_task_outcome_drop(&received); frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n",cleanup.0,self.place(*task)));
                     self.set_init(out, *task, false);
+                    if let Some(kind) = super::task_adapter::outcome_nominal_kind_symbol(inner) {
+                        out.push_str(&format!("  if (received.result_kind!={kind}) {{ ku_task_outcome_drop(&received); frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n"));
+                    }
+                    let unpack = if let Some(layout) =
+                        crate::ir::task::enum_layout(self.layouts, inner)
+                            .filter(|layout| crate::ir::task::enum_str_variant(layout).is_some())
+                    {
+                        out.push_str(&format!("  if (received.value.{field}.ok && (uint32_t)received.value.{field}.tag>={}u) {{ ku_task_outcome_drop(&received); frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n", layout.variants.len()));
+                        format!("ku_task_unpack_{suffix}")
+                    } else {
+                        format!("ku_result_move_{suffix}")
+                    };
                     out.push_str("  if (received.exit_class==KU_TASK_EXIT_RUNTIME_FAILURE) {\n    frame->header.has_exit_deadline=received.has_cleanup_deadline;\n    frame->header.exit_deadline=received.cleanup_deadline;\n");
                     self.emit_runtime_error(
                         out,
                         &format!("ku_error_move(&received.value.{field}.error)"),
                     )?;
                     out.push_str("  }\n");
-                    out.push_str(&format!("  {}=ku_result_move_{suffix}(&received.value.{field});\n  ku_task_outcome_drop(&received);\n",self.place(*dst)));
+                    out.push_str(&format!("  {}={unpack}(&received.value.{field});\n  ku_task_outcome_drop(&received);\n",self.place(*dst)));
                     self.set_init(out, *dst, true);
                     out.push_str(&format!(
                         "  frame->header.state={}u;\n  goto ku_task_dispatch;\n  }}\n",
@@ -3089,7 +3310,65 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
             }
             // Verified lexical ownership annotation; no runtime stack or bits.
             TaskOp::ScopeEnter { .. } => {}
+            TaskOp::EnumStringMove { dst, src, tag } => {
+                let extracting = self.slot_type(*dst)? == &IrType::Str;
+                let enum_type = self.slot_type(if extracting { *src } else { *dst })?;
+                let variant = crate::ir::task::enum_str_layout(self.layouts, enum_type)
+                    .ok_or_else(|| unsupported("missing Task enum string layout"))?;
+                let field = format!(
+                    "payload.{}.{}",
+                    c_ident(&variant.name),
+                    c_ident(&variant.fields[0].name)
+                );
+                let source = self.place(*src);
+                let destination = self.place(*dst);
+                if extracting {
+                    out.push_str(&format!("  if ({source}.tag!={tag}) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n  {destination}=ku_string_move(&{source}.{field});\n  {source}.tag=-1;\n"));
+                } else {
+                    out.push_str(&format!(
+                        "  {destination}=({}){{.tag={tag},.{field}=ku_string_move(&{source})}};\n",
+                        c_type(enum_type)?
+                    ));
+                }
+                self.set_init(out, *dst, true);
+                self.set_init(out, *src, false);
+            }
             TaskOp::Unary { dst, op, src } => match op {
+                TaskUnaryOp::EnumTag => {
+                    out.push_str(&format!(
+                        "  {} = (int64_t)({}).tag;\n",
+                        self.place(*dst),
+                        self.place(*src)
+                    ));
+                    self.set_init(out, *dst, true);
+                }
+                TaskUnaryOp::EnumFromInt { tag } => {
+                    let ty = self.slot_type(*dst)?;
+                    let variant = crate::ir::task::enum_int_layout(self.layouts, ty)
+                        .ok_or_else(|| unsupported("missing Task enum constructor layout"))?;
+                    out.push_str(&format!(
+                        "  {} = ({}){{.tag={tag},.payload.{}.{}={}}};\n",
+                        self.place(*dst),
+                        c_type(ty)?,
+                        c_ident(&variant.name),
+                        c_ident(&variant.fields[0].name),
+                        self.place(*src),
+                    ));
+                    self.set_init(out, *dst, true);
+                }
+                TaskUnaryOp::EnumPayloadInt { tag } => {
+                    let variant =
+                        crate::ir::task::enum_int_layout(self.layouts, self.slot_type(*src)?)
+                            .ok_or_else(|| unsupported("missing Task enum payload layout"))?;
+                    let src = self.place(*src);
+                    out.push_str(&format!(
+                        "  if ({src}.tag!={tag}) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n  {} = {src}.payload.{}.{};\n",
+                        self.place(*dst),
+                        c_ident(&variant.name),
+                        c_ident(&variant.fields[0].name),
+                    ));
+                    self.set_init(out, *dst, true);
+                }
                 TaskUnaryOp::Not => {
                     out.push_str(&format!(
                         "  {} = !{};\n",
@@ -3189,6 +3468,52 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                         ),
                         state,
                     )?;
+                } else if matches!(self.slot_type(*left)?, IrType::Nullable(_))
+                    || matches!(self.slot_type(*right)?, IrType::Nullable(_))
+                {
+                    if !matches!(op, TaskBinaryOp::Equal | TaskBinaryOp::NotEqual) {
+                        return Err(unsupported(
+                            "nullable Task arithmetic requires a non-null proof",
+                        ));
+                    }
+                    let left_type = self.slot_type(*left)?;
+                    let right_type = self.slot_type(*right)?;
+                    let inner = match (left_type, right_type) {
+                        (IrType::Nullable(inner), _) | (_, IrType::Nullable(inner)) => {
+                            inner.as_ref()
+                        }
+                        _ => unreachable!(),
+                    };
+                    let place = |slot: SlotId, ty: &IrType| -> KuResult<(String, String)> {
+                        let place = self.place(slot);
+                        Ok(match ty {
+                            IrType::Nullable(_) => {
+                                (format!("{place}.is_null"), format!("{place}.value"))
+                            }
+                            IrType::Null => ("true".into(), c_zero_initializer(inner)?),
+                            _ => ("false".into(), place),
+                        })
+                    };
+                    let (left_null, left_value) = place(*left, left_type)?;
+                    let (right_null, right_value) = place(*right, right_type)?;
+                    let equal = if inner == &IrType::Str {
+                        format!("ku_string_equal({left_value},{right_value})")
+                    } else {
+                        format!("({left_value}=={right_value})")
+                    };
+                    let equal = format!(
+                        "(({left_null} || {right_null}) ? ({left_null} && {right_null}) : {equal})"
+                    );
+                    out.push_str(&format!(
+                        "  {}={}({equal});\n",
+                        self.place(*dst),
+                        if *op == TaskBinaryOp::NotEqual {
+                            "!"
+                        } else {
+                            ""
+                        }
+                    ));
+                    self.set_init(out, *dst, true);
                 } else if self.slot_type(*left)? == &IrType::Str {
                     let negate = match op {
                         TaskBinaryOp::Equal => "",
@@ -3311,6 +3636,152 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 ));
                 self.set_init(out, *dst, true);
             }
+            TaskOp::Collection {
+                dst,
+                source,
+                other,
+                operation,
+            } => {
+                let destination = self.place(*dst);
+                match operation {
+                    TaskCollectionOperation::Concat => {
+                        let left_slot = source.ok_or_else(|| unsupported("concat source"))?;
+                        let right_slot = other.ok_or_else(|| unsupported("concat other"))?;
+                        let left = self.place(left_slot);
+                        let right = self.place(right_slot);
+                        let IrType::Array(element) = self.slot_type(*dst)? else {
+                            return Err(unsupported("concat type"));
+                        };
+                        out.push_str(&format!("  if ({left}.len>SIZE_MAX-{right}.len || {left}.len+{right}.len>10000u) {{\n"));
+                        self.emit_runtime_error(
+                            out,
+                            &format!(
+                                "ku_error_make({},{},{})",
+                                c_static_utf8_string("task"),
+                                c_static_utf8_string("memory_limit"),
+                                c_static_utf8_string("native Task array size limit exceeded")
+                            ),
+                        )?;
+                        out.push_str(&format!("  }}\n  {{ size_t count={left}.len+{right}.len; void* data=NULL; uint32_t allocated=ku_task_host_allocate_array((KuTaskAdapterHostV1*)clock->host,count,sizeof({}),&data);\n",c_type(element)?));
+                        self.emit_array_allocation_check(out, "allocated")?;
+                        out.push_str(&format!(
+                            "  {destination}=({}){{0,data,count}};\n",
+                            c_type(self.slot_type(*dst)?)?
+                        ));
+                        self.set_init(out, *dst, true);
+                        out.push_str("  for (size_t index=0;index<count;index++) {\n");
+                        let value = format!("(index<{left}.len ? {left}.data[index] : {right}.data[index-{left}.len])");
+                        if element.as_ref() == &IrType::Str {
+                            out.push_str(&format!("    uint32_t cloned=ku_task_host_clone_string((KuTaskAdapterHostV1*)clock->host,{value},&{destination}.data[index]);\n"));
+                            self.emit_array_allocation_check(out, "cloned")?;
+                        } else {
+                            out.push_str(&format!("    {destination}.data[index]={value};\n"));
+                        }
+                        out.push_str(&format!("    {destination}.len++;\n  }}\n  }}\n"));
+                    }
+                    TaskCollectionOperation::First | TaskCollectionOperation::Last => {
+                        let source = self.place(source.ok_or_else(|| unsupported("edge source"))?);
+                        out.push_str(&format!(
+                            "  {destination}={};\n",
+                            c_zero_initializer(self.slot_type(*dst)?)?
+                        ));
+                        self.set_init(out, *dst, true);
+                        if let IrType::Nullable(inner) = self.slot_type(*dst)? {
+                            let index = if *operation == TaskCollectionOperation::First {
+                                "0".into()
+                            } else {
+                                format!("{source}.len-1u")
+                            };
+                            out.push_str(&format!("  if ({source}.len) {{\n"));
+                            if inner.as_ref() == &IrType::Str {
+                                out.push_str(&format!("  uint32_t cloned=ku_task_host_clone_string((KuTaskAdapterHostV1*)clock->host,{source}.data[{index}],&{destination}.value);\n"));
+                                self.emit_string_allocation_check(out, "cloned")?;
+                            } else {
+                                out.push_str(&format!(
+                                    "  {destination}.value={source}.data[{index}];\n"
+                                ));
+                            }
+                            out.push_str(&format!("  {destination}.is_null=false;\n  }}\n"));
+                        }
+                    }
+                    TaskCollectionOperation::NullableNull => {
+                        out.push_str(&format!(
+                            "  {destination}={};\n",
+                            c_zero_initializer(self.slot_type(*dst)?)?
+                        ));
+                        self.set_init(out, *dst, true);
+                    }
+                    TaskCollectionOperation::NullableSome => {
+                        let source = source.ok_or_else(|| unsupported("nullable Some source"))?;
+                        let ty = self.slot_type(source)?;
+                        out.push_str(&format!(
+                            "  {destination}=({}){{false,{}}};\n",
+                            c_type(self.slot_type(*dst)?)?,
+                            c_move_value(ty, &self.place(source))?
+                        ));
+                        if super::is_c_owned_type(ty) {
+                            self.set_init(out, source, false);
+                        }
+                        self.set_init(out, *dst, true);
+                    }
+                    TaskCollectionOperation::NullableClone => {
+                        let source =
+                            self.place(source.ok_or_else(|| unsupported("nullable clone source"))?);
+                        let IrType::Nullable(inner) = self.slot_type(*dst)? else {
+                            return Err(unsupported("nullable clone type"));
+                        };
+                        out.push_str(&format!(
+                            "  {destination}={};\n",
+                            c_zero_initializer(self.slot_type(*dst)?)?
+                        ));
+                        self.set_init(out, *dst, true);
+                        out.push_str(&format!("  if (!{source}.is_null) {{\n"));
+                        if inner.as_ref() == &IrType::Str {
+                            out.push_str(&format!("  uint32_t cloned=ku_task_host_clone_string((KuTaskAdapterHostV1*)clock->host,{source}.value,&{destination}.value);\n"));
+                            self.emit_string_allocation_check(out, "cloned")?;
+                        } else {
+                            out.push_str(&format!("  {destination}.value={source}.value;\n"));
+                        }
+                        out.push_str(&format!("  {destination}.is_null=false;\n  }}\n"));
+                    }
+                    TaskCollectionOperation::NullableView
+                    | TaskCollectionOperation::NullableTake => {
+                        let source_slot =
+                            source.ok_or_else(|| unsupported("nullable projection source"))?;
+                        let source = self.place(source_slot);
+                        out.push_str(&format!("  if ({source}.is_null) {{\n"));
+                        self.emit_runtime_error(
+                            out,
+                            &format!(
+                                "ku_error_make({},{},{})",
+                                c_static_utf8_string("array"),
+                                c_static_utf8_string("null_value"),
+                                c_static_utf8_string("cannot read an empty array result")
+                            ),
+                        )?;
+                        out.push_str("  }\n");
+                        out.push_str(&format!("  {destination}={source}.value;\n"));
+                        if *operation == TaskCollectionOperation::NullableTake {
+                            out.push_str(&format!(
+                                "  {source}={};\n",
+                                c_zero_initializer(self.slot_type(source_slot)?)?
+                            ));
+                        }
+                        self.set_init(out, *dst, true);
+                    }
+                    TaskCollectionOperation::NullableIsNull => {
+                        let source = self
+                            .place(source.ok_or_else(|| unsupported("nullable predicate source"))?);
+                        out.push_str(&format!("  {destination}={source}.is_null;\n"));
+                        self.set_init(out, *dst, true);
+                    }
+                    TaskCollectionOperation::NullableViewEnd => {
+                        // A projection owns no payload. End only its temporary
+                        // witness; the nullable source retains the allocation.
+                        self.set_init(out, *dst, false);
+                    }
+                }
+            }
             TaskOp::StringLen { dst, src, bytes } => {
                 let source = self.place(*src);
                 let length = if *bytes {
@@ -3319,6 +3790,17 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                     format!("ku_string_char_len({source})")
                 };
                 out.push_str(&format!("  {}=(int64_t)({length});\n", self.place(*dst)));
+                self.set_init(out, *dst, true);
+            }
+            TaskOp::StringContainsStep {
+                dst,
+                haystack,
+                needle,
+                offset,
+                matched,
+            } => {
+                let status = self.place(*dst);
+                out.push_str(&format!("  {status}=ku_task_string_contains_step({},{},&{},&{});\n  if ({status}==-2) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n",self.place(*haystack),self.place(*needle),self.place(*offset),self.place(*matched)));
                 self.set_init(out, *dst, true);
             }
             TaskOp::StringClone { dst, src } => {
@@ -3544,7 +4026,125 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 self.set_init(out, *src, false);
                 self.set_init(out, *dst, true);
             }
+            TaskOp::RecordMake { dst, elements } => {
+                let ty = self.slot_type(*dst)?;
+                let layout = if crate::ir::task::error_type(ty) {
+                    None
+                } else {
+                    let IrType::Named(name) = ty else {
+                        return Err(unsupported("Task RecordMake requires a record layout"));
+                    };
+                    Some(
+                        self.layouts
+                            .structs
+                            .iter()
+                            .find(|layout| layout.name == *name)
+                            .ok_or_else(|| unsupported("missing Task record layout"))?,
+                    )
+                };
+                let destination = self.place(*dst);
+                for (index, source) in elements.iter().enumerate() {
+                    let (member, ty) = match layout {
+                        Some(layout) => {
+                            let field = &layout.fields[index];
+                            (super::c_ident(&field.name), &field.ty)
+                        }
+                        None => (crate::ir::ERROR_FIELDS[index].to_owned(), &IrType::Str),
+                    };
+                    let value = c_move_value(ty, &self.place(*source))?;
+                    out.push_str(&format!("  {destination}.{member}={value};\n"));
+                    if self.owns_slot(*source) {
+                        self.set_init(out, *source, false);
+                    }
+                }
+                self.set_init(out, *dst, true);
+            }
+            TaskOp::RecordField {
+                dst,
+                src,
+                path,
+                take,
+            } => {
+                let mut ty = self.slot_type(*src)?;
+                let mut field = self.place(*src);
+                let mut guards = Vec::new();
+                for (member, _) in path {
+                    if let IrType::Nullable(inner) = ty {
+                        guards.push(format!("!{field}.is_null"));
+                        field.push_str(".value");
+                        ty = inner;
+                    }
+                    let IrType::Named(name) = ty else {
+                        return Err(unsupported("Task projection through a non-record field"));
+                    };
+                    let layout = self
+                        .layouts
+                        .structs
+                        .iter()
+                        .find(|layout| layout.name == *name)
+                        .ok_or_else(|| unsupported("missing Task field layout"))?;
+                    ty = &layout
+                        .fields
+                        .iter()
+                        .find(|field| field.name == *member)
+                        .ok_or_else(|| unsupported("unknown generated Task record field"))?
+                        .ty;
+                    field.push('.');
+                    field.push_str(&super::c_ident(member));
+                }
+                let destination = self.place(*dst);
+                let output_ty = self.slot_type(*dst)?;
+                let lifted = ty != output_ty;
+                if !guards.is_empty() {
+                    out.push_str(&format!(
+                        "  {destination}={};\n  if ({}) {{\n",
+                        c_zero_initializer(output_ty)?,
+                        guards.join(" && ")
+                    ));
+                }
+                let present = if lifted && ty != &IrType::Null {
+                    format!("{destination}.value")
+                } else {
+                    destination.clone()
+                };
+                if *take {
+                    out.push_str(&format!("  {present}={};\n", c_move_value(ty, &field)?));
+                } else if super::is_c_owned_type(ty) {
+                    if guards.is_empty() {
+                        out.push_str(&format!(
+                            "  {destination}={};\n",
+                            c_zero_initializer(output_ty)?
+                        ));
+                    }
+                    // A fallible field clone can leave earlier owned fields
+                    // initialized. Publish the zeroed destination to cleanup
+                    // before cloning any leaf.
+                    if lifted {
+                        out.push_str(&format!("  {destination}.is_null=false;\n"));
+                    }
+                    self.set_init(out, *dst, true);
+                    self.emit_record_field_clone(out, ty, &field, &present)?;
+                } else {
+                    out.push_str(&format!("  {present}={field};\n"));
+                }
+                if lifted && ty != &IrType::Null {
+                    out.push_str(&format!("  {destination}.is_null=false;\n"));
+                }
+                if !guards.is_empty() {
+                    out.push_str("  }\n");
+                }
+                self.set_init(out, *dst, true);
+            }
             TaskOp::ErrorField { dst, src, field } => {
+                if field == "status" {
+                    out.push_str(&format!(
+                        "  {}={}.status;\n",
+                        self.place(*dst),
+                        self.place(*src)
+                    ));
+                    self.set_init(out, *dst, true);
+                    return Ok(());
+                }
                 if !matches!(
                     field.as_str(),
                     "domain" | "code" | "message" | "method" | "path" | "body"
@@ -3563,10 +4163,37 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 key,
                 map,
             } => {
+                if crate::ir::task::http_response_type(self.slot_type(*request)?) {
+                    out.push_str(&format!("  {{ KuString projected={{0}}; uint32_t cloned=ku_task_host_http_header_get((KuTaskAdapterHostV1*)clock->host,&{}, {},&projected);\n",self.place(*request),self.place(*key)));
+                    out.push_str("  if(cloned==KU_TASK_HTTP_MISSING_HEADER) {\n");
+                    self.emit_runtime_error(
+                        out,
+                        &format!(
+                            "ku_error_make({},{},{})",
+                            c_static_utf8_string("object"),
+                            c_static_utf8_string("missing_key"),
+                            c_static_utf8_string("object has no requested header key")
+                        ),
+                    )?;
+                    out.push_str("  }\n");
+                    self.emit_string_allocation_check(out, "cloned")?;
+                    out.push_str(&format!("  {}=projected; }}\n", self.place(*dst)));
+                    self.set_init(out, *dst, true);
+                    return Ok(());
+                }
                 out.push_str(&format!("  {{ KuValue* field_value=ku_object_get({}.{map},{});\n  KuString field_string=field_value && field_value->tag==KU_STR ? field_value->as.s : (KuString){{0}};\n  uint32_t cloned=ku_task_host_clone_string((KuTaskAdapterHostV1*)clock->host,field_string,&{});\n  if(cloned==KU_TASK_DRIVER_LIMIT || cloned==KU_TASK_HOST_ALLOCATION_FAILED) {{\n",self.place(*request),self.place(*key),self.place(*dst)));
                 self.emit_runtime_error(out,"ku_error_make(ku_string_static((const uint8_t*)\"task\",4),ku_string_static((const uint8_t*)\"memory_limit\",12),ku_string_static((const uint8_t*)\"request map projection allocation rejected\",42))")?;
                 out.push_str("  }\n  if(cloned!=KU_TASK_DRIVER_OK) {frame->header.running=0;return KU_TASK_FRAME_INVALID_STATE;}\n  }\n");
                 self.set_init(out, *dst, true);
+            }
+            TaskOp::HttpHeaderSet {
+                response,
+                key,
+                value,
+            } => {
+                out.push_str(&format!("  {{ uint32_t stored=ku_task_host_http_header_set((KuTaskAdapterHostV1*)clock->host,&{},{},{});\n",self.place(*response),self.place(*key),self.place(*value)));
+                self.emit_string_allocation_check(out, "stored")?;
+                out.push_str("  }\n");
             }
             TaskOp::HttpResponse {
                 dst,
@@ -3692,6 +4319,18 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                         IrType::Bool => format!("ku_v_bool({})", self.place(*slot)),
                         IrType::Null => "ku_v_null()".into(),
                         IrType::Str => format!("ku_v_str({})", self.place(*slot)),
+                        IrType::Nullable(inner) => {
+                            let wrapper = match inner.as_ref() {
+                                IrType::Int => "ku_v_int",
+                                IrType::Bool => "ku_v_bool",
+                                IrType::Str => "ku_v_str",
+                                _ => return Err(unsupported("Task object nullable field type")),
+                            };
+                            let place = self.place(*slot);
+                            format!(
+                                "(({place}).is_null ? ku_v_null() : {wrapper}(({place}).value))"
+                            )
+                        }
                         IrType::Named(name) if name == "__ku_value" => self.place(*slot),
                         _ => return Err(unsupported("Task JSON object field type")),
                     });
@@ -3810,6 +4449,18 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
             TaskOp::Print { value, newline } => {
                 let place = self.place(*value);
                 let expression = match self.slot_type(*value)? {
+                    IrType::Nullable(inner) => {
+                        let payload = match inner.as_ref() {
+                            IrType::Int => format!("ku_output_printf(\"%lld\",(long long){place}.value) < 0"),
+                            IrType::Bool => format!("ku_output_write({place}.value ? \"true\" : \"false\",{place}.value ? 4u : 5u) < 0"),
+                            IrType::Str => format!("ku_output_write({place}.value.ptr,{place}.value.len) < 0"),
+                            IrType::Null => "ku_output_write(\"null\",4u) < 0".into(),
+                            _ => return Err(unsupported("unsupported Task nullable output")),
+                        };
+                        format!(
+                            "({place}.is_null ? (ku_output_write(\"null\",4u)<0) : ({payload}))"
+                        )
+                    }
                     IrType::Int => format!("ku_output_printf(\"%lld\",(long long){place}) < 0"),
                     IrType::Bool => format!(
                         "ku_output_write({place} ? \"true\" : \"false\",{place} ? 4u : 5u) < 0"
@@ -4110,6 +4761,29 @@ static uint32_t {prefix}_finish_finally(void* storage, size_t bytes, uint32_t ab
         let prefix = &self.prefix;
         let frame_type = &self.frame_type;
         let result_type = c_type(&self.function.result)?;
+        let tag_check = match &self.function.result {
+            IrType::Result(inner) => crate::ir::task::enum_layout(self.layouts, inner)
+                .filter(|layout| crate::ir::task::enum_int_variant(layout).is_some())
+                .map(|layout| format!(
+                    "if (frame->result.ok && (uint32_t)frame->result.value.tag>={}u) return KU_TASK_FRAME_INVALID_STATE;\n",
+                    layout.variants.len(),
+                ))
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        let string_enum = match &self.function.result {
+            IrType::Result(inner) => crate::ir::task::enum_layout(self.layouts, inner)
+                .filter(|layout| crate::ir::task::enum_str_variant(layout).is_some()),
+            _ => None,
+        };
+        let owned_preflight = if let Some(layout) = string_enum {
+            let alias_checks = super::task_adapter::string_enum_result_strings(self.layouts, &self.function.result, "frame->result", &|leaf| {
+                format!("  checked=ku_task_adapter_string_charge({leaf},&payload_bytes);\n  if (checked!=KU_TASK_DRIVER_OK || ku_task_adapter_string_overlaps({leaf},output,sizeof(*output))) return KU_TASK_FRAME_INVALID_ARGUMENT;\n")
+            }).ok_or_else(|| unsupported("missing Task result string alias check"))?;
+            format!("if (frame->result.ok && (uint32_t)frame->result.value.tag>={}u) return KU_TASK_FRAME_INVALID_STATE;\n  size_t payload_bytes=0;\n{alias_checks}", layout.variants.len())
+        } else {
+            String::new()
+        };
         out.push_str(&format!(
             "static uint32_t {prefix}_take_result(void* storage, size_t bytes, uint32_t abi, {result_type}* output) {{\n\
                uint32_t checked = {prefix}_check(storage, bytes, abi);\n\
@@ -4117,12 +4791,12 @@ static uint32_t {prefix}_finish_finally(void* storage, size_t bytes, uint32_t ab
                {frame_type}* frame = ({frame_type}*)storage;\n\
                if (frame->header.status != KU_TASK_FRAME_READY || !frame->header.result_initialized) return KU_TASK_FRAME_INVALID_STATE;\n\
                if (!ku_task_frame_storage_valid(output, sizeof(*output), sizeof(*output), KU_TASK_FRAME_ALIGNOF({result_type})) || ku_task_frame_ranges_overlap(storage, bytes, output, sizeof(*output))) return KU_TASK_FRAME_INVALID_ARGUMENT;\n\
-               if (!({})) return KU_TASK_FRAME_INVALID_ARGUMENT;\n\
-               *output = {};\n\
+               {owned_preflight}if (!({})) return KU_TASK_FRAME_INVALID_ARGUMENT;\n\
+               {tag_check}*output = {};\n\
                frame->header.result_initialized = 0;\n\
                return KU_TASK_FRAME_OK;\n\
              }}\n",
-            empty_value_expr(&self.function.result, "(*output)")?,
+            super::task_adapter::outcome_empty_expr(self.layouts, &self.function.result, "(*output)")?,
             c_move_value(&self.function.result, "frame->result")?
         ));
         Ok(())
@@ -4164,10 +4838,14 @@ fn require_slot_type(ty: &IrType) -> KuResult<()> {
         || crate::ir::task::http_type(ty)
         || crate::ir::task::local_pg_type(ty)
         || crate::ir::task::local_json_type(ty)
+        || crate::ir::task::record_type(ty)
+        || crate::ir::task::nullable_record(ty)
+        || crate::ir::task::enum_name(ty).is_some()
     {
         return Ok(());
     }
     match ty {
+        IrType::Nullable(inner) if crate::ir::task::nullable_leaf(ty) => require_slot_type(inner),
         IrType::Int | IrType::Bool | IrType::Null | IrType::Str => Ok(()),
         IrType::Array(_)
             if crate::ir::task::flat_array(ty) || crate::ir::task::pg_params_array(ty) =>
@@ -4182,7 +4860,7 @@ fn require_slot_type(ty: &IrType) -> KuResult<()> {
 }
 
 fn require_result_type(ty: &IrType) -> KuResult<()> {
-    if matches!(ty, IrType::Result(inner) if matches!(**inner, IrType::Int | IrType::Bool | IrType::Null | IrType::Str) || crate::ir::task::flat_array(inner) || crate::ir::task::http_response_type(inner) || matches!(inner.as_ref(), IrType::Named(name) if name == "__ku_pg_result"))
+    if matches!(ty, IrType::Result(inner) if matches!(**inner, IrType::Int | IrType::Bool | IrType::Null | IrType::Str) || crate::ir::task::flat_array(inner) || crate::ir::task::http_response_type(inner) || crate::ir::task::record_type(inner) || crate::ir::task::enum_name(inner).is_some() || matches!(inner.as_ref(), IrType::Named(name) if name == "__ku_pg_result"))
     {
         Ok(())
     } else {
@@ -4206,6 +4884,11 @@ pub(super) fn drop_statement(ty: &IrType, place: &str) -> KuResult<String> {
 // Empty typed output is checked by fields, not indeterminate C struct padding.
 // This neither dereferences payload pointers nor drops an existing output.
 pub(super) fn empty_value_expr(ty: &IrType, place: &str) -> KuResult<String> {
+    if crate::ir::task::enum_name(ty).is_some() {
+        return Ok(format!(
+            "({place}).tag == 0 && ({place}).payload.empty == 0"
+        ));
+    }
     if matches!(ty, IrType::Named(name) if name == "__ku_value") {
         return Ok(format!("({place}).tag == KU_NULL"));
     }
@@ -4222,7 +4905,10 @@ pub(super) fn empty_value_expr(ty: &IrType, place: &str) -> KuResult<String> {
             .iter()
             .map(|name| empty_value_expr(&IrType::Str, &format!("({place}).{name}")))
             .collect::<KuResult<Vec<_>>>()?;
-        return Ok(format!("!({place}).status && ({})", leaves.join(") && (")));
+        return Ok(format!(
+            "!({place}).status && !({place}).headers && ({})",
+            leaves.join(") && (")
+        ));
     }
     if crate::ir::task::http_request_type(ty) {
         let leaves = ["method", "path", "body"]
@@ -4243,6 +4929,7 @@ pub(super) fn empty_value_expr(ty: &IrType, place: &str) -> KuResult<String> {
         ));
     }
     match ty {
+        IrType::Nullable(_) => Ok(format!("({place}).is_null")),
         IrType::Named(name) if name == "__ku_net_client" => Ok(format!("({place}) == NULL")),
         IrType::Named(name) if name == "__ku_bytes" => Ok(format!("({place}).ptr == NULL && ({place}).len == 0 && ({place}).capacity == 0 && ({place}).storage == 0")),
         IrType::Int | IrType::Bool | IrType::Null => Ok(format!("({place}) == 0")),
@@ -4270,6 +4957,7 @@ fn constant_expr(value: &TaskConstant, ty: &IrType) -> KuResult<String> {
         TaskConstant::Bool(value) => Ok(value.to_string()),
         TaskConstant::Null => Ok("0".to_string()),
         TaskConstant::Str(value) => Ok(c_static_utf8_string(value)),
+        TaskConstant::UnitEnum { tag } => Ok(format!("({}){{.tag={tag}}}", c_type(ty)?)),
         TaskConstant::Ok(value) => {
             let IrType::Result(inner) = ty else {
                 return Err(unsupported(

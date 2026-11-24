@@ -6,6 +6,8 @@ use crate::{
 };
 
 pub fn eval_builtin(name: &str, args: &[Value], span: Span) -> KuResult<Option<Value>> {
+    #[cfg(feature = "browser")]
+    crate::browser::preflight_args(args, span)?;
     match name {
         "len" => {
             expect_arg_count(name, args.len(), 1, span)?;
@@ -35,7 +37,7 @@ pub fn eval_builtin(name: &str, args: &[Value], span: Span) -> KuResult<Option<V
         }
         "println" => {
             expect_arg_count(name, args.len(), 1, span)?;
-            println!("{}", args[0]);
+            crate::runtime::interpreter::write_output(&args[0], true, span)?;
             Ok(Some(Value::Null))
         }
         _ => Ok(None),

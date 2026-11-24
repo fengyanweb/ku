@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{
     ast::*,
@@ -10,6 +10,7 @@ use crate::{
 mod generic;
 #[cfg(test)]
 mod loop_analysis_tests;
+mod nullable;
 mod statement_depth;
 pub(crate) use generic::{native_local_generic_span, native_specialization_plan, GenericCallSite};
 
@@ -305,6 +306,9 @@ impl ClosureSummaryContext {
 struct VarType {
     binding_id: BindingId,
     ty: Type,
+    /// Read-only flow evidence for an existing T|null binding. Storage and
+    /// assignment checking always retain `ty`; this is never a representation.
+    narrowed_type: Option<Type>,
     mutable: bool,
     borrowed: bool,
     /// Move state at struct-field-path granularity. A key is a projection path
@@ -342,6 +346,7 @@ impl VarType {
         Self {
             binding_id,
             ty,
+            narrowed_type: None,
             mutable,
             borrowed: false,
             moves: BTreeMap::new(),
@@ -438,6 +443,86 @@ struct FunctionValueBodyRef<'a> {
     body_id: Option<FunctionBodyId>,
 }
 
+#[derive(Debug, Default)]
+struct AnonymousReturnEvidence {
+    payload: Option<Type>,
+    has_null: bool,
+    unsupported: bool,
+    reachable_catches: HashSet<usize>,
+}
+
+impl AnonymousReturnEvidence {
+    fn observe(&mut self, ty: &Type) {
+        let payload = match ty {
+            Type::Null | Type::Void => {
+                self.has_null = true;
+                return;
+            }
+            Type::Union(parts) => match parts.as_slice() {
+                [Type::Null, payload] | [payload, Type::Null] => payload,
+                _ => {
+                    self.unsupported = true;
+                    return;
+                }
+            },
+            ty => ty,
+        };
+        if !matches!(payload, Type::Int | Type::Float | Type::Bool | Type::String)
+            || self
+                .payload
+                .as_ref()
+                .is_some_and(|previous| previous != payload)
+        {
+            self.unsupported = true;
+        } else if self.payload.is_none() {
+            self.payload = Some(payload.clone());
+        }
+    }
+
+    fn nullable_type(self, falls_through: bool) -> Option<Type> {
+        if self.unsupported || !(self.has_null || falls_through) {
+            return None;
+        }
+        self.payload
+            .map(|payload| Type::Union(vec![payload, Type::Null]))
+    }
+
+    fn stmt_falls_through(&self, stmt: &Stmt) -> bool {
+        let block_falls_through =
+            |body: &[Stmt]| body.iter().all(|stmt| self.stmt_falls_through(stmt));
+        match stmt {
+            Stmt::If {
+                then_branch,
+                else_branch,
+                ..
+            } => block_falls_through(then_branch) || block_falls_through(else_branch),
+            Stmt::Try {
+                body,
+                catch_body,
+                finally_body,
+                ..
+            } => {
+                block_falls_through(finally_body)
+                    && (block_falls_through(body)
+                        || (self
+                            .reachable_catches
+                            .contains(&(stmt as *const Stmt as usize))
+                            && block_falls_through(catch_body)))
+            }
+            // The native IR considers both exits of a loop condition before
+            // optimization.
+            Stmt::While { .. } => true,
+            _ => !stmt_stops_fallthrough(stmt),
+        }
+    }
+}
+
+fn has_scalar_nullable_payload(ty: &Type) -> bool {
+    matches!(ty, Type::Union(parts) if matches!(parts.as_slice(),
+        [Type::Null, Type::Int | Type::Float | Type::Bool | Type::String]
+        | [Type::Int | Type::Float | Type::Bool | Type::String, Type::Null]))
+}
+
 #[derive(Debug, Clone)]
 struct FunctionType {
     type_params: Vec<String>,
@@ -460,7 +545,68 @@ struct EnumType {
     variants: HashMap<String, Vec<Type>>,
 }
 
+/// Facts about field projections in the AST being checked. Identity keys
+/// are never dereferenced; copied trees fall back to checked dynamic values.
+#[derive(Default)]
+pub(crate) struct NativeFieldFacts {
+    pub(crate) destructured: HashMap<usize, TypeName>,
+    pub(crate) optional: HashMap<usize, TypeName>,
+    ordinary_objects: HashMap<usize, (usize, TypeName)>,
+    literal_object_bindings: HashMap<BindingId, usize>,
+    invalidated_object_literals: HashSet<usize>,
+}
+
+impl NativeFieldFacts {
+    pub(crate) fn ordinary_object_type(&self, expr: &Expr) -> Option<&TypeName> {
+        let (literal, ty) = self
+            .ordinary_objects
+            .get(&(std::ptr::from_ref(expr) as usize))?;
+        (!self.invalidated_object_literals.contains(literal)).then_some(ty)
+    }
+
+    fn invalidate_object_binding(&mut self, binding: BindingId) {
+        if let Some(literal) = self.literal_object_bindings.remove(&binding) {
+            // A checker replay (for example on a loop back edge) may assign the
+            // same declaration a new binding ID. Retain the invalidation by site.
+            self.invalidated_object_literals.insert(literal);
+        }
+    }
+}
+
+fn is_native_object_scalar(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Int | Type::Float | Type::Bool | Type::String | Type::Null
+    )
+}
+
+fn native_field_type(ty: &Type) -> Option<TypeName> {
+    Some(match ty {
+        Type::Int => TypeName::Int,
+        Type::Float => TypeName::Float,
+        Type::Bool => TypeName::Bool,
+        Type::String => TypeName::String,
+        Type::Null => TypeName::Null,
+        Type::Array(inner)
+            if matches!(
+                inner.as_ref(),
+                Type::Int | Type::Float | Type::Bool | Type::String
+            ) =>
+        {
+            TypeName::Array(Box::new(native_field_type(inner)?))
+        }
+        Type::Object(_) | Type::StringMap | Type::DynamicObject => {
+            TypeName::Custom("__ku_object".into())
+        }
+        Type::Union(parts) if parts.len() == 2 && parts.contains(&Type::Null) => {
+            TypeName::Union(parts.iter().map(native_field_type).collect::<Option<_>>()?)
+        }
+        _ => return None,
+    })
+}
+
 pub struct Checker {
+    native_field_facts: Option<NativeFieldFacts>,
     functions: HashMap<String, FunctionType>,
     structs: HashMap<String, StructType>,
     enums: HashMap<String, EnumType>,
@@ -486,6 +632,9 @@ pub struct Checker {
     readonly_capture: Option<ReadonlyCapture>,
     std_modules: HashSet<String>,
     function_value_inference_stack: Vec<FunctionBodyId>,
+    /// Inference for one unannotated anonymous function. Sibling and nested
+    /// function bodies must not contribute returns to it.
+    anonymous_return_evidence: Option<AnonymousReturnEvidence>,
     /// Bodies currently re-audited below an outer read-only execution boundary.
     /// This guard is independent from return inference because annotated direct
     /// and mutually recursive FunctionValues must terminate too.
@@ -514,6 +663,7 @@ pub struct Checker {
 impl Checker {
     pub fn new() -> Self {
         Self {
+            native_field_facts: None,
             functions: HashMap::new(),
             structs: HashMap::new(),
             enums: HashMap::new(),
@@ -530,6 +680,7 @@ impl Checker {
             readonly_capture: None,
             std_modules: HashSet::new(),
             function_value_inference_stack: Vec::new(),
+            anonymous_return_evidence: None,
             readonly_function_body_stack: Vec::new(),
             next_function_body_id: 1,
             next_binding_id: 1,
@@ -587,6 +738,78 @@ impl Checker {
     pub fn check(mut self, program: &Program) -> KuResult<()> {
         self.check_program(program)?;
         self.check_generic_instances()
+    }
+
+    pub(crate) fn check_with_native_fields(
+        mut self,
+        program: &Program,
+    ) -> KuResult<NativeFieldFacts> {
+        self.native_field_facts = Some(NativeFieldFacts::default());
+        self.check_program(program)?;
+        self.check_generic_instances()?;
+        Ok(self.native_field_facts.take().unwrap_or_default())
+    }
+
+    fn record_native_optional_type(&mut self, expr: &Expr, ty: &Type) {
+        if let Some(facts) = &mut self.native_field_facts {
+            let id = std::ptr::from_ref(expr) as usize;
+            if let Some(ty) = native_field_type(ty) {
+                facts.optional.insert(id, ty);
+            } else {
+                facts.optional.remove(&id);
+            }
+        }
+    }
+
+    fn record_native_object_literal_binding(&mut self, name: &str, value: &Expr) {
+        if let Some(facts) = &mut self.native_field_facts {
+            if matches!(value.kind, ExprKind::ObjectLiteral { .. }) {
+                if let Some(binding) = self.scopes.last().and_then(|scope| scope.get(name)) {
+                    if matches!(binding.ty, Type::Object(_)) {
+                        facts
+                            .literal_object_bindings
+                            .insert(binding.binding_id, std::ptr::from_ref(value) as usize);
+                    }
+                }
+            }
+        }
+    }
+
+    fn invalidate_native_object_binding(&mut self, name: &str) {
+        if let Some(facts) = self
+            .native_field_facts
+            .as_mut()
+            .filter(|facts| !facts.literal_object_bindings.is_empty())
+        {
+            if let Some(binding) = self.scopes.iter().rev().find_map(|scope| scope.get(name)) {
+                facts.invalidate_object_binding(binding.binding_id);
+            }
+        }
+    }
+
+    fn record_native_object_field_type(&mut self, expr: &Expr, target: &Expr, ty: &Type) {
+        let Some(facts) = &mut self.native_field_facts else {
+            return;
+        };
+        let ExprKind::Variable(name) = &target.kind else {
+            return;
+        };
+        let id = std::ptr::from_ref(expr) as usize;
+        if let Some(binding) = self.scopes.iter().rev().find_map(|scope| scope.get(name)) {
+            // Bracket writes can change the tag without changing the checker's
+            // structural type. Trust only literal bindings confined to plain field
+            // reads and same-type scalar stores. Binding IDs distinguish shadowing.
+            if is_native_object_scalar(ty) {
+                if let (Some(&literal), Some(ty)) = (
+                    facts.literal_object_bindings.get(&binding.binding_id),
+                    native_field_type(ty),
+                ) {
+                    facts.ordinary_objects.insert(id, (literal, ty));
+                    return;
+                }
+            }
+        }
+        facts.ordinary_objects.remove(&id);
     }
 
     fn check_program(&mut self, program: &Program) -> KuResult<()> {
@@ -658,7 +881,7 @@ impl Checker {
             }
         }
 
-        for item in &program.items {
+        for item in aggregate_declaration_order(&program.items)? {
             match item {
                 Item::Struct(decl) => self.collect_struct(decl)?,
                 Item::Enum(decl) => self.collect_enum(decl)?,
@@ -869,7 +1092,9 @@ impl Checker {
             }
         }
         if let Some(expected) = &explicit_return {
-            if expected != &Type::Void && !block_may_return(&function.body) {
+            if expected != &Type::Void
+                && !block_may_return(&function.body, matches!(expected, Type::Result(_)))
+            {
                 return Err(KuError::runtime(
                     format!(
                         "function '{}' must return {}",
@@ -886,7 +1111,10 @@ impl Checker {
         }
         if self.current_return != Type::Unknown
             && self.current_return != Type::Void
-            && !block_may_return(&function.body)
+            && !block_may_return(
+                &function.body,
+                matches!(self.current_return, Type::Result(_)),
+            )
         {
             return Err(KuError::runtime(
                 format!(
@@ -969,7 +1197,15 @@ impl Checker {
                 let mut resolved = Vec::with_capacity(types.len());
                 for ty in types {
                     let ty = self.resolve_type_name_with_generics(ty, span, generics)?;
-                    if !resolved.iter().any(|existing| type_matches(existing, &ty)) {
+                    if !resolved.iter().any(|existing| {
+                        // A generic/unknown wildcard is not proof that a null
+                        // arm has the same representation as its payload.
+                        if existing == &Type::Null || ty == Type::Null {
+                            existing == &ty
+                        } else {
+                            type_matches(existing, &ty)
+                        }
+                    }) {
                         resolved.push(ty);
                     }
                 }
@@ -1102,6 +1338,7 @@ impl Checker {
                     *mutable && !is_constant_name(name),
                     *span,
                 )?;
+                self.record_native_object_literal_binding(name, value);
                 self.set_closure_provenance(name, closure_provenance, *span)
             }
             Stmt::Assign { name, value, span } => {
@@ -1127,6 +1364,7 @@ impl Checker {
                 };
                 if !self.contains(name) {
                     self.define(name.clone(), actual, !is_constant_name(name), *span)?;
+                    self.record_native_object_literal_binding(name, value);
                     return self.set_closure_provenance(name, closure_provenance, *span);
                 }
                 self.reject_readonly_capture_assignment(name, *span)?;
@@ -1168,7 +1406,8 @@ impl Checker {
                 } else {
                     None
                 };
-                let expected = self.check_assign_target(target, *span)?;
+                let scalar_type = is_native_object_scalar(&actual).then_some(&actual);
+                let expected = self.check_assign_target(target, *span, scalar_type)?;
                 if !type_matches(&expected, &actual) {
                     return Err(type_error(*span, &expected, &actual));
                 }
@@ -1203,7 +1442,7 @@ impl Checker {
                 // after consuming the RHS lets the normal moved-place diagnostic
                 // reject a receiver/key that the RHS just moved.
                 let right = self.consume_expr(value)?;
-                let left = self.check_assign_target(target, *span)?;
+                let left = self.check_assign_target(target, *span, None)?;
                 // `a += b` reads the target before writing it, so the target place
                 // must still be live — a compound-assign to a moved field is a
                 // use-after-move (`check_assign_target` only checks the base).
@@ -1273,9 +1512,11 @@ impl Checker {
             } => {
                 self.expect_condition(condition, *span)?;
                 let before = self.scopes.clone();
+                self.apply_nullable_condition(condition, true);
                 self.check_block(then_branch)?;
                 let then_scopes = self.scopes.clone();
                 self.scopes = before.clone();
+                self.apply_nullable_condition(condition, false);
                 self.check_block(else_branch)?;
                 let else_scopes = self.scopes.clone();
                 let then_falls = !block_stops_fallthrough(then_branch);
@@ -1297,6 +1538,7 @@ impl Checker {
                 self.check_loop_analysis_budget()?;
                 self.expect_condition(condition, *span)?;
                 let condition_exit = self.scopes.clone();
+                self.apply_nullable_condition(condition, true);
                 self.loop_depth += 1;
                 self.loop_break_states.push(Vec::new());
                 self.loop_continue_states.push(Vec::new());
@@ -1449,6 +1691,16 @@ impl Checker {
                     // snapshots. In particular, do not merge the raw throw state
                     // into finally after a catch has re-initialized a value.
                     let catch_reachable = !body_throws.is_empty();
+                    let dead_catch_evidence = if catch_reachable {
+                        if let Some(evidence) = &mut self.anonymous_return_evidence {
+                            evidence
+                                .reachable_catches
+                                .insert(stmt as *const Stmt as usize);
+                        }
+                        None
+                    } else {
+                        self.anonymous_return_evidence.take()
+                    };
                     self.scopes = if catch_reachable {
                         merge_moved_scope_paths(before.clone(), &body_throws)
                     } else {
@@ -1475,6 +1727,9 @@ impl Checker {
                         Ok(())
                     })();
                     self.pop_scope();
+                    if let Some(evidence) = dead_catch_evidence {
+                        self.anonymous_return_evidence = Some(evidence);
+                    }
                     let catch_end = self.scopes.clone();
                     if let Err(error) = catch_result {
                         self.try_exit_collectors.pop();
@@ -1594,6 +1849,7 @@ impl Checker {
                 if !type_matches(&self.current_return, &actual) {
                     return Err(type_error(*span, &self.current_return, &actual));
                 }
+                self.observe_anonymous_return(&actual);
                 self.capture_try_exit(TryExitKind::Return);
                 Ok(())
             }
@@ -1627,7 +1883,15 @@ impl Checker {
         value: &Expr,
         span: Span,
     ) -> KuResult<()> {
-        let source_type = self.check_object_destructure_source(value)?;
+        let source_type = match self.check_object_destructure_source(value)? {
+            Type::Struct(name) => {
+                let structure = self.structs.get(&name).ok_or_else(|| {
+                    KuError::runtime(format!("undefined struct '{name}'"), value.span)
+                })?;
+                Type::Object(structure.fields.clone())
+            }
+            other => other,
+        };
         let source_provenance = self.expression_closure_provenance(value);
         let mut consumed = HashSet::new();
         match source_type {
@@ -1646,6 +1910,14 @@ impl Checker {
                             }
                         },
                     };
+                    if let Some(facts) = &mut self.native_field_facts {
+                        let id = std::ptr::from_ref(binding) as usize;
+                        if let Some(ty) = native_field_type(&actual) {
+                            facts.destructured.insert(id, ty);
+                        } else {
+                            facts.destructured.remove(&id);
+                        }
+                    }
                     if let Some(local) = &binding.local {
                         let provenance = if fields.contains_key(&binding.field) {
                             source_provenance.clone()
@@ -1766,7 +2038,36 @@ impl Checker {
     }
 
     fn check_expr(&mut self, expr: &Expr) -> KuResult<Type> {
-        self.check_expr_with_field_receiver(expr, None)
+        self.check_expr_with_field_receiver(expr, None, false)
+    }
+
+    fn optional_field_type(&self, target: &Type, name: &str, span: Span) -> KuResult<Type> {
+        match target {
+            Type::Null => Ok(Type::Null),
+            Type::Struct(struct_name) => {
+                let structure = self.structs.get(struct_name).ok_or_else(|| {
+                    KuError::runtime(format!("undefined struct '{struct_name}'"), span)
+                })?;
+                Ok(structure.fields.get(name).cloned().unwrap_or(Type::Null))
+            }
+            Type::Object(fields) => Ok(fields.get(name).cloned().unwrap_or(Type::Null)),
+            Type::Unknown => Ok(Type::Unknown),
+            // A nullable receiver uses the same member type as its non-null
+            // value. Preserve any null already present in the field itself.
+            Type::Union(parts) if matches!(parts.as_slice(), [Type::Null, _] | [_, Type::Null]) => {
+                let inner = if parts[0] == Type::Null {
+                    &parts[1]
+                } else {
+                    &parts[0]
+                };
+                self.optional_field_type(inner, name, span)
+                    .map(nullable::make_nullable)
+            }
+            other => Err(KuError::runtime(
+                format!("type error: {} has no fields", type_name(other)),
+                span,
+            )),
+        }
     }
 
     // Method dispatch and ordinary callable-field fallback share one receiver
@@ -1777,6 +2078,7 @@ impl Checker {
         &mut self,
         expr: &Expr,
         checked_receiver: Option<&Type>,
+        plain_field_base: bool,
     ) -> KuResult<Type> {
         self.completed_expression_provenance = None;
         let mut evaluated_provenance = None;
@@ -1800,6 +2102,9 @@ impl Checker {
                 }
                 ExprKind::Literal(Literal::Null) => Ok(Type::Null),
                 ExprKind::Variable(name) => {
+                    if !plain_field_base {
+                        self.invalidate_native_object_binding(name);
+                    }
                     if self.contains(name) {
                         return self.get(name, expr.span).map(|v| v.ty);
                     }
@@ -1823,9 +2128,31 @@ impl Checker {
                     }
                 }
                 ExprKind::Binary { left, op, right } => {
-                    let left = self.check_expr(left)?;
-                    let right = self.check_expr(right)?;
-                    self.check_binary(*op, &left, &right, expr.span)
+                    let mut left_type = self.check_expr(left)?;
+                    let short_circuit = matches!(op, BinaryOp::And | BinaryOp::Or);
+                    let facts = short_circuit.then(|| self.nullable_facts());
+                    if short_circuit {
+                        self.apply_nullable_condition(left, *op == BinaryOp::And);
+                    }
+                    let mut right_type = self.check_expr(right)?;
+                    if let Some(facts) = facts {
+                        self.join_nullable_facts(&facts);
+                    }
+                    if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual) {
+                        if matches!(right.kind, ExprKind::Literal(Literal::Null)) {
+                            if let ExprKind::Variable(name) = &left.kind {
+                                let declared = self.get_allow_moved(name, left.span)?.ty;
+                                if nullable::contains_null(&declared) { left_type = declared; }
+                            }
+                        }
+                        if matches!(left.kind, ExprKind::Literal(Literal::Null)) {
+                            if let ExprKind::Variable(name) = &right.kind {
+                                let declared = self.get_allow_moved(name, right.span)?.ty;
+                                if nullable::contains_null(&declared) { right_type = declared; }
+                            }
+                        }
+                    }
+                    self.check_binary(*op, &left_type, &right_type, expr.span)
                 }
                 ExprKind::Call { callee, args } => {
                     let mut checked_receiver = None;
@@ -2021,7 +2348,7 @@ impl Checker {
                             return Ok(ty);
                         }
                         let callee_root = expr_root_name(callee).map(str::to_string);
-                        let callee_type = self.check_expr_with_field_receiver(callee, checked_receiver.as_ref())?;
+                        let callee_type = self.check_expr_with_field_receiver(callee, checked_receiver.as_ref(), false)?;
                         let captured = self.expression_closure_provenance(callee);
                         if let Type::FunctionValue {
                             params,
@@ -2191,7 +2518,7 @@ impl Checker {
                     }
                     let target_type = match checked_receiver {
                         Some(ty) => ty.clone(),
-                        None => self.check_expr(target)?,
+                        None => self.check_expr_with_field_receiver(target, None, true)?,
                     };
                     // Reading a field whose place — or an ancestor of it — was moved
                     // out is a use-after-move. Only the exact path or an ancestor
@@ -2218,9 +2545,13 @@ impl Checker {
                                 )
                             })
                         }
-                        Type::Object(fields) => fields.get(name).cloned().ok_or_else(|| {
-                            KuError::runtime(format!("object has no field '{name}'"), expr.span)
-                        }),
+                        Type::Object(fields) => {
+                            let ty = fields.get(name).cloned().ok_or_else(|| {
+                                KuError::runtime(format!("object has no field '{name}'"), expr.span)
+                            })?;
+                            self.record_native_object_field_type(expr, target, &ty);
+                            Ok(ty)
+                        }
                         Type::StringMap => Ok(Type::String),
                         Type::DynamicObject => Ok(Type::Unknown),
                         Type::Enum(enum_name) => {
@@ -2255,24 +2586,15 @@ impl Checker {
                 }
                 ExprKind::OptionalField { target, name } => {
                     let target_type = self.check_expr(target)?;
-                    match target_type {
-                        Type::Null => Ok(Type::Null),
-                        Type::Struct(struct_name) => {
-                            let Some(struct_type) = self.structs.get(&struct_name) else {
-                                return Err(KuError::runtime(
-                                    format!("undefined struct '{struct_name}'"),
-                                    target.span,
-                                ));
-                            };
-                            Ok(struct_type.fields.get(name).cloned().unwrap_or(Type::Null))
-                        }
-                        Type::Object(fields) => Ok(fields.get(name).cloned().unwrap_or(Type::Null)),
-                        Type::Unknown => Ok(Type::Unknown),
-                        other => Err(KuError::runtime(
-                            format!("type error: {} has no fields", type_name(&other)),
-                            target.span,
-                        )),
+                    if let PlaceClass::Movable(mut place) = self.classify_place(target) {
+                        // `?.` skips null receivers, but it still reads the
+                        // selected place. A moved field is not a null state.
+                        place.path.push(name.clone());
+                        self.check_place_readable(&place, expr.span)?;
                     }
+                    let ty = self.optional_field_type(&target_type, name, target.span)?;
+                    self.record_native_optional_type(expr, &ty);
+                    Ok(ty)
                 }
                 ExprKind::StructLiteral { name, fields } => {
                     let Some(struct_type) = self.structs.get(name).cloned() else {
@@ -2441,6 +2763,11 @@ impl Checker {
         })()
         .and_then(|ty| {
             self.reject_readonly_http_native_capture_read(expr, &ty)?;
+            if matches!(&expr.kind, ExprKind::Await(_))
+                || matches!(&expr.kind, ExprKind::Call { callee, .. } if self.nullable_call_may_mutate(callee))
+            {
+                self.invalidate_captured_nullable_facts();
+            }
             Ok(ty)
         });
         // Publish only this successful expression. Nested body checking and
@@ -2563,13 +2890,16 @@ impl Checker {
         let captured_names = checker_closure_capture_names(params, body, &visible_names);
         self.reject_borrowed_captures(&captured_names, span)?;
         self.record_function_body_outer_bindings(body_id, &captured_names);
-        let inferred = self.check_function_value_body(
-            &resolved_params,
-            own_return.as_deref(),
-            body,
-            Some(body_id),
+        let inferred = self.check_function_value_body_impl(
+            FunctionValueBodyRef {
+                params: &resolved_params,
+                return_type: own_return.as_deref(),
+                body,
+                body_id: Some(body_id),
+            },
             &arg_types,
             span,
+            own_return.is_none(),
         );
         self.async_depth = saved_async_depth;
         let inferred = inferred?;
@@ -2656,6 +2986,12 @@ impl Checker {
             }
             BinaryOp::Add if left == &Type::String && right == &Type::String => Ok(Type::String),
             BinaryOp::Equal | BinaryOp::NotEqual if type_matches(left, right) => Ok(Type::Bool),
+            BinaryOp::Equal | BinaryOp::NotEqual
+                if (left == &Type::Null && nullable::contains_null(right))
+                    || (right == &Type::Null && nullable::contains_null(left)) =>
+            {
+                Ok(Type::Bool)
+            }
             // A KuValue is a first-class tagged value: `==` / `!=` compare it
             // against anything (by tag + value); arithmetic stays rejected.
             BinaryOp::Equal | BinaryOp::NotEqual
@@ -2739,14 +3075,58 @@ impl Checker {
         args: &[Expr],
         span: Span,
     ) -> KuResult<Option<Type>> {
+        if let Some(kind) = crate::interop::ReturnKind::for_bound(name) {
+            self.check_interop_arguments(args, span)?;
+            return Ok(Some(Type::Result(Box::new(match kind {
+                crate::interop::ReturnKind::Null => Type::Null,
+                crate::interop::ReturnKind::Int => Type::Int,
+                crate::interop::ReturnKind::Str => Type::String,
+                crate::interop::ReturnKind::Bool => Type::Bool,
+            }))));
+        }
         let Some(signature) = metadata::builtin_signature(name) else {
             return Ok(None);
         };
         Ok(Some(self.apply_stdlib_signature(&signature, args, span)?))
     }
 
-    fn check_assign_target(&mut self, target: &AssignTarget, span: Span) -> KuResult<Type> {
-        match target {
+    fn check_interop_arguments(&mut self, args: &[Expr], span: Span) -> KuResult<()> {
+        crate::interop::binding_arguments(args, span)?;
+        if self.async_depth != 0 || self.readonly_capture.is_some() {
+            return Err(KuError::runtime(
+                "interop bridge calls may block and require synchronous CLI execution",
+                span,
+            ));
+        }
+        let args = &args[2..];
+        let modes = vec![ParamMode::View; args.len()];
+        self.check_argument_modes_conflicts(args, &modes, span)?;
+        for argument in args {
+            let ty = self.check_expr(argument)?;
+            if !matches!(ty, Type::Int | Type::Bool | Type::String | Type::Null) {
+                return Err(KuError::runtime(
+                    "interop arguments must be int, bool, str or null",
+                    argument.span,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn check_assign_target(
+        &mut self,
+        target: &AssignTarget,
+        span: Span,
+        scalar_type: Option<&Type>,
+    ) -> KuResult<Type> {
+        // This exemption only covers one fixed field on the original binding.
+        // The RHS was checked first, so any escape or capture has already
+        // invalidated the binding. The new value must keep the exact scalar tag.
+        let direct_scalar_field = self.native_field_facts.is_some()
+            && scalar_type.is_some()
+            && matches!(target, AssignTarget::Field { target, .. }
+                if matches!(target.kind, ExprKind::Variable(_)));
+        let expected = match target {
             AssignTarget::Variable(name) => {
                 let binding = self.get(name, span)?;
                 if !binding.mutable {
@@ -2792,33 +3172,42 @@ impl Checker {
                     )),
                 }
             }
-            AssignTarget::Field { target, name } => match self.check_expr(target)? {
-                Type::Struct(struct_name) => {
-                    let Some(struct_type) = self.structs.get(&struct_name) else {
-                        return Err(KuError::runtime(
-                            format!("undefined struct '{struct_name}'"),
-                            target.span,
-                        ));
-                    };
-                    struct_type.fields.get(name).cloned().ok_or_else(|| {
-                        KuError::runtime(
-                            format!("struct '{struct_name}' has no field '{name}'"),
-                            span,
-                        )
-                    })
+            AssignTarget::Field { target, name } => {
+                match self.check_expr_with_field_receiver(target, None, direct_scalar_field)? {
+                    Type::Struct(struct_name) => {
+                        let Some(struct_type) = self.structs.get(&struct_name) else {
+                            return Err(KuError::runtime(
+                                format!("undefined struct '{struct_name}'"),
+                                target.span,
+                            ));
+                        };
+                        struct_type.fields.get(name).cloned().ok_or_else(|| {
+                            KuError::runtime(
+                                format!("struct '{struct_name}' has no field '{name}'"),
+                                span,
+                            )
+                        })
+                    }
+                    Type::Object(fields) => fields.get(name).cloned().ok_or_else(|| {
+                        KuError::runtime(format!("object has no field '{name}'"), span)
+                    }),
+                    Type::StringMap => Ok(Type::String),
+                    Type::DynamicObject => Ok(Type::Unknown),
+                    other => Err(KuError::runtime(
+                        format!("type error: {} has no fields", type_name(&other)),
+                        target.span,
+                    )),
                 }
-                Type::Object(fields) => fields
-                    .get(name)
-                    .cloned()
-                    .ok_or_else(|| KuError::runtime(format!("object has no field '{name}'"), span)),
-                Type::StringMap => Ok(Type::String),
-                Type::DynamicObject => Ok(Type::Unknown),
-                other => Err(KuError::runtime(
-                    format!("type error: {} has no fields", type_name(&other)),
-                    target.span,
-                )),
-            },
+            }
+        }?;
+        if self.native_field_facts.is_some()
+            && (!direct_scalar_field || scalar_type != Some(&expected))
+        {
+            if let Some(name) = assign_target_root_name(target) {
+                self.invalidate_native_object_binding(name);
+            }
         }
+        Ok(expected)
     }
 
     fn check_http_service_method_call(
@@ -3392,7 +3781,7 @@ impl Checker {
                 return Err(http_handler_return_error(span, return_type));
             }
         }
-        if !block_may_return(body) {
+        if !block_may_return(body, matches!(return_type, Some(Type::Result(_)))) {
             return Err(http_handler_return_error(span, &Type::Null));
         }
         let actual = self.check_function_value_call_with_types_readonly_captures(
@@ -3467,14 +3856,60 @@ impl Checker {
         if consumes_scrutinee && self.borrowed_expr_root(value).is_some() {
             return Err(KuError::runtime("borrowed operation is not supported: match with owned payload binding; clone the scrutinee first", value.span));
         }
+        let has_final_wildcard = arms.last().is_some_and(|arm| {
+            arm.guard.is_none() && matches!(&arm.pattern, MatchPattern::Wildcard)
+        });
+        let unit_variant_count = match &value_type {
+            Type::Enum(name) => self
+                .enums
+                .get(name)
+                .filter(|layout| {
+                    layout.variants.values().all(Vec::is_empty)
+                        && arms[..arms.len() - usize::from(has_final_wildcard)]
+                            .iter()
+                            .all(|arm| {
+                                matches!(&arm.pattern, MatchPattern::EnumVariant { fields, .. }
+                                    if fields.is_empty())
+                            })
+                })
+                .map(|layout| layout.variants.len()),
+            _ => None,
+        };
         let before_arms = self.scopes.clone();
+        let mut guard_fallthrough = HashMap::new();
         let mut arm_scopes = Vec::with_capacity(arms.len());
         let mut result_type = Type::Unknown;
         let mut saw_unguarded_catch_all = false;
         let mut covered_full_variants = HashSet::new();
         let mut covered_patterns = HashSet::new();
         for arm in arms {
-            self.scopes = before_arms.clone();
+            let unit_variant = match &arm.pattern {
+                MatchPattern::EnumVariant { variant, .. } if unit_variant_count.is_some() => {
+                    Some(variant.as_str())
+                }
+                _ => None,
+            };
+            self.scopes = match (unit_variant, unit_variant_count) {
+                (Some(variant), _) => guard_fallthrough
+                    .remove(variant)
+                    .unwrap_or_else(|| before_arms.clone()),
+                (None, Some(count))
+                    if matches!(&arm.pattern, MatchPattern::Wildcard)
+                        && !guard_fallthrough.is_empty() =>
+                {
+                    // An unguarded variant removed its snapshot when it selected
+                    // its arm. Remaining snapshots are false guards on tags that
+                    // can still reach the wildcard. Unseen tags share the baseline.
+                    let mut paths = std::mem::take(&mut guard_fallthrough)
+                        .into_values()
+                        .collect::<Vec<_>>();
+                    if paths.len() + covered_full_variants.len() < count {
+                        paths.push(before_arms.clone());
+                    }
+                    merge_moved_scope_paths(before_arms.clone(), &paths)
+                }
+                _ => before_arms.clone(),
+            };
             if saw_unguarded_catch_all {
                 return Err(KuError::runtime(
                     "match arm after catch-all pattern is unreachable",
@@ -3552,6 +3987,11 @@ impl Checker {
                         ).with_diagnostic_id(crate::error::DiagnosticId::TaskGuardMove));
                     }
                 }
+                if let Some(variant) = unit_variant {
+                    // A false guard leaves its outer moves in effect. A different
+                    // tag skips this guard, and the arm's own bindings expire here.
+                    guard_fallthrough.insert(variant, self.scopes[..before_arms.len()].to_vec());
+                }
             }
             let actual = self.consume_expr(&arm.value);
             self.pop_scope();
@@ -3590,7 +4030,8 @@ impl Checker {
             }
         }
         if consumes_scrutinee {
-            self.consume_expr(value)?;
+            // Record a move from the checked place without replaying a subject's await or calls.
+            self.consume_checked_expr(value, value_type)?;
         }
         Ok(result_type)
     }
@@ -3816,21 +4257,21 @@ impl Checker {
                 Ok(Type::DynamicObject)
             }
             "date" => match args.len() {
-                0 => Ok(Type::DynamicObject),
+                0 => Ok(calendar_date_type()),
                 1 => {
                     expect_dynamic_object_arg("time.date", &actuals[0], args[0].span)?;
-                    Ok(Type::Result(Box::new(Type::DynamicObject)))
+                    Ok(Type::Result(Box::new(calendar_date_type())))
                 }
                 2 => {
                     expect_dynamic_object_arg("time.date", &actuals[0], args[0].span)?;
                     expect_type_arg(&actuals[1], &Type::String, args[1].span)?;
-                    Ok(Type::Result(Box::new(Type::DynamicObject)))
+                    Ok(Type::Result(Box::new(calendar_date_type())))
                 }
                 3 => {
                     for (actual, arg) in actuals.iter().zip(args) {
                         expect_type_arg(actual, &Type::Int, arg.span)?;
                     }
-                    Ok(Type::Result(Box::new(Type::DynamicObject)))
+                    Ok(Type::Result(Box::new(calendar_date_type())))
                 }
                 _ => Err(KuError::runtime(
                     format!(
@@ -3921,12 +4362,12 @@ impl Checker {
             "parts" => match args.len() {
                 1 => {
                     expect_dynamic_object_arg("time.parts", &actuals[0], args[0].span)?;
-                    Ok(Type::DynamicObject)
+                    Ok(calendar_parts_type())
                 }
                 2 => {
                     expect_dynamic_object_arg("time.parts", &actuals[0], args[0].span)?;
                     expect_type_arg(&actuals[1], &Type::String, args[1].span)?;
-                    Ok(Type::Result(Box::new(Type::DynamicObject)))
+                    Ok(Type::Result(Box::new(calendar_parts_type())))
                 }
                 _ => Err(KuError::runtime(
                     format!(
@@ -4576,6 +5017,7 @@ impl Checker {
             },
             TypePattern::Native(name) => matches!(actual, Type::Native(n) if n == name),
             TypePattern::ArrayElementOfArg(_)
+            | TypePattern::NullableOf(_)
             | TypePattern::ResultOf(_)
             | TypePattern::SameAsArg(_) => true,
         }
@@ -4604,6 +5046,7 @@ impl Checker {
             TypePattern::Unknown
             | TypePattern::Any
             | TypePattern::ArrayElementOfArg(_)
+            | TypePattern::NullableOf(_)
             | TypePattern::ResultOf(_)
             | TypePattern::SameAsArg(_) => Type::Unknown,
         }
@@ -4651,6 +5094,9 @@ impl Checker {
             TypePattern::ResultOf(inner) => Ok(Type::Result(Box::new(
                 Self::stdlib_pattern_to_type(inner, actuals, span)?,
             ))),
+            TypePattern::NullableOf(inner) => Ok(nullable::make_nullable(
+                Self::stdlib_pattern_to_type(inner, actuals, span)?,
+            )),
             TypePattern::SameAsArg(index) => actuals
                 .get(*index)
                 .cloned()
@@ -4905,6 +5351,32 @@ impl Checker {
         arg_types: &[Type],
         span: Span,
     ) -> KuResult<Type> {
+        self.check_function_value_body_impl(
+            FunctionValueBodyRef {
+                params,
+                return_type,
+                body,
+                body_id,
+            },
+            arg_types,
+            span,
+            false,
+        )
+    }
+
+    fn check_function_value_body_impl(
+        &mut self,
+        function: FunctionValueBodyRef<'_>,
+        arg_types: &[Type],
+        span: Span,
+        infer_anonymous_nullable: bool,
+    ) -> KuResult<Type> {
+        let FunctionValueBodyRef {
+            params,
+            return_type,
+            body,
+            body_id,
+        } = function;
         let guard_inference = return_type.is_none();
         if guard_inference {
             let Some(body_id) = body_id else {
@@ -4950,11 +5422,17 @@ impl Checker {
             self.function_value_inference_stack.push(body_id);
         }
         let saved_return = self.current_return.clone();
+        let saved_anonymous_return = std::mem::replace(
+            &mut self.anonymous_return_evidence,
+            infer_anonymous_nullable.then(AnonymousReturnEvidence::default),
+        );
         let saved_loop_depth = self.loop_depth;
         let saved_recoverable_depth = self.recoverable_depth;
         // A closure executes later; its return/fail/? edges do not enter a try
         // surrounding the closure literal's creation.
         let saved_try_exit_collectors = std::mem::take(&mut self.try_exit_collectors);
+        let saved_nullable_facts = self.nullable_facts();
+        self.clear_nullable_facts();
         self.current_return = return_type.cloned().unwrap_or(Type::Unknown);
         self.loop_depth = 0;
         self.recoverable_depth = 0;
@@ -4975,13 +5453,21 @@ impl Checker {
             }
 
             let mut inferred_return = Type::Null;
+            let mut reachable = true;
             for stmt in body {
-                if let Some(return_type) = self.check_stmt_and_infer_return(stmt)? {
+                if let Some(return_type) =
+                    self.check_stmt_and_infer_return_on_path(stmt, reachable)?
+                {
                     inferred_return = merge_return_types(&inferred_return, &return_type, span)?;
+                }
+                if let Some(evidence) = &self.anonymous_return_evidence {
+                    reachable &= evidence.stmt_falls_through(stmt);
                 }
             }
             if let Some(expected) = return_type {
-                if expected != &Type::Void && !block_may_return(body) {
+                if expected != &Type::Void
+                    && !block_may_return(body, matches!(expected, Type::Result(_)))
+                {
                     return Err(KuError::runtime(
                         format!("function value must return {}", type_name(expected)),
                         span,
@@ -4991,7 +5477,16 @@ impl Checker {
                     return Err(type_error(span, expected, &inferred_return));
                 }
             }
-            Ok(inferred_return)
+            Ok(self
+                .anonymous_return_evidence
+                .take()
+                .and_then(|evidence| evidence.nullable_type(reachable))
+                .or_else(|| {
+                    return_type
+                        .filter(|ty| has_scalar_nullable_payload(ty))
+                        .cloned()
+                })
+                .unwrap_or(inferred_return))
         })();
 
         // Every enclosing binding this closure reads is boxed into a shared cell
@@ -5012,6 +5507,9 @@ impl Checker {
                     for var in scope.values_mut() {
                         if captured_ids.contains(&var.binding_id) {
                             var.captured = true;
+                            if let Some(facts) = &mut self.native_field_facts {
+                                facts.invalidate_object_binding(var.binding_id);
+                            }
                         }
                     }
                 }
@@ -5034,6 +5532,9 @@ impl Checker {
                     for name in &captured {
                         if let Some(var) = scope.get_mut(name) {
                             var.captured = true;
+                            if let Some(facts) = &mut self.native_field_facts {
+                                facts.invalidate_object_binding(var.binding_id);
+                            }
                         }
                     }
                 }
@@ -5045,9 +5546,11 @@ impl Checker {
             self.pop_scope();
         }
         self.current_return = saved_return;
+        self.anonymous_return_evidence = saved_anonymous_return;
         self.loop_depth = saved_loop_depth;
         self.recoverable_depth = saved_recoverable_depth;
         self.try_exit_collectors = saved_try_exit_collectors;
+        self.restore_nullable_facts(&saved_nullable_facts);
         if inference_body_key.is_some() {
             self.function_value_inference_stack.pop();
         }
@@ -5137,11 +5640,14 @@ impl Checker {
         self.push_scope();
         self.readonly_capture = Some(effective_capture);
         let saved_return = self.current_return.clone();
+        let saved_anonymous_return = self.anonymous_return_evidence.take();
         let saved_loop_depth = self.loop_depth;
         let saved_recoverable_depth = self.recoverable_depth;
         // Handler/async bodies are separate executions too; do not report their
         // abrupt exits to a try active where the function value is checked.
         let saved_try_exit_collectors = std::mem::take(&mut self.try_exit_collectors);
+        let saved_nullable_facts = self.nullable_facts();
+        self.clear_nullable_facts();
         self.current_return = function.return_type.cloned().unwrap_or(Type::Unknown);
         self.loop_depth = 0;
         self.recoverable_depth = 0;
@@ -5170,7 +5676,9 @@ impl Checker {
                 }
             }
             if let Some(expected) = function.return_type {
-                if expected != &Type::Void && !block_may_return(function.body) {
+                if expected != &Type::Void
+                    && !block_may_return(function.body, matches!(expected, Type::Result(_)))
+                {
                     return Err(KuError::runtime(
                         format!("function value must return {}", type_name(expected)),
                         span,
@@ -5180,10 +5688,15 @@ impl Checker {
                     return Err(type_error(span, expected, &inferred_return));
                 }
             }
-            Ok(inferred_return)
+            Ok(function
+                .return_type
+                .filter(|ty| has_scalar_nullable_payload(ty))
+                .cloned()
+                .unwrap_or(inferred_return))
         })();
 
         self.current_return = saved_return;
+        self.anonymous_return_evidence = saved_anonymous_return;
         self.loop_depth = saved_loop_depth;
         self.recoverable_depth = saved_recoverable_depth;
         self.try_exit_collectors = saved_try_exit_collectors;
@@ -5192,6 +5705,7 @@ impl Checker {
         if replayed_captures {
             self.pop_scope();
         }
+        self.restore_nullable_facts(&saved_nullable_facts);
         if let Some(expected_body_id) = function.body_id {
             let popped = self.readonly_function_body_stack.pop();
             debug_assert_eq!(popped, Some(expected_body_id));
@@ -5348,6 +5862,7 @@ impl Checker {
                 if !type_matches(&self.current_return, &actual) {
                     return Err(type_error(*span, &self.current_return, &actual));
                 }
+                self.observe_anonymous_return(&actual);
                 self.capture_try_exit(TryExitKind::Return);
                 Ok(Some(actual))
             }
@@ -5385,9 +5900,11 @@ impl Checker {
                 // the `if`, and a path moved on only one branch would look
                 // definitely-moved instead of `MaybeMoved`.
                 let before = self.scopes.clone();
+                self.apply_nullable_condition(condition, true);
                 let then_return = self.check_block_and_infer_return(then_branch)?;
                 let then_scopes = self.scopes.clone();
                 self.scopes = before.clone();
+                self.apply_nullable_condition(condition, false);
                 let else_return = self.check_block_and_infer_return(else_branch)?;
                 let else_scopes = self.scopes.clone();
                 let then_falls = !block_stops_fallthrough(then_branch);
@@ -5426,16 +5943,44 @@ impl Checker {
     fn check_block_and_infer_return(&mut self, body: &[Stmt]) -> KuResult<Option<Type>> {
         self.push_scope();
         let mut inferred = None;
+        let mut reachable = true;
         for stmt in body {
-            if let Some(return_type) = self.check_stmt_and_infer_return(stmt)? {
+            if let Some(return_type) = self.check_stmt_and_infer_return_on_path(stmt, reachable)? {
                 inferred = Some(match inferred {
                     Some(existing) => merge_return_types(&existing, &return_type, stmt_span(stmt))?,
                     None => return_type,
                 });
             }
+            if let Some(evidence) = &self.anonymous_return_evidence {
+                reachable &= evidence.stmt_falls_through(stmt);
+            }
         }
         self.pop_scope();
         Ok(inferred)
+    }
+
+    fn observe_anonymous_return(&mut self, actual: &Type) {
+        if self.loop_analysis_depth == 0 {
+            if let Some(evidence) = &mut self.anonymous_return_evidence {
+                evidence.observe(actual);
+            }
+        }
+    }
+
+    fn check_stmt_and_infer_return_on_path(
+        &mut self,
+        stmt: &Stmt,
+        reachable: bool,
+    ) -> KuResult<Option<Type>> {
+        if reachable {
+            return self.check_stmt_and_infer_return(stmt);
+        }
+        // Keep diagnostics for dead statements from the existing checker. Only
+        // their contribution to the anonymous callable's ABI is suppressed.
+        let saved = self.anonymous_return_evidence.take();
+        let result = self.check_stmt_and_infer_return(stmt);
+        self.anonymous_return_evidence = saved;
+        result
     }
 
     fn expect_condition(&mut self, expr: &Expr, span: Span) -> KuResult<()> {
@@ -5507,7 +6052,11 @@ impl Checker {
                         span,
                     ));
                 }
-                return Ok(var.clone());
+                let mut readable = var.clone();
+                if let Some(narrowed) = &var.narrowed_type {
+                    readable.ty = narrowed.clone();
+                }
+                return Ok(readable);
             }
         }
         Err(KuError::runtime(
@@ -6214,6 +6763,10 @@ impl Checker {
                 }
             }
             conservative.complete = false;
+            let data_only_arguments = argument_types
+                .iter()
+                .zip(arguments)
+                .all(|(ty, provenance)| self.is_closed_capture_data(ty, provenance));
             for target in self
                 .function_body_outer_bindings
                 .get(&body_id)
@@ -6221,10 +6774,11 @@ impl Checker {
                 .flat_map(|bindings| bindings.values().copied())
             {
                 self.reject_http_shared_write(target, span)?;
-                if self
-                    .binding_by_id(target)
-                    .is_some_and(|binding| self.type_may_contain_function_value(&binding.ty))
-                {
+                if self.binding_by_id(target).is_some_and(|binding| {
+                    self.type_may_contain_function_value(&binding.ty)
+                        && !(data_only_arguments
+                            && self.is_immutable_callable_with_data_captures(binding))
+                }) {
                     let mut provenance = conservative.clone();
                     // Merely owning the target cell is not itself a write-back;
                     // remove that tautological edge so an opaque but harmless
@@ -6243,9 +6797,17 @@ impl Checker {
         for effect in summary.effects {
             self.reject_http_shared_write(effect.target, effect.assignment_span.unwrap_or(span))?;
             self.mark_http_callable_body_uncertain(effect.target);
-            environment_effect.merge(&effect.provenance);
-            let Some((target_name, target_type)) = self.binding_name_and_type_by_id(effect.target)
-            else {
+            let target = self.binding_name_and_type_by_id(effect.target);
+            // A typed data write cannot install a function in the captured
+            // environment. An unresolved value alone is not a reason to taint
+            // callable provenance when the destination cannot hold a callable.
+            if !target
+                .as_ref()
+                .is_some_and(|(_, ty)| self.is_closed_capture_data(ty, &effect.provenance))
+            {
+                environment_effect.merge(&effect.provenance);
+            }
+            let Some((target_name, target_type)) = target else {
                 continue;
             };
             if !self.type_may_contain_function_value(&target_type) {
@@ -6274,6 +6836,54 @@ impl Checker {
             }
         }
         Ok(())
+    }
+
+    fn is_immutable_callable_with_data_captures(&self, binding: &VarType) -> bool {
+        // An immutable function slot cannot be overwritten. Treating it as a
+        // proxy for an indirect write through its environment is necessary
+        // only if that environment might carry a callable. Keep the fallback
+        // for missing bindings, erased bodies and non-data captures.
+        !binding.mutable
+            && !binding.borrowed
+            && matches!(
+                &binding.ty,
+                Type::FunctionValue {
+                    body_id: Some(_),
+                    is_async: false,
+                    ..
+                }
+            )
+            && binding.closure_provenance.complete
+            && !binding.closure_provenance.http_callable_body_uncertain
+            && binding
+                .closure_provenance
+                .dependencies
+                .iter()
+                .all(|dependency| {
+                    self.binding_by_id(*dependency).is_some_and(|captured| {
+                        self.is_closed_capture_data(&captured.ty, &captured.closure_provenance)
+                    })
+                })
+    }
+
+    fn is_closed_capture_data(&self, ty: &Type, provenance: &ClosureProvenance) -> bool {
+        provenance.dependencies.is_empty()
+            && !provenance.http_callable_body_uncertain
+            && provenance.http_shared.is_empty()
+            && !self.type_graph_any(ty, |ty| {
+                matches!(
+                    ty,
+                    Type::FunctionValue { .. }
+                        | Type::Task(_)
+                        | Type::Native(_)
+                        | Type::Object(_)
+                        | Type::StringMap
+                        | Type::DynamicObject
+                        | Type::KuValue
+                        | Type::Generic(_)
+                        | Type::Unknown
+                )
+            })
     }
 
     fn apply_top_level_function_closure_effects(
@@ -7526,8 +8136,12 @@ impl Checker {
     fn mark_initialized(&mut self, name: &str) {
         for scope in self.scopes.iter_mut().rev() {
             if let Some(var) = scope.get_mut(name) {
+                if let Some(facts) = &mut self.native_field_facts {
+                    facts.invalidate_object_binding(var.binding_id);
+                }
                 // Reassigning the whole variable re-initializes every path.
                 var.reinit(&[]);
+                var.narrowed_type = None;
                 return;
             }
         }
@@ -7553,7 +8167,7 @@ impl Checker {
     }
 
     fn place_type(&self, place: &PlacePath) -> Option<Type> {
-        let mut ty = self.get_allow_moved(&place.root, Span::default()).ok()?.ty;
+        let mut ty = self.get(&place.root, Span::default()).ok()?.ty;
         for field in &place.path {
             ty = match &ty {
                 Type::Struct(name) => self.structs.get(name)?.fields.get(field)?.clone(),
@@ -7668,6 +8282,9 @@ impl Checker {
         for scope in self.scopes.iter_mut().rev() {
             if let Some(var) = scope.get_mut(&place.root) {
                 var.reinit(&place.path);
+                if place.path.is_empty() {
+                    var.narrowed_type = None;
+                }
                 return;
             }
         }
@@ -8316,6 +8933,7 @@ impl Checker {
         if let Some(condition) = condition {
             if self.charge_loop_analysis(condition.span).is_ok() {
                 let _ = self.expect_condition(condition, condition.span);
+                self.apply_nullable_condition(condition, true);
             }
         }
         self.push_scope();
@@ -8628,6 +9246,100 @@ fn reject_duplicate_function_value_params(params: &[FunctionParam]) -> KuResult<
     Ok(())
 }
 
+/// Check each nominal type's fields once its dependencies are known. The
+/// original AST and field order are also used by the interpreter and backends.
+fn aggregate_declaration_order(items: &[Item]) -> KuResult<Vec<&Item>> {
+    let declarations = items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Struct(decl) => Some((decl.name.as_str(), decl.span, item)),
+            Item::Enum(decl) => Some((decl.name.as_str(), decl.span, item)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let by_name = declarations
+        .iter()
+        .enumerate()
+        .map(|(index, (name, _, _))| (*name, index))
+        .collect::<HashMap<_, _>>();
+    let mut unresolved = vec![0usize; declarations.len()];
+    let mut dependents = vec![Vec::new(); declarations.len()];
+
+    for (index, (_, _, item)) in declarations.iter().enumerate() {
+        let mut pending: Vec<(&TypeName, Span)> = match item {
+            Item::Struct(decl) => decl
+                .fields
+                .iter()
+                .filter_map(|p| p.ty.as_ref().map(|ty| (ty, p.span)))
+                .collect(),
+            Item::Enum(decl) => decl
+                .variants
+                .iter()
+                .flat_map(|variant| &variant.fields)
+                .filter_map(|p| p.ty.as_ref().map(|ty| (ty, p.span)))
+                .collect(),
+            _ => unreachable!("only aggregate declarations were collected"),
+        };
+        while let Some((ty, span)) = pending.pop() {
+            match ty {
+                TypeName::Custom(name) => {
+                    // Other names (including built-ins) are resolved by the
+                    // normal field checker at the original field's span.
+                    if let Some(&dependency) = by_name.get(name.as_str()) {
+                        unresolved[index] += 1;
+                        dependents[dependency].push((index, span));
+                    }
+                }
+                TypeName::Array(inner) | TypeName::Result(inner) => pending.push((inner, span)),
+                TypeName::Union(arms) => pending.extend(arms.iter().map(|ty| (ty, span))),
+                TypeName::Function {
+                    params,
+                    return_type,
+                    ..
+                } => {
+                    pending.extend(params.iter().map(|ty| (ty, span)));
+                    pending.push((return_type, span));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut ready = unresolved
+        .iter()
+        .enumerate()
+        .filter_map(|(index, count)| (*count == 0).then_some(index))
+        .collect::<BTreeSet<_>>();
+    let mut ordered = Vec::with_capacity(declarations.len());
+    // Prefer source order among ready types so independent diagnostics stay
+    // in the same order as in a dependency-first source file.
+    while let Some(index) = ready.pop_first() {
+        ordered.push(declarations[index].2);
+        for &(dependent, _) in &dependents[index] {
+            unresolved[dependent] -= 1;
+            if unresolved[dependent] == 0 {
+                ready.insert(dependent);
+            }
+        }
+    }
+    if let Some(index) = unresolved.iter().position(|count| *count != 0) {
+        let (name, declaration_span, _) = declarations[index];
+        let span = dependents
+            .iter()
+            .enumerate()
+            .filter(|(dependency, _)| unresolved[*dependency] != 0)
+            .flat_map(|(_, edges)| edges)
+            .filter_map(|(dependent, field)| (*dependent == index).then_some(*field))
+            .min_by_key(|field| field.start.offset)
+            .unwrap_or(declaration_span);
+        return Err(KuError::runtime(
+            format!("recursive type declarations are not supported: '{name}' depends on a recursive type"),
+            span,
+        ));
+    }
+    Ok(ordered)
+}
+
 fn reject_duplicate_params(function: &FnDecl) -> KuResult<()> {
     let mut seen = HashSet::new();
     for param in &function.params {
@@ -8841,6 +9553,15 @@ fn bind_generic_type(expected: &Type, actual: &Type, bindings: &mut HashMap<Stri
             Type::Result(actual) => bind_generic_type(expected, actual, bindings),
             _ => false,
         },
+        Type::Union(_) if matches!(actual, Type::Union(_)) => {
+            let Type::Union(actuals) = actual else {
+                unreachable!()
+            };
+            actuals
+                .iter()
+                .all(|actual| bind_generic_type(expected, actual, bindings))
+        }
+        Type::Union(options) if actual == &Type::Null && options.contains(&Type::Null) => true,
         Type::Union(options) => options.iter().any(|option| {
             let mut candidate = bindings.clone();
             if bind_generic_type(option, actual, &mut candidate) && type_matches(option, actual) {
@@ -9119,7 +9840,7 @@ fn assign_target_uses_name(target: &AssignTarget, name: &str, shadowed: bool) ->
     }
 }
 
-fn expr_uses_name(expr: &Expr, name: &str, shadowed: bool) -> bool {
+pub(crate) fn expr_uses_name(expr: &Expr, name: &str, shadowed: bool) -> bool {
     match &expr.kind {
         ExprKind::Literal(Literal::TemplateString(raw)) => {
             let mut used = false;
@@ -10110,6 +10831,12 @@ fn merge_moved_scopes(
             let then_moves = then_var.map(|value| &value.moves);
             let else_moves = else_var.map(|value| &value.moves);
             merge_var_moves(var, &[then_moves, else_moves]);
+            var.narrowed_type = match (then_var, else_var) {
+                (Some(left), Some(right)) if left.narrowed_type == right.narrowed_type => {
+                    left.narrowed_type.clone()
+                }
+                _ => None,
+            };
             var.ty = merge_function_value_branch_types(
                 &var.ty,
                 &[
@@ -10161,6 +10888,21 @@ fn merge_moved_scope_paths(
                 })
                 .collect();
             merge_var_moves(var, &branch_moves);
+            var.narrowed_type = paths.first().and_then(|path| {
+                path.get(index)
+                    .and_then(|scope| scope.get(name))
+                    .and_then(|first| {
+                        paths
+                            .iter()
+                            .all(|path| {
+                                path.get(index)
+                                    .and_then(|scope| scope.get(name))
+                                    .is_some_and(|next| next.narrowed_type == first.narrowed_type)
+                            })
+                            .then(|| first.narrowed_type.clone())
+                            .flatten()
+                    })
+            });
             let branch_types = paths
                 .iter()
                 .map(|path| {
@@ -10215,13 +10957,15 @@ fn is_constant_name(name: &str) -> bool {
     has_alpha
 }
 
-fn block_may_return(body: &[Stmt]) -> bool {
-    body.iter().any(stmt_may_return)
+fn block_may_return(body: &[Stmt], can_propagate_error: bool) -> bool {
+    body.iter()
+        .any(|stmt| stmt_may_return(stmt, can_propagate_error))
 }
 
-fn stmt_may_return(stmt: &Stmt) -> bool {
+fn stmt_may_return(stmt: &Stmt, can_propagate_error: bool) -> bool {
     match stmt {
-        Stmt::Return { .. } | Stmt::Fail { .. } => true,
+        Stmt::Return { .. } => true,
+        Stmt::Fail { .. } => can_propagate_error,
         Stmt::Break { .. } | Stmt::Continue { .. } => false,
         Stmt::If {
             then_branch,
@@ -10229,8 +10973,27 @@ fn stmt_may_return(stmt: &Stmt) -> bool {
             ..
         } => {
             !else_branch.is_empty()
-                && block_may_return(then_branch)
-                && block_may_return(else_branch)
+                && block_may_return(then_branch, can_propagate_error)
+                && block_may_return(else_branch, can_propagate_error)
+        }
+        Stmt::Try {
+            body,
+            catch_name,
+            catch_body,
+            finally_body,
+            ..
+        } => {
+            // A terminating finally covers paths that otherwise fall through.
+            // If it completes normally, both the regular and caught paths
+            // must supply an exit. A failure can count as an exit only when
+            // an enclosing catch or a Result function can receive it.
+            block_may_return(finally_body, can_propagate_error)
+                || (block_may_return(body, true)
+                    && if catch_name.is_some() {
+                        block_may_return(catch_body, can_propagate_error)
+                    } else {
+                        can_propagate_error
+                    })
         }
         _ => false,
     }
@@ -10754,54 +11517,21 @@ fn http_route_type() -> Type {
 }
 
 fn http_status_type() -> Type {
-    Type::Object(HashMap::from([
-        ("ok".to_string(), Type::Int),
-        ("created".to_string(), Type::Int),
-        ("accepted".to_string(), Type::Int),
-        ("noContent".to_string(), Type::Int),
-        ("movedPermanently".to_string(), Type::Int),
-        ("found".to_string(), Type::Int),
-        ("seeOther".to_string(), Type::Int),
-        ("notModified".to_string(), Type::Int),
-        ("temporaryRedirect".to_string(), Type::Int),
-        ("permanentRedirect".to_string(), Type::Int),
-        ("badRequest".to_string(), Type::Int),
-        ("unauthorized".to_string(), Type::Int),
-        ("forbidden".to_string(), Type::Int),
-        ("notFound".to_string(), Type::Int),
-        ("methodNotAllowed".to_string(), Type::Int),
-        ("notAcceptable".to_string(), Type::Int),
-        ("requestTimeout".to_string(), Type::Int),
-        ("conflict".to_string(), Type::Int),
-        ("gone".to_string(), Type::Int),
-        ("contentTooLarge".to_string(), Type::Int),
-        ("uriTooLong".to_string(), Type::Int),
-        ("unsupportedMedia".to_string(), Type::Int),
-        ("rangeNotSatisfiable".to_string(), Type::Int),
-        ("unprocessable".to_string(), Type::Int),
-        ("tooManyRequests".to_string(), Type::Int),
-        ("headerTooLarge".to_string(), Type::Int),
-        ("internalError".to_string(), Type::Int),
-        ("notImplemented".to_string(), Type::Int),
-        ("badGateway".to_string(), Type::Int),
-        ("serviceUnavailable".to_string(), Type::Int),
-        ("gatewayTimeout".to_string(), Type::Int),
-    ]))
+    Type::Object(
+        crate::stdlib::http::HTTP_STATUS_CODES
+            .iter()
+            .map(|(name, _, _)| ((*name).to_string(), Type::Int))
+            .collect(),
+    )
 }
 
 fn http_code_type() -> Type {
-    Type::Object(HashMap::from([
-        ("SUCCESS".to_string(), Type::Int),
-        ("CREATED".to_string(), Type::Int),
-        ("ACCEPTED".to_string(), Type::Int),
-        ("NO_CONTENT".to_string(), Type::Int),
-        ("BAD_REQUEST".to_string(), Type::Int),
-        ("UNAUTHORIZED".to_string(), Type::Int),
-        ("FORBIDDEN".to_string(), Type::Int),
-        ("NOT_FOUND".to_string(), Type::Int),
-        ("VALIDATION_FAILED".to_string(), Type::Int),
-        ("INTERNAL_ERROR".to_string(), Type::Int),
-    ]))
+    Type::Object(
+        crate::stdlib::http::HTTP_CODE_ALIASES
+            .iter()
+            .map(|(name, _)| ((*name).to_string(), Type::Int))
+            .collect(),
+    )
 }
 
 fn std_module_object_type(module: &str, span: Span) -> KuResult<Type> {
@@ -10833,7 +11563,7 @@ fn http_request_type() -> Type {
 fn http_response_type() -> Type {
     Type::Object(HashMap::from([
         ("status".to_string(), Type::Int),
-        ("headers".to_string(), Type::Object(HashMap::new())),
+        ("headers".to_string(), Type::DynamicObject),
         ("body".to_string(), Type::String),
     ]))
 }
@@ -11056,6 +11786,26 @@ impl Default for Checker {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn calendar_date_type() -> Type {
+    Type::Object(HashMap::from([
+        ("kind".into(), Type::String),
+        ("year".into(), Type::Int),
+        ("month".into(), Type::Int),
+        ("day".into(), Type::Int),
+    ]))
+}
+
+fn calendar_parts_type() -> Type {
+    let Type::Object(mut fields) = calendar_date_type() else {
+        unreachable!()
+    };
+    for field in ["hour", "minute", "second", "millis", "weekday"] {
+        fields.insert(field.into(), Type::Int);
+    }
+    fields.insert("zone".into(), Type::String);
+    Type::Object(fields)
 }
 
 #[cfg(test)]

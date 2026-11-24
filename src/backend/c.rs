@@ -5,16 +5,33 @@ use std::collections::{HashMap, HashSet, VecDeque};
 mod output;
 use output::COutput;
 
+#[path = "c_array_optional.rs"]
+mod array_optional;
+#[path = "c_calendar.rs"]
+mod calendar;
+#[path = "c_http_client.rs"]
+mod http_client;
+
 #[path = "c_int.rs"]
 mod checked_int;
+#[path = "c_compression.rs"]
+mod compression;
 #[path = "c_database_budget.rs"]
 mod database_budget;
 #[path = "c_http_short.rs"]
 mod http_short;
+#[path = "c_http_status.rs"]
+mod http_status;
+#[path = "c_interop.rs"]
+mod interop;
 #[path = "c_service_output.rs"]
 mod service_output;
+#[path = "c_string_unicode.rs"]
+mod string_unicode;
 #[path = "c_sync.rs"]
 mod sync;
+#[path = "c_time.rs"]
+mod time;
 
 #[path = "c_task.rs"]
 mod task;
@@ -35,6 +52,29 @@ mod task_range;
 #[path = "c_task_root.rs"]
 mod task_root;
 
+fn c_object_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "__ku_object"
+            | "__ku_calendar_date"
+            | "__ku_calendar_parts"
+            | "__ku_http_client_config"
+            | "__ku_http_headers"
+    ) || crate::ir::http_constant_object_table(name).is_some()
+}
+
+fn c_time_scalar_name(name: &str) -> bool {
+    matches!(name, "__ku_time" | "__ku_duration")
+}
+
+fn c_time_prefix(name: &str) -> &'static str {
+    if name == "__ku_duration" {
+        "__ku_duration"
+    } else {
+        "ku_time"
+    }
+}
+
 // Whole generated-file bytes, including shared runtimes and all specializations.
 // This is independent of the checker's generic AST/type admission budget.
 const MAX_GENERATED_C_BYTES: usize = 64 * 1024 * 1024;
@@ -44,8 +84,8 @@ use crate::{
     error::{KuError, KuResult},
     ir::{
         FunctionId, IrBlock, IrCallKind, IrCaptureSource, IrEnumLayout, IrExpr, IrExprKind,
-        IrFieldLayout, IrFunction, IrInst, IrLValue, IrProgram, IrStructLayout, IrTerminator,
-        IrType,
+        IrFieldLayout, IrFunction, IrInst, IrLValue, IrLayoutTable, IrProgram, IrStructLayout,
+        IrTerminator, IrType,
     },
     span::Span,
 };
@@ -307,13 +347,81 @@ pub fn generate_mixed_http_c_source(
     frames: &crate::ir::task::TaskProgram,
     options: &CBackendOptions,
 ) -> KuResult<String> {
+    generate_mixed_http_with_layouts(
+        program,
+        frames,
+        &IrLayoutTable {
+            structs: Vec::new(),
+            enums: Vec::new(),
+        },
+        options,
+    )
+}
+
+pub(crate) fn generate_mixed_http_task_c_source(
+    program: &IrProgram,
+    native: &crate::ir::task_lower::NativeTaskProgram,
+    options: &CBackendOptions,
+) -> KuResult<String> {
+    generate_mixed_http_with_layouts(program, &native.tasks, &native.layouts, options)
+}
+
+fn generate_mixed_http_with_layouts(
+    program: &IrProgram,
+    frames: &crate::ir::task::TaskProgram,
+    layouts: &IrLayoutTable,
+    options: &CBackendOptions,
+) -> KuResult<String> {
     task_mixed::validate(program, frames)?;
     if !program_uses_http(program) || frames.functions.is_empty() {
         return Err(unsupported(
             "async functions outside an async entry require an HTTP service",
         ));
     }
-    let plan = crate::ir::task::verify_and_plan(frames, Default::default())?;
+    let plan = crate::ir::task::verify_and_plan_with_layouts(frames, Default::default(), layouts)?;
+    let combined;
+    let program = if layouts.structs.is_empty() {
+        program
+    } else {
+        // The synchronous setup already owns its declarations. Task records
+        // are emitted separately so their typed move/drop ABI cannot replace
+        // the setup representation, even if source names collide after C mangling.
+        let mut occupied: HashSet<_> = program
+            .layouts
+            .structs
+            .iter()
+            .map(|layout| c_struct_type(&layout.name))
+            .chain(
+                program
+                    .functions
+                    .iter()
+                    .map(|function| c_symbol(&function.name)),
+            )
+            .collect();
+        for layout in &layouts.structs {
+            if [
+                c_struct_type(&layout.name),
+                c_named_move_function(&layout.name),
+                c_named_clone_function(&layout.name),
+                c_named_drop_function(&layout.name),
+            ]
+            .into_iter()
+            .any(|symbol| !occupied.insert(symbol))
+            {
+                return Err(unsupported(format!(
+                    "mixed native HTTP Task record '{}' collides with an existing C declaration",
+                    layout.name
+                )));
+            }
+        }
+        let mut extended = program.clone();
+        extended
+            .layouts
+            .structs
+            .extend(layouts.structs.iter().cloned());
+        combined = extended;
+        &combined
+    };
     generate_c_source_with_frames_bounded(
         program,
         options,
@@ -328,7 +436,11 @@ pub fn generate_native_task_c_source(
     native: &crate::ir::task_lower::NativeTaskProgram,
     options: &CBackendOptions,
 ) -> KuResult<String> {
-    let plan = crate::ir::task::verify_and_plan(&native.tasks, Default::default())?;
+    let plan = crate::ir::task::verify_and_plan_with_layouts(
+        &native.tasks,
+        Default::default(),
+        &native.layouts,
+    )?;
     let entry = native
         .tasks
         .functions
@@ -342,10 +454,7 @@ pub fn generate_native_task_c_source(
     }
     let sync = IrProgram {
         functions: Vec::new(),
-        layouts: crate::ir::IrLayoutTable {
-            structs: Vec::new(),
-            enums: Vec::new(),
-        },
+        layouts: native.layouts.clone(),
     };
     generate_c_source_with_frames_bounded(
         &sync,
@@ -392,11 +501,15 @@ fn generate_c_source_with_frames_attempt(
 ) -> KuResult<String> {
     crate::ir::verify_borrow_contract(program)?;
     sync::validate_program(program)?;
-    let checked_integer_runtime = sync::uses_checked_integer(program)
+    let checked_integer_runtime = time::uses_runtime(program)
+        || sync::uses_checked_integer(program)
         || frames.is_some_and(|(tasks, _, _)| task::uses_checked_integer(tasks));
     sync::validate_identifiers(program, checked_integer_runtime)?;
+    let task_outbound_http = frames.is_some_and(|(tasks, _, _)| task::uses_outbound_http(tasks));
+    let task_http_values=frames.is_some_and(|(tasks,_,_)|tasks.functions.iter().any(|f|f.slots.iter().any(|s|matches!(&s.ty,crate::ir::task::TaskSlotType::Value{ty,..}if crate::ir::task::http_type(ty)))));
     let task_net = frames.is_some_and(|(tasks, _, _)| {
-        task::uses_postgres(tasks)
+        task::uses_outbound_http(tasks)
+            || task::uses_postgres(tasks)
             || tasks.functions.iter().any(|function| {
                 function.slots.iter().any(|slot| {
                     matches!(&slot.ty, crate::ir::task::TaskSlotType::Value { ty, .. }
@@ -426,6 +539,9 @@ fn generate_c_source_with_frames_attempt(
     });
     let mut frame_result_types = Vec::new();
     let mut frame_array_elements = Vec::new();
+    // Frame-only local types need their ABI even without a synchronous body.
+    // These signatures are consumed only by the type emitters below.
+    let mut abi_program = program.clone();
     if let Some((frames, _, _)) = frames {
         if !frames.functions.is_empty() {
             // The fixed outcome union is shared by all typed Task dispatches.
@@ -457,6 +573,17 @@ fn generate_c_source_with_frames_attempt(
                     }
                 }
                 collect_result_type(ty, &mut frame_result_types)?;
+                if matches!(ty, IrType::Nullable(_)) || crate::ir::task::http_type(ty) {
+                    abi_program.functions.push(IrFunction {
+                        id: FunctionId(usize::MAX - abi_program.functions.len()),
+                        name: "__ku_frame_type_only".into(),
+                        params: Vec::new(),
+                        return_type: ty.clone(),
+                        blocks: Vec::new(),
+                        is_closure_body: false,
+                        captures: Vec::new(),
+                    });
+                }
             }
         }
     }
@@ -559,6 +686,7 @@ fn generate_c_source_with_frames_attempt(
          static int64_t ku_time_elapsed(KuTime previous) {\n  ku_time_validate(previous);\n  int64_t now = ku_time_now_millis();\n  if ((previous.millis > 0 && now < INT64_MIN + previous.millis) ||\n      (previous.millis < 0 && now > INT64_MAX + previous.millis)) {\n    ku_time_fail(\"time.elapsed: elapsed milliseconds overflow\");\n  }\n  return now - previous.millis;\n}\n\
          static void ku_time_print(KuTime value) {\n  ku_time_validate(value);\n  ku_output_printf(\"{ kind: time.time, millis: %lld }\", (long long)value.millis);\n}\n\n",
     );
+    out.push_str(time::DURATION_SCALAR);
     out.check()?;
     // Socket headers shared by the native HTTP and Redis runtimes. `winsock2.h`
     // must precede any `windows.h`; on POSIX both runtimes use poll(2) rather
@@ -567,7 +695,7 @@ fn generate_c_source_with_frames_attempt(
     // The pg connection poller also needs WSAPoll/poll and shutdown(2). Keep a
     // PG-only artifact lean: it does not need the HTTP/Redis resolver, atomic,
     // or thread headers unless it also uses one of those runtimes.
-    let uses_native_socket_runtime = program_uses_http(program)
+    let uses_native_socket_runtime = program_uses_http_server(program)
         || program_uses_redis(program)
         || program_uses_net(program)
         || task_net;
@@ -607,7 +735,7 @@ fn generate_c_source_with_frames_attempt(
         );
     }
     emit_fs_headers(&mut out, fs_usage);
-    service_output::emit(&mut out, program_uses_http(program));
+    service_output::emit(&mut out, program_uses_http_server(program));
     // Call-depth guard: match the interpreter's MAX_CALL_DEPTH so deep/infinite
     // recursion reports "maximum function call depth exceeded" instead of a
     // native stack-overflow crash. Counted at every function/closure-body entry
@@ -712,79 +840,132 @@ fn generate_c_source_with_frames_attempt(
     // array typedefs (a `KuArray_KuStruct_X` only needs the struct as a pointer),
     // then the struct bodies (which can embed a `KuArray_*` by value), then the
     // ownership helpers (forward-declared so struct-clone↔array-clone can recurse).
-    emit_object_type_header(&mut out, program, task_net || task_json)?;
+    emit_object_type_header(&mut out, program, task_net || task_json || task_http_values)?;
     emit_struct_forward_decls(&mut out, program);
+    for inner in array_optional::nullable_elements(&abi_program) {
+        let name = array_optional::nullable_type(&inner)?;
+        out.push_str(&format!("typedef struct {name} {name};\n"));
+    }
     // Arrays store their element behind a pointer, so a declared (not yet
     // complete) Result/closure tag is enough for `[T!]` and `[fn(...): T]`.
     // Their bodies/helpers are completed later, after their by-value
     // dependencies are available.
-    emit_result_forward_decls(&mut out, program, &frame_result_types)?;
-    emit_closure_forward_decls(&mut out, program)?;
-    emit_array_typedefs(&mut out, program, &frame_array_elements)?;
-    emit_array_helper_prototypes(&mut out, program, &frame_array_elements)?;
+    emit_result_forward_decls(&mut out, &abi_program, &frame_result_types)?;
+    let mut closure_types = Vec::new();
+    collect_closure_types_program(program, &mut closure_types);
+    emit_closure_forward_decls(&mut out, &closure_types)?;
+    emit_array_typedefs(&mut out, &abi_program, &frame_array_elements)?;
+    emit_array_helper_prototypes(&mut out, &abi_program, &frame_array_elements)?;
     // Opaque libpq handle typedefs must precede the Result ABI.
     emit_pg_types(&mut out, program);
     emit_redis_types(&mut out, program);
     emit_mysql_types(&mut out, program);
     emit_bytes_types(&mut out, program, task_bytes);
     emit_net_types(&mut out, program, task_net);
-    emit_layouts(&mut out, program)?;
+    let mut closure_header_done = false;
+    let mut closure_emitted = HashSet::new();
+    // Struct fields embed the closure by value. Complete these signatures and
+    // their ownership helpers before emitting the containing structs.
+    let field_types = program
+        .layouts
+        .structs
+        .iter()
+        .flat_map(|layout| layout.fields.iter().map(|field| &field.ty));
+    emit_closure_types(
+        &mut out,
+        field_types,
+        &mut closure_header_done,
+        &mut closure_emitted,
+    )?;
+    let mut nullable_emitted = HashSet::new();
+    emit_layouts(&mut out, &abi_program, &mut nullable_emitted)?;
     emit_named_ownership_helpers(&mut out, program)?;
+    if nullable_emitted.contains("int")
+        && program_has_intrinsic(program, |name, args| {
+            name == "str"
+                && matches!(args.first().map(|arg| &arg.ty), Some(IrType::Nullable(inner)) if **inner == IrType::Int)
+        })
+    {
+        out.push_str(
+            "static KuString __ku_string_from_nullable_int(__ku_nullable_type_int value) {\n\
+             \x20 return value.is_null ? ku_string_static((const uint8_t*)\"null\", 4) : ku_string_from_int(value.value);\n\
+             }\n\n",
+        );
+    }
     register_closure_invoke_symbols(program);
     // The env header carries the type-erased retain/release used by both closures
     // and the `KuValue` Function tag. Emit it up front whenever either feature is
     // present so the object ABI (which clones/drops Function values) and the
     // closure structs can all reference it, regardless of emission order below.
-    let mut closure_types_present = Vec::new();
-    collect_closure_types_program(program, &mut closure_types_present);
-    let mut closure_header_done = false;
-    if !closure_types_present.is_empty()
-        || program_uses_object(program)
-        || program_uses_http(program)
-        // Task controls reuse the atomic representation even with no closures.
-        || frames.is_some_and(|(frames, _, _)| !frames.functions.is_empty())
+    if !closure_header_done
+        && (!closure_types.is_empty()
+            || program_uses_object(program)
+            || program_uses_http(program)
+            // Task controls reuse the atomic representation even with no closures.
+            || frames.is_some_and(|(frames, _, _)| !frames.functions.is_empty()))
     {
         emit_closure_refcount_header(&mut out);
         closure_header_done = true;
     }
-    // Closure struct typedefs come in two passes around the aggregate ABIs so the
-    // cyclic-looking (but acyclic) dependency between array-of-closures and
-    // closure-returning-array is resolved by emission order (see `emit_closure_types`).
-    let mut closure_emitted = std::collections::HashSet::new();
+    // Complete the remaining closure signatures in two passes around the
+    // aggregate ABIs.
+    let (primitive_closures, aggregate_closures): (Vec<_>, Vec<_>) = closure_types
+        .iter()
+        .partition(|ty| closure_has_primitive_signature(ty));
     emit_closure_types(
         &mut out,
-        program,
+        primitive_closures,
         &mut closure_header_done,
         &mut closure_emitted,
-        true,
     )?;
     emit_object_abi(
         &mut out,
         program,
-        task_net || task_json,
+        task_net || task_json || task_http_values,
         options.object_oom_fault_injection,
     )?;
     // Object-valued typed arrays need KuObject/KuValue to be complete before
     // their typed KuArray helper bodies call ku_object_{clone,drop,move}.
-    emit_late_array_typedefs(&mut out, program)?;
-    emit_http_types(&mut out, program)?;
-    emit_result_abi(&mut out, program, &frame_result_types)?;
+    emit_late_array_typedefs(&mut out, &abi_program)?;
+    emit_http_types(&mut out, &abi_program, !program.functions.is_empty())?;
     emit_closure_types(
         &mut out,
-        program,
+        aggregate_closures,
         &mut closure_header_done,
         &mut closure_emitted,
-        false,
     )?;
+    emit_result_abi(
+        &mut out,
+        &abi_program,
+        &frame_result_types,
+        &mut nullable_emitted,
+    )?;
+    interop::emit(&mut out, program)?;
     // Array helper bodies use element sizeof/clone/drop. Result and aggregate-
     // signature closure elements are complete only at this point. Result helper
     // bodies can already refer to the earlier clone/drop prototypes.
-    emit_array_helper_bodies(&mut out, program, &frame_array_elements)?;
+    emit_array_helper_bodies(&mut out, &abi_program, &frame_array_elements)?;
+    time::emit(&mut out, program);
     emit_bytes_runtime(&mut out, program, task_bytes);
+    compression::emit(
+        &mut out,
+        program_uses_intrinsic(program, "zstd.compress")
+            || program_uses_intrinsic(program, "zstd.decompress"),
+        [
+            "gzip.compress",
+            "gzip.decompress",
+            "deflate.compress",
+            "deflate.decompress",
+        ]
+        .iter()
+        .any(|name| program_uses_intrinsic(program, name)),
+    );
     emit_windows_socket_runtime(&mut out, program, task_net);
     emit_net_runtime(&mut out, program, task_net, task_native_tls);
     emit_string_chars_helper(&mut out, program)?;
+    emit_nullable_value_wrappers(&mut out, program, true)?;
     emit_kuvalue_array_wrappers(&mut out, program)?;
+    emit_object_pattern_array_moves(&mut out, program)?;
     emit_kuvalue_typed_array_equality_helpers(&mut out, program)?;
     emit_fs_runtime(&mut out, fs_usage, &options.fs_base);
     if frames.is_some_and(|(tasks, _, _)| task::uses_blocking_io(tasks)) {
@@ -798,8 +979,16 @@ fn generate_c_source_with_frames_attempt(
     }
     emit_array_try_get_helpers(&mut out, program)?;
     emit_string_slice_helper(&mut out, program)?;
+    string_unicode::emit(
+        &mut out,
+        program_uses_intrinsic(program, "string.trim"),
+        program_uses_intrinsic(program, "string.lower")
+            || program_uses_intrinsic(program, "string.upper"),
+    )?;
     emit_object_result_helpers(&mut out, program, task_json)?;
+    http_status::emit(&mut out, program)?;
     emit_closure_value_wrappers(&mut out, program)?;
+    emit_nullable_value_wrappers(&mut out, program, false)?;
     if program_uses_object(program) || task_json {
         // JSON returns Result<str> and its typed writers borrow fully-defined
         // arrays/closures/results. Keep it after all of those ABI phases rather
@@ -810,15 +999,18 @@ fn generate_c_source_with_frames_attempt(
     emit_cell_types(&mut out, program)?;
     emit_env_types(&mut out, program)?;
     emit_array_map_helpers(&mut out, program)?;
+    array_optional::emit_helpers(&mut out, &abi_program, !program.functions.is_empty())?;
+    calendar::emit(&mut out, program);
+    http_client::emit(&mut out, program, task_outbound_http);
     emit_function_prototypes(&mut out, program)?;
     emit_closure_thunk_prototypes(&mut out, program)?;
     if program_uses_pg(program) || program_uses_mysql(program) || program_uses_redis(program) {
         database_budget::emit(&mut out);
     }
-    if program_uses_http(program) || frames.is_some() {
+    if program_uses_http_server(program) || frames.is_some() {
         out.push_str(include_str!("c_runtime_config.c"));
     }
-    if program_uses_http(program) {
+    if program_uses_http_server(program) {
         if let Some((tasks, _, None)) = frames {
             out.push_str("#define KU_HTTP_HAS_TASK_RUNTIME 1\n");
             if task::uses_blocking_net(tasks) {
@@ -861,7 +1053,7 @@ fn generate_c_source_with_frames_attempt(
             out.push_str("  return NULL;\n}\n");
         }
     }
-    if program_uses_http(program) {
+    if program_uses_http_server(program) {
         http_short::emit(
             &mut out,
             program,
@@ -884,9 +1076,10 @@ fn generate_c_source_with_frames_attempt(
             &mut out,
             frames,
             plan,
-            entry.is_some() || program_uses_http(program),
+            &program.layouts,
+            entry.is_some() || program_uses_http_server(program),
         )?;
-        if program_uses_http(program) {
+        if program_uses_http_server(program) {
             task_http::emit(&mut out, frames, program)?;
         }
     }
@@ -913,30 +1106,33 @@ fn register_closure_invoke_symbols(program: &IrProgram) {
     CLOSURE_INVOKE_SYMBOLS.with(|slot| *slot.borrow_mut() = symbols);
 }
 
-/// True when every type in a closure signature lowers to a self-contained C type
-/// (no `KuArray_*`/`KuResult_*`/`KuObject`/nested closure). Such a signature can
-/// be emitted before the array/result ABI, which is required so an
-/// array-of-closures (`[fn(): int]`) sees `KuClosure_*` already defined. Closures
-/// whose signature *does* reference those aggregates are emitted in the later
-/// pass, after those ABIs exist.
-fn closure_signature_is_self_contained(params: &[IrType], ret: &IrType) -> bool {
-    params.iter().chain(std::iter::once(ret)).all(|ty| {
-        matches!(
-            ty,
-            IrType::Int | IrType::Float | IrType::Bool | IrType::Str | IrType::Null | IrType::Void
-        )
-    })
+fn is_primitive_closure_type(ty: &IrType) -> bool {
+    matches!(
+        ty,
+        IrType::Int | IrType::Float | IrType::Bool | IrType::Str | IrType::Null | IrType::Void
+    )
+}
+
+fn closure_has_primitive_signature(ty: &IrType) -> bool {
+    matches!(ty, IrType::Closure { params, ret, .. }
+        if is_primitive_closure_type(ret) && params.iter().all(is_primitive_closure_type))
+}
+
+fn supported_closure_field_signature(params: &[IrType], ret: &IrType) -> bool {
+    let result: &IrType = match ret {
+        IrType::Result(inner) => inner,
+        _ => ret,
+    };
+    params.iter().all(is_primitive_closure_type) && is_primitive_closure_type(result)
 }
 
 /// Declare every signature-specific closure tag before any array typedef. An
 /// array only stores `KuClosure_*` behind a pointer, so the tag may remain
 /// incomplete until its signature's aggregate types are available.
-fn emit_closure_forward_decls(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+fn emit_closure_forward_decls(out: &mut COutput, types: &[IrType]) -> KuResult<()> {
     out.check()?;
-    let mut types = Vec::new();
-    collect_closure_types_program(program, &mut types);
     let mut emitted = std::collections::HashSet::new();
-    for ty in &types {
+    for ty in types {
         let IrType::Closure {
             params,
             param_modes,
@@ -1055,31 +1251,20 @@ typedef struct KuEnvHeader {
 }
 
 /// Emit a `typedef struct { ret (*invoke)(void*, params...); void* env; }` for
-/// every distinct closure signature the program uses (Stage 6a). Runs in two
-/// passes sharing `header_done`/`emitted`: `self_contained_only == true` emits
-/// signatures over primitives before the array/result ABI (so array-of-closures
-/// resolves `KuClosure_*`); the second pass (`false`) emits the remainder after
-/// those ABIs exist (so a closure returning e.g. `[int]` sees `KuArray_int`).
-fn emit_closure_types(
+/// the supplied closure signatures. Share `header_done` and `emitted` across
+/// passes so layout fields and ordinary closures can use the same signature.
+fn emit_closure_types<'a>(
     out: &mut COutput,
-    program: &IrProgram,
+    types: impl IntoIterator<Item = &'a IrType>,
     header_done: &mut bool,
     emitted: &mut std::collections::HashSet<String>,
-    self_contained_only: bool,
 ) -> KuResult<()> {
     out.check()?;
-    let mut types = Vec::new();
-    collect_closure_types_program(program, &mut types);
-    let selected: Vec<&IrType> = types
-        .iter()
-        .filter(|ty| match ty {
-            IrType::Closure { params, ret, .. } => {
-                closure_signature_is_self_contained(params, ret) == self_contained_only
-            }
-            _ => false,
-        })
-        .collect();
-    if selected.is_empty() {
+    let mut selected = types
+        .into_iter()
+        .filter(|ty| matches!(ty, IrType::Closure { .. }))
+        .peekable();
+    if selected.peek().is_none() {
         return Ok(());
     }
     // Stage 6b: a shared env header so a closure can retain/release its env
@@ -1481,6 +1666,11 @@ fn collect_closure_types_program(program: &IrProgram, types: &mut Vec<IrType>) {
             });
         }
     }
+    for layout in &program.layouts.structs {
+        for field in &layout.fields {
+            collect_closure_type(&field.ty, types);
+        }
+    }
 }
 
 fn collect_closure_type(ty: &IrType, types: &mut Vec<IrType>) {
@@ -1494,7 +1684,9 @@ fn collect_closure_type(ty: &IrType, types: &mut Vec<IrType>) {
             }
             collect_closure_type(ret, types);
         }
-        IrType::Array(inner) | IrType::Result(inner) => collect_closure_type(inner, types),
+        IrType::Array(inner) | IrType::Result(inner) | IrType::Nullable(inner) => {
+            collect_closure_type(inner, types)
+        }
         _ => {}
     }
 }
@@ -1597,6 +1789,25 @@ fn validate_layouts(program: &IrProgram) -> KuResult<()> {
         for field in &layout.fields {
             match &field.ty {
                 IrType::Int | IrType::Float | IrType::Bool | IrType::Str => {}
+                IrType::Closure { .. } if field.is_async_callable => {
+                    return Err(unsupported(format!(
+                        "native C struct '{}.{}' does not support async callable fields",
+                        layout.name, field.name
+                    )));
+                }
+                IrType::Closure {
+                    params,
+                    param_modes,
+                    ret,
+                } if params.len() == param_modes.len()
+                    && supported_closure_field_signature(params, ret) => {}
+                IrType::Closure { .. } => {
+                    return Err(unsupported(format!(
+                        "native C struct '{}.{}' requires a synchronous callable field signature over int, float, bool, str or null, with an optional Result return",
+                        layout.name, field.name
+                    )));
+                }
+                IrType::Nullable(inner) if optional_layout_field_supported(inner, program) => {}
                 IrType::Named(name) if is_runtime_object_name(name) => {}
                 // Array fields (`[int]`, `[Person]`, `[[int]]`): the array typedef is
                 // emitted before the struct layout and the array helpers are forward-
@@ -1656,38 +1867,19 @@ fn validate_layouts(program: &IrProgram) -> KuResult<()> {
         ));
     }
 
-    for (index, layout) in program.layouts.structs.iter().enumerate() {
-        for field in &layout.fields {
-            // Only struct-typed fields are ordered among the struct list here; enum
-            // fields are ordered by `emit_layouts` across the unified struct+enum
-            // graph, so skip them (their name is not in the struct `indexes`).
-            if let IrType::Named(name) = &field.ty {
-                if enum_type_name(name).is_some() || is_runtime_object_name(name) {
-                    continue;
-                }
-                let dependency = indexes[name.as_str()];
-                if dependency >= index {
-                    return Err(unsupported(format!(
-                        "native C struct '{}.{}' must reference a struct declared earlier than '{}'; declaration-order value layouts cannot use a later struct",
-                        layout.name, field.name, layout.name
-                    )));
-                }
-            }
-        }
-    }
-
-    let enum_indexes = program
+    // The emission graph orders struct, enum and nullable layouts together.
+    let enum_names = program
         .layouts
         .enums
         .iter()
-        .enumerate()
-        .map(|(index, layout)| (layout.name.as_str(), index))
-        .collect::<HashMap<_, _>>();
-    for (index, layout) in program.layouts.enums.iter().enumerate() {
+        .map(|layout| layout.name.as_str())
+        .collect::<HashSet<_>>();
+    for layout in &program.layouts.enums {
         for variant in &layout.variants {
             for field in &variant.fields {
                 match &field.ty {
                     IrType::Int | IrType::Float | IrType::Bool | IrType::Str => {}
+                    IrType::Nullable(inner) if optional_layout_field_supported(inner, program) => {}
                     IrType::Named(name) if is_runtime_object_name(name) => {}
                     IrType::Array(element) if is_early_array_element(element, program) => {}
                     IrType::Named(name) if enum_type_name(name).is_none() => {
@@ -1700,22 +1892,16 @@ fn validate_layouts(program: &IrProgram) -> KuResult<()> {
                     }
                     IrType::Named(name) => {
                         let enum_name = enum_type_name(name).expect("checked enum marker");
-                        let Some(&dependency) = enum_indexes.get(enum_name) else {
+                        if !enum_names.contains(enum_name) {
                             return Err(unsupported(format!(
                                 "native C enum '{}.{}.{}' references unknown enum '{enum_name}'",
-                                layout.name, variant.name, field.name
-                            )));
-                        };
-                        if dependency >= index {
-                            return Err(unsupported(format!(
-                                "native C enum '{}.{}.{}' must reference an enum declared earlier; recursive enum value layouts are not supported",
                                 layout.name, variant.name, field.name
                             )));
                         }
                     }
                     other => {
                         return Err(unsupported(format!(
-                            "native C enum '{}.{}.{}' does not support payload type {other}; supported payloads are int, bool, str, structs, and earlier enums",
+                            "native C enum '{}.{}.{}' does not support payload type {other}; supported payloads are int, bool, str, structs, and enums",
                             layout.name, variant.name, field.name
                         )));
                     }
@@ -1726,17 +1912,61 @@ fn validate_layouts(program: &IrProgram) -> KuResult<()> {
     Ok(())
 }
 
+fn optional_layout_field_supported(ty: &IrType, program: &IrProgram) -> bool {
+    match ty {
+        IrType::Int | IrType::Float | IrType::Bool | IrType::Str | IrType::Null => true,
+        IrType::Nullable(inner) => optional_layout_field_supported(inner, program),
+        IrType::Array(inner) => is_early_array_element(inner, program),
+        IrType::Named(name) => {
+            c_object_type_name(name)
+                || c_time_scalar_name(name)
+                || program
+                    .layouts
+                    .structs
+                    .iter()
+                    .any(|layout| layout.name == *name)
+                || enum_type_name(name).is_some_and(|name| {
+                    program
+                        .layouts
+                        .enums
+                        .iter()
+                        .any(|layout| layout.name == name)
+                })
+        }
+        _ => false,
+    }
+}
+
 /// Emit struct and enum typedefs in a unified topological order: a type is emitted
 /// after every type it embeds BY VALUE (a struct field or enum payload of `Named`
 /// type). This lets a struct hold an enum field and an enum hold a struct payload
 /// in the same program. Array fields embed through a `KuArray_*` pointer, so they
 /// create no ordering dependency (their typedefs are emitted separately).
-fn emit_layouts(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+fn optional_before_results(ty: &IrType, program: &IrProgram) -> bool {
+    match ty {
+        IrType::Result(_) | IrType::Closure { .. } => false,
+        IrType::Nullable(inner) => optional_before_results(inner, program),
+        IrType::Array(inner) => is_early_array_element(inner, program),
+        IrType::Named(name) if name.starts_with("__ku_http_") => false,
+        _ => true,
+    }
+}
+
+fn emit_layouts(
+    out: &mut COutput,
+    program: &IrProgram,
+    nullable_emitted: &mut HashSet<String>,
+) -> KuResult<()> {
     out.check()?;
     let structs = &program.layouts.structs;
     let enums = &program.layouts.enums;
     let n_structs = structs.len();
-    let total = n_structs + enums.len();
+    let n_named = n_structs + enums.len();
+    let nullables = array_optional::nullable_elements(program)
+        .into_iter()
+        .filter(|inner| optional_before_results(inner, program))
+        .collect::<Vec<_>>();
+    let total = n_named + nullables.len();
     if total == 0 {
         return Ok(());
     }
@@ -1750,13 +1980,16 @@ fn emit_layouts(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
         enum_index.insert(layout.name.as_str(), n_structs + i);
     }
     let node_of = |ty: &IrType| -> Option<usize> {
-        if let IrType::Named(name) = ty {
-            match enum_type_name(name) {
+        match ty {
+            IrType::Named(name) => match enum_type_name(name) {
                 Some(ename) => enum_index.get(ename).copied(),
                 None => struct_index.get(name.as_str()).copied(),
-            }
-        } else {
-            None
+            },
+            IrType::Nullable(inner) => nullables
+                .iter()
+                .position(|item| item == inner.as_ref())
+                .map(|index| n_named + index),
+            _ => None,
         }
     };
 
@@ -1781,6 +2014,12 @@ fn emit_layouts(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
             }
         }
     }
+    for (index, inner) in nullables.iter().enumerate() {
+        if let Some(dep) = node_of(inner) {
+            indegree[n_named + index] += 1;
+            dependents[dep].push(n_named + index);
+        }
+    }
 
     // Kahn's algorithm, always taking the lowest ready node id for stable output
     // (independent structs keep declaration order, and precede independent enums).
@@ -1794,8 +2033,13 @@ fn emit_layouts(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
         done[node] = true;
         if node < n_structs {
             emit_struct_layout(out, &structs[node])?;
-        } else {
+        } else if node < n_named {
             emit_enum_layout(out, &enums[node - n_structs])?;
+        } else {
+            let inner = &nullables[node - n_named];
+            array_optional::emit_typedef(out, inner)?;
+            array_optional::emit_prototypes(out, inner)?;
+            nullable_emitted.insert(c_type_suffix(inner)?);
         }
         for dependent in dependents[node].clone() {
             indegree[dependent] -= 1;
@@ -1918,6 +2162,15 @@ fn collect_all_array_elements(program: &IrProgram, element_types: &mut Vec<IrTyp
     {
         element_types.push(IrType::Str);
     }
+    dedup_c_types(element_types);
+}
+
+fn dedup_c_types(types: &mut Vec<IrType>) {
+    let mut emitted = HashSet::new();
+    types.retain(|ty| match c_type_suffix(ty) {
+        Ok(name) => emitted.insert(name),
+        Err(_) => true,
+    });
 }
 
 /// Forward-declare every user-struct tag so a `KuArray_KuStruct_X` typedef can hold
@@ -1938,7 +2191,7 @@ fn emit_struct_forward_decls(out: &mut COutput, program: &IrProgram) {
 }
 
 fn is_runtime_object_name(name: &str) -> bool {
-    matches!(name, "__ku_value" | "__ku_object")
+    name == "__ku_value" || c_object_type_name(name)
 }
 
 /// An array element whose ABI is available before user aggregate layouts:
@@ -1949,6 +2202,9 @@ fn is_early_array_element(element: &IrType, program: &IrProgram) -> bool {
     match element {
         IrType::Int | IrType::Float | IrType::Bool | IrType::Str => true,
         IrType::Array(inner) => is_early_array_element(inner, program),
+        // Nullable tags are declared before array headers; array elements are
+        // behind a pointer and need not be complete until ownership bodies.
+        IrType::Nullable(_) | IrType::Null => true,
         IrType::Named(name) => {
             is_runtime_object_name(name)
                 || (enum_type_name(name).is_none()
@@ -2180,7 +2436,9 @@ fn collect_array_element_type(ty: &IrType, output: &mut Vec<IrType>) {
                 output.push(*inner.clone());
             }
         }
-        IrType::Result(inner) => collect_array_element_type(inner, output),
+        IrType::Result(inner) | IrType::Nullable(inner) => {
+            collect_array_element_type(inner, output)
+        }
         _ => {}
     }
 }
@@ -2526,7 +2784,14 @@ fn emit_block(
         emit_for_each_cleanup(out, state)?;
     }
     for inst in &block.instructions {
-        emit_inst(out, inst, return_type, owned_locals, initial_temps)?;
+        emit_inst(
+            out,
+            inst,
+            return_type,
+            owned_locals,
+            for_each_states,
+            initial_temps,
+        )?;
     }
     if block.terminator == IrTerminator::Unreachable
         && matches!(
@@ -2544,9 +2809,69 @@ fn emit_inst(
     inst: &IrInst,
     return_type: &IrType,
     owned_locals: &[OwnedLocal],
+    for_each_states: &[ForEachState],
     initial_temps: &HashSet<usize>,
 ) -> KuResult<()> {
     out.check()?;
+    if let IrInst::Expr(IrExpr {
+        kind:
+            IrExprKind::Call {
+                kind: IrCallKind::Intrinsic(name),
+                args,
+                ..
+            },
+        ty,
+    }) = inst
+    {
+        if name == "__ku_retire_foreach" {
+            if *ty != IrType::Void {
+                return Err(unsupported("foreach retirement must have a void result"));
+            }
+            for arg in args.iter().rev() {
+                let IrExprKind::Literal(raw) = &arg.kind else {
+                    return Err(unsupported("foreach retirement requires literal block IDs"));
+                };
+                let id = raw
+                    .parse::<usize>()
+                    .map_err(|_| unsupported("invalid foreach retirement block ID"))?;
+                let state = for_each_states
+                    .iter()
+                    .find(|state| state.block_id.0 == id)
+                    .ok_or_else(|| unsupported("foreach retirement refers to an unknown loop"))?;
+                emit_for_each_cleanup(out, state)?;
+            }
+            return Ok(());
+        }
+        if name == "__ku_loop_scope_cleanup" {
+            if *ty != IrType::Void {
+                return Err(unsupported("loop scope cleanup must have a void result"));
+            }
+            let mut names = HashSet::new();
+            for arg in args {
+                let IrExprKind::Literal(raw) = &arg.kind else {
+                    return Err(unsupported(
+                        "loop scope cleanup requires internal literal names",
+                    ));
+                };
+                let key = raw
+                    .strip_prefix('"')
+                    .and_then(|raw| raw.strip_suffix('"'))
+                    .filter(|name| !name.contains(['"', '\\']))
+                    .ok_or_else(|| unsupported("invalid loop scope cleanup name"))?;
+                names.insert(key);
+            }
+            for local in owned_locals.iter().rev() {
+                if local.borrowed || !names.contains(local.source_name.as_str()) {
+                    continue;
+                }
+                emit_drop_expr(out, &local.ty, &local.name)?;
+                if matches!(local.ty, IrType::Cell(_)) {
+                    out.push_str(&format!("  {} = NULL;\n", local.name));
+                }
+            }
+            return Ok(());
+        }
+    }
     match inst {
         IrInst::Temp { id, ty, value } => {
             if sync::emit_math_temp(out, *id, value)? {
@@ -2860,6 +3185,24 @@ fn emit_statement_intrinsic(out: &mut COutput, value: &IrExpr) -> KuResult<bool>
 fn emit_print(out: &mut COutput, value: &IrExpr) -> KuResult<()> {
     out.check()?;
     match value.ty {
+        IrType::Null => out.push_str("  ku_output_write(\"null\", 4);\n  ku_output_flush();\n"),
+        IrType::Nullable(ref inner) => {
+            out.push_str(&format!("  {{ {} __ku_optional_print = {}; if (__ku_optional_print.is_null) {{ ku_output_write(\"null\", 4); }} else {{\n", c_type(&value.ty)?, c_expr(value)?));
+            emit_print(
+                out,
+                &IrExpr {
+                    ty: (**inner).clone(),
+                    kind: IrExprKind::Field {
+                        target: Box::new(IrExpr {
+                            ty: value.ty.clone(),
+                            kind: IrExprKind::Local("__ku_optional_print".into()),
+                        }),
+                        name: "value".into(),
+                    },
+                },
+            )?;
+            out.push_str("  } }\n  ku_output_flush();\n");
+        }
         IrType::Int => {
             out.push_str(&format!(
                 "  ku_output_printf(\"%lld\", (long long){});\n  ku_output_flush();\n",
@@ -2894,9 +3237,10 @@ fn emit_print(out: &mut COutput, value: &IrExpr) -> KuResult<()> {
                 c_expr(value)?
             ));
         }
-        IrType::Named(ref name) if name == "__ku_time" => {
+        IrType::Named(ref name) if c_time_scalar_name(name) => {
             out.push_str(&format!(
-                "  ku_time_print({});\n  ku_output_flush();\n",
+                "  {}_print({});\n  ku_output_flush();\n",
+                c_time_prefix(name),
                 c_expr(value)?
             ));
         }
@@ -3162,12 +3506,15 @@ fn c_expr(expr: &IrExpr) -> KuResult<String> {
                 Ok(value.clone())
             }
         }
-        IrExprKind::Local(name) => Ok(c_symbol(name)),
-        IrExprKind::BorrowedParam(name) => Ok(if is_c_owned_type(&expr.ty) {
-            format!("(*{})", c_symbol(name))
-        } else {
-            c_symbol(name)
-        }),
+        IrExprKind::Local(name) => Ok(c_ident(name)),
+        IrExprKind::BorrowedParam(name) => {
+            let ident = c_ident(name);
+            Ok(if is_c_owned_type(&expr.ty) {
+                format!("(*{ident})")
+            } else {
+                ident
+            })
+        }
         IrExprKind::Borrow(value) => c_expr(value),
         IrExprKind::Temp(id) | IrExprKind::BorrowedTemp(id) => Ok(format!("t{}", id.0)),
         IrExprKind::StructLiteral { name, fields } => {
@@ -3196,12 +3543,23 @@ fn c_expr(expr: &IrExpr) -> KuResult<String> {
             ))
         }
         IrExprKind::Binary { left, op, right }
-            if matches!(&left.ty, IrType::Named(name) if name == "__ku_time")
-                && matches!(&right.ty, IrType::Named(name) if name == "__ku_time")
+            if matches!(&left.ty, IrType::Named(name) if c_time_scalar_name(name))
+                && matches!(&right.ty, IrType::Named(name) if c_time_scalar_name(name))
                 && matches!(op, BinaryOp::Equal | BinaryOp::NotEqual) =>
         {
             Ok(format!(
-                "(ku_time_equal({}, {}) {} true)",
+                "({}({}, {}) {} true)",
+                if left.ty != right.ty {
+                    "__ku_duration_mixed_equal".to_string()
+                } else {
+                    format!(
+                        "{}_equal",
+                        c_time_prefix(match &left.ty {
+                            IrType::Named(name) => name,
+                            _ => unreachable!(),
+                        })
+                    )
+                },
                 c_expr(left)?,
                 c_expr(right)?,
                 if *op == BinaryOp::Equal { "==" } else { "!=" }
@@ -3273,15 +3631,20 @@ fn c_expr(expr: &IrExpr) -> KuResult<String> {
                 "native C prototype does not support enum equality yet",
             ))
         }
-        IrExprKind::Binary { left, op, right } => Ok(format!(
-            "({} {} {})",
-            c_expr(left)?,
-            c_binary(*op),
-            c_expr(right)?
-        )),
+        IrExprKind::Binary { left, op, right } => {
+            if let Some(expression) = array_optional::equality_expr(left, *op, right)? {
+                return Ok(expression);
+            }
+            Ok(format!(
+                "({} {} {})",
+                c_expr(left)?,
+                c_binary(*op),
+                c_expr(right)?
+            ))
+        }
         IrExprKind::Call { callee, args, kind } => {
             if let IrCallKind::Intrinsic(name) = kind {
-                if name == "__ku_clone" {
+                if matches!(name.as_str(), "__ku_clone" | "__ku_clone_nullable") {
                     let value = args
                         .first()
                         .ok_or_else(|| unsupported("clone intrinsic requires one argument"))?;
@@ -3305,7 +3668,12 @@ fn c_expr(expr: &IrExpr) -> KuResult<String> {
                     "native C prototype only supports direct function calls",
                 ));
             }
-            let callee = c_expr(callee)?;
+            // Direct lowering carries the resolved function name in a Local
+            // placeholder. Only a function symbol needs the entry-point rename.
+            let IrExprKind::Local(name) = &callee.kind else {
+                return Err(unsupported("native C direct call requires a function name"));
+            };
+            let callee = c_symbol(name);
             let args = args
                 .iter()
                 .map(c_arg_value_expr)
@@ -3313,10 +3681,22 @@ fn c_expr(expr: &IrExpr) -> KuResult<String> {
                 .join(", ");
             Ok(format!("{callee}({args})"))
         }
-        IrExprKind::Field { target, name } if matches!(&target.ty, IrType::Named(type_name) if type_name == "__ku_time") => {
+        IrExprKind::Field { target, name } if matches!(&target.ty, IrType::Named(type_name) if c_time_scalar_name(type_name)) =>
+        {
+            let IrType::Named(type_name) = &target.ty else {
+                unreachable!()
+            };
             match name.as_str() {
-                "kind" => Ok(format!("ku_time_kind({})", c_expr(target)?)),
-                "millis" => Ok(format!("ku_time_value_millis({})", c_expr(target)?)),
+                "kind" => Ok(format!(
+                    "{}_kind({})",
+                    c_time_prefix(type_name),
+                    c_expr(target)?
+                )),
+                "millis" => Ok(format!(
+                    "{}_value_millis({})",
+                    c_time_prefix(type_name),
+                    c_expr(target)?
+                )),
                 _ => Err(unsupported(format!(
                     "native Time value has no field '{name}'"
                 ))),
@@ -3391,7 +3771,7 @@ fn c_expr(expr: &IrExpr) -> KuResult<String> {
                 let cells = captures
                     .iter()
                     .map(|(name, _, source)| match source {
-                        IrCaptureSource::Local => c_symbol(name),
+                        IrCaptureSource::Local => c_ident(name),
                         IrCaptureSource::EnclosingEnvironment => {
                             format!("__e->{}", c_ident(name))
                         }
@@ -3429,16 +3809,16 @@ fn c_expr(expr: &IrExpr) -> KuResult<String> {
 /// left to clear.
 fn c_move_place(expr: &IrExpr) -> KuResult<Option<String>> {
     match &expr.kind {
-        IrExprKind::Local(name) => Ok(Some(c_symbol(name))),
+        IrExprKind::Local(name) => Ok(Some(c_ident(name))),
         IrExprKind::Temp(id) => Ok(Some(format!("t{}", id.0))),
         IrExprKind::Field { target, name } => {
             let IrType::Named(type_name) = &target.ty else {
                 return Ok(None);
             };
-            if type_name == "__ku_object"
+            if c_object_type_name(type_name)
                 || type_name == "__ku_value"
                 || type_name == "__ku_http_server"
-                || type_name == "__ku_time"
+                || c_time_scalar_name(type_name)
                 || enum_type_name(type_name).is_some()
             {
                 return Ok(None);
@@ -3449,13 +3829,46 @@ fn c_move_place(expr: &IrExpr) -> KuResult<Option<String>> {
         // is an lvalue: moving out of it clears the payload so the cell's release
         // drops a zeroed value instead of freeing the buffer a second time.
         IrExprKind::CellLoad(inner) => Ok(Some(format!("({})->value", c_expr(inner)?))),
+        IrExprKind::Call {
+            kind: IrCallKind::Intrinsic(name),
+            args,
+            ..
+        } if name == "__ku_nullable_get" => {
+            let [wrapper] = args.as_slice() else {
+                return Err(unsupported("nullable get requires one wrapper"));
+            };
+            Ok(c_move_place(wrapper)?.map(|place| format!("({place}).value")))
+        }
         _ => Ok(None),
     }
 }
 
 fn c_value_expr(expr: &IrExpr) -> KuResult<String> {
     if let IrExprKind::Call { kind, args, .. } = &expr.kind {
-        if matches!(kind, IrCallKind::Intrinsic(name) if name == "__ku_clone") {
+        if matches!(kind, IrCallKind::Intrinsic(name) if name.starts_with("__ku_enum_payload:")) {
+            return c_move_value(&expr.ty, &c_expr(expr)?);
+        }
+        if is_c_owned_type(&expr.ty)
+            && matches!(kind, IrCallKind::Intrinsic(name) if name == "__ku_nullable_get")
+        {
+            let [wrapper] = args.as_slice() else {
+                return Err(unsupported("nullable projection requires one wrapper"));
+            };
+            let IrType::Nullable(inner) = &wrapper.ty else {
+                return Err(unsupported("nullable projection requires a nullable value"));
+            };
+            if let Some(place) = c_move_place(wrapper)? {
+                return Ok(format!(
+                    "__ku_nullable_take_{}(&{place})",
+                    c_type_suffix(inner)?
+                ));
+            }
+            return Err(unsupported(
+                "owned nullable projection requires an owned place",
+            ));
+        }
+        if matches!(kind, IrCallKind::Intrinsic(name) if matches!(name.as_str(), "__ku_clone" | "__ku_clone_nullable"))
+        {
             let value = args
                 .first()
                 .ok_or_else(|| unsupported("clone intrinsic requires one argument"))?;
@@ -3466,7 +3879,7 @@ fn c_value_expr(expr: &IrExpr) -> KuResult<String> {
     // value; ordinary assignment/passing copies either one. Keep this after the
     // explicit clone intrinsic so `time.instant().clone()` is lowered as a copy
     // instead of falling through to the generic intrinsic dispatcher.
-    if matches!(&expr.ty, IrType::Named(name) if name == "__ku_http_server" || name == "__ku_time")
+    if matches!(&expr.ty, IrType::Named(name) if name == "__ku_http_server" || c_time_scalar_name(name))
     {
         return c_expr(expr);
     }
@@ -3490,6 +3903,17 @@ fn c_value_expr(expr: &IrExpr) -> KuResult<String> {
                 "ku_result_move_{}(&{})",
                 c_type_suffix(inner)?,
                 place
+            ));
+        }
+    }
+    if let IrType::Nullable(inner) = &expr.ty {
+        if !is_c_owned_type(inner) {
+            return c_expr(expr);
+        }
+        if let Some(place) = c_move_place(expr)? {
+            return Ok(format!(
+                "__ku_nullable_move_{}(&{place})",
+                c_type_suffix(inner)?
             ));
         }
     }
@@ -3517,7 +3941,7 @@ fn c_value_expr(expr: &IrExpr) -> KuResult<String> {
             }
         }
         if let Some(place) = c_move_place(expr)? {
-            return Ok(if name == "__ku_object" {
+            return Ok(if c_object_type_name(name) {
                 format!("ku_object_move(&{place})")
             } else if name == "__ku_value" {
                 format!("ku_value_move(&{place})")
@@ -3541,6 +3965,11 @@ fn c_borrow_is_addressable(expr: &IrExpr) -> bool {
         | IrExprKind::BorrowedParam(_)
         | IrExprKind::CellLoad(_) => true,
         IrExprKind::Field { target, .. } => c_borrow_is_addressable(target),
+        IrExprKind::Call {
+            kind: IrCallKind::Intrinsic(name),
+            args,
+            ..
+        } if name == "__ku_nullable_get" => args.first().is_some_and(c_borrow_is_addressable),
         _ => false,
     }
 }
@@ -3551,7 +3980,7 @@ fn c_arg_value_expr(expr: &IrExpr) -> KuResult<String> {
             return c_expr(value);
         }
         return match &value.kind {
-            IrExprKind::BorrowedParam(name) => Ok(c_symbol(name)),
+            IrExprKind::BorrowedParam(name) => Ok(c_ident(name)),
             _ if c_borrow_is_addressable(value) => Ok(format!("&({})", c_expr(value)?)),
             // A lookup returns a shallow header. Its C11 compound-literal slot
             // remains valid throughout this synchronous call, without ownership.
@@ -3578,16 +4007,21 @@ fn c_clone_expr(expr: &IrExpr) -> KuResult<String> {
             c_type_suffix(inner)?,
             c_expr(expr)?
         )),
+        IrType::Nullable(inner) => Ok(format!(
+            "__ku_nullable_clone_{}({})",
+            c_type_suffix(inner)?,
+            c_expr(expr)?
+        )),
         IrType::Named(name) if name == "__ku_error_type" => {
             Ok(format!("ku_error_clone({})", c_expr(expr)?))
         }
-        IrType::Named(name) if name == "__ku_object" => {
+        IrType::Named(name) if c_object_type_name(name) => {
             Ok(format!("ku_object_clone({})", c_expr(expr)?))
         }
         IrType::Named(name) if name == "__ku_value" => {
             Ok(format!("ku_value_clone({})", c_expr(expr)?))
         }
-        IrType::Named(name) if name == "__ku_time" => c_expr(expr),
+        IrType::Named(name) if c_time_scalar_name(name) => c_expr(expr),
         IrType::Closure { .. } => Ok(format!(
             "ku_closure_clone_{}({})",
             c_type_suffix(&expr.ty)?,
@@ -3607,8 +4041,13 @@ fn c_clone_expr(expr: &IrExpr) -> KuResult<String> {
 
 fn c_addressable_expr(expr: &IrExpr) -> KuResult<String> {
     match &expr.kind {
-        IrExprKind::Local(name) => Ok(c_symbol(name)),
+        IrExprKind::Local(name) => Ok(c_ident(name)),
         IrExprKind::Temp(id) => Ok(format!("t{}", id.0)),
+        IrExprKind::Call {
+            kind: IrCallKind::Intrinsic(name),
+            ..
+        } if name == "__ku_nullable_get" => c_move_place(expr)?
+            .ok_or_else(|| unsupported("nullable result projection requires an owned place")),
         _ => Err(unsupported(
             "native C Result unwrapping requires a materialized local result",
         )),
@@ -3619,7 +4058,7 @@ fn c_error_expr(value: &IrExpr, default_code: &str) -> KuResult<String> {
     if value.ty == IrType::Named("__ku_error_type".to_string()) {
         // Move an existing Error value (its KuStrings are owned).
         match &value.kind {
-            IrExprKind::Local(name) => Ok(format!("ku_error_move(&{})", c_symbol(name))),
+            IrExprKind::Local(name) => Ok(format!("ku_error_move(&{})", c_ident(name))),
             IrExprKind::Temp(id) => Ok(format!("ku_error_move(&t{})", id.0)),
             // A freshly-built error (e.g. `__ku_error_make(...)`) — already an rvalue.
             _ => c_expr(value),
@@ -3645,7 +4084,7 @@ fn c_error_expr(value: &IrExpr, default_code: &str) -> KuResult<String> {
 fn dynamic_object_store_target(target: &IrLValue) -> bool {
     match target {
         IrLValue::Field { target, .. } | IrLValue::Index { target, .. } => {
-            matches!(&target.ty, IrType::Named(name) if name == "__ku_object")
+            matches!(&target.ty, IrType::Named(name) if c_object_type_name(name))
         }
         IrLValue::Local(_) => false,
     }
@@ -3687,7 +4126,7 @@ fn c_lvalue(target: &IrLValue) -> KuResult<String> {
     match target {
         IrLValue::Local(name) => Ok(c_ident(name)),
         IrLValue::Field { target, name } => {
-            if matches!(&target.ty, IrType::Named(type_name) if type_name == "__ku_time") {
+            if matches!(&target.ty, IrType::Named(type_name) if c_time_scalar_name(type_name)) {
                 return match name.as_str() {
                     // `millis` is the one public Time field backed by physical
                     // storage in KuTime. `kind` is a virtual discriminator
@@ -3739,11 +4178,11 @@ fn c_lvalue(target: &IrLValue) -> KuResult<String> {
 /// and nested indexed assignments update their owning container.
 fn c_place_expr(expr: &IrExpr) -> KuResult<String> {
     match &expr.kind {
-        IrExprKind::Local(name) => Ok(c_symbol(name)),
+        IrExprKind::Local(name) => Ok(c_ident(name)),
         IrExprKind::Temp(id) => Ok(format!("t{}", id.0)),
         IrExprKind::CellLoad(cell) => Ok(format!("({})->value", c_expr(cell)?)),
         IrExprKind::Field { target, name } => {
-            if matches!(&target.ty, IrType::Named(type_name) if type_name == "__ku_time") {
+            if matches!(&target.ty, IrType::Named(type_name) if c_time_scalar_name(type_name)) {
                 return match name.as_str() {
                     "millis" => Ok(format!("({}).millis", c_place_expr(target)?)),
                     "kind" => Err(unsupported("native Time.kind is read-only")),
@@ -3791,10 +4230,11 @@ fn c_type(ty: &IrType) -> KuResult<String> {
         IrType::Null => Ok("uint8_t".to_string()),
         IrType::Array(inner) => c_array_type(inner),
         IrType::Result(inner) => c_result_type(inner),
+        IrType::Nullable(inner) => array_optional::nullable_type(inner),
         IrType::Named(name) if name == "__ku_error_type" => Ok("KuError".to_string()),
-        IrType::Named(name) if name == "__ku_object" => Ok("KuObject*".to_string()),
+        IrType::Named(name) if c_object_type_name(name) => Ok("KuObject*".to_string()),
         IrType::Named(name) if name == "__ku_value" => Ok("KuValue".to_string()),
-        IrType::Named(name) if name == "__ku_time" => Ok("KuTime".to_string()),
+        IrType::Named(name) if c_time_scalar_name(name) => Ok("KuTime".to_string()),
         // Stage 8a: the native HTTP server is a heap pointer shared between route
         // registration and the accept loop (never copied by value).
         IrType::Named(name) if name == "__ku_http_server" => Ok("KuHttpServer*".to_string()),
@@ -3833,12 +4273,17 @@ fn emit_result_forward_decls(
     extra_types: &[IrType],
 ) -> KuResult<()> {
     out.check()?;
-    emit_result_abi_phase(out, program, true, extra_types)
+    emit_result_abi_phase(out, program, true, extra_types, None)
 }
 
-fn emit_result_abi(out: &mut COutput, program: &IrProgram, extra_types: &[IrType]) -> KuResult<()> {
+fn emit_result_abi(
+    out: &mut COutput,
+    program: &IrProgram,
+    extra_types: &[IrType],
+    nullable_emitted: &mut HashSet<String>,
+) -> KuResult<()> {
     out.check()?;
-    emit_result_abi_phase(out, program, false, extra_types)
+    emit_result_abi_phase(out, program, false, extra_types, Some(nullable_emitted))
 }
 
 /// Collect Result types once per phase through the same path so the early tag
@@ -3848,9 +4293,19 @@ fn emit_result_abi_phase(
     program: &IrProgram,
     forward_decls_only: bool,
     extra_types: &[IrType],
+    nullable_emitted: Option<&mut HashSet<String>>,
 ) -> KuResult<()> {
     out.check()?;
     let mut result_types = extra_types.to_vec();
+    // Even an unused struct can declare a closure returning Result by value.
+    // Declare that Result before defining the closure's function pointer.
+    for layout in &program.layouts.structs {
+        for field in &layout.fields {
+            if let IrType::Closure { ret, .. } = &field.ty {
+                collect_result_type(ret, &mut result_types)?;
+            }
+        }
+    }
     for function in &program.functions {
         collect_result_type(&function.return_type, &mut result_types)?;
         for param in &function.params {
@@ -3928,6 +4383,18 @@ fn emit_result_abi_phase(
             }
         }
     }
+    if calendar::uses_runtime(program) {
+        for forced in [
+            IrType::Named("__ku_object".into()),
+            IrType::Named("__ku_time".into()),
+            IrType::Str,
+            IrType::Int,
+        ] {
+            if !result_types.contains(&forced) {
+                result_types.push(forced);
+            }
+        }
+    }
     // The pg/redis runtimes emit their whole API unconditionally, so the Result types
     // their functions return must exist even if the program calls only some of them.
     let mut forced: Vec<IrType> = Vec::new();
@@ -3988,6 +4455,10 @@ fn emit_result_abi_phase(
     if program_uses_http(program) {
         for inner in [
             IrType::Named("__ku_http_response".to_string()),
+            // The HTTP-owned adapter calls Result<Object> handlers through
+            // their real ABI before converting only the successful payload.
+            IrType::Named("__ku_object".to_string()),
+            IrType::Named("__ku_value".to_string()),
             IrType::Null,
         ] {
             if !result_types.contains(&inner) {
@@ -3995,32 +4466,67 @@ fn emit_result_abi_phase(
             }
         }
     }
-    for inner in &result_types {
-        let result_type = c_result_type(inner)?;
-        if forward_decls_only {
+    dedup_c_types(&mut result_types);
+    if forward_decls_only {
+        for inner in &result_types {
+            let result_type = c_result_type(inner)?;
             out.push_str(&format!("typedef struct {result_type} {result_type};\n"));
-            continue;
         }
-        let suffix = c_type_suffix(inner)?;
-        let value_type = c_type(inner)?;
-        out.push_str(&format!(
-            "struct {result_type} {{ bool ok; {value_type} value; KuError error; }};\n"
-        ));
-        out.push_str(&format!(
+        return out.check();
+    }
+    let nullable_emitted = nullable_emitted.expect("complete Result ABI has nullable state");
+    let nullables = array_optional::nullable_elements(program);
+    let mut result_emitted = Vec::<IrType>::new();
+    while result_emitted.len() < result_types.len() || nullable_emitted.len() < nullables.len() {
+        fn ready(ty: &IrType, nullables: &HashSet<String>, results: &[IrType]) -> KuResult<bool> {
+            Ok(match ty {
+                IrType::Nullable(inner) => nullables.contains(&c_type_suffix(inner)?),
+                IrType::Result(inner) => results.iter().any(|result| matches!((c_type_suffix(result), c_type_suffix(inner)), (Ok(left),Ok(right)) if left == right)),
+                _ => true,
+            })
+        }
+        let before = result_emitted.len() + nullable_emitted.len();
+        for inner in &nullables {
+            let key = c_type_suffix(inner)?;
+            if !nullable_emitted.contains(&key) && ready(inner, nullable_emitted, &result_emitted)?
+            {
+                array_optional::emit_typedef(out, inner)?;
+                array_optional::emit_prototypes(out, inner)?;
+                nullable_emitted.insert(key);
+            }
+        }
+        for inner in &result_types {
+            if result_emitted.contains(inner) || !ready(inner, nullable_emitted, &result_emitted)? {
+                continue;
+            }
+            let result_type = c_result_type(inner)?;
+            let suffix = c_type_suffix(inner)?;
+            let value_type = c_type(inner)?;
+            out.push_str(&format!(
+                "struct {result_type} {{ bool ok; {value_type} value; KuError error; }};\n"
+            ));
+            out.push_str(&format!(
             "static {result_type} ku_result_move_{suffix}({result_type}* result) {{ {result_type} value = *result; *result = ({result_type}){{0}}; return value; }}\n"
         ));
-        out.push_str(&format!(
+            out.push_str(&format!(
             "static {value_type} ku_result_take_{suffix}({result_type}* result) {{ {value_type} value = result->value; result->value = {}; result->ok = false; return value; }}\n",
             c_zero_value(inner)?
         ));
-        out.push_str(&format!(
+            out.push_str(&format!(
             "static {result_type} ku_result_clone_{suffix}({result_type} result) {{ if (result.ok) result.value = {}; else result.error = ku_error_clone(result.error); return result; }}\n",
             c_clone_value(inner, "result.value")?
         ));
-        out.push_str(&format!(
+            out.push_str(&format!(
             "static void ku_result_drop_{suffix}({result_type}* result) {{ if (!result) return; if (result->ok) {{ {} }} else {{ ku_error_drop(&result->error); }} *result = ({result_type}){{0}}; }}\n",
             c_drop_value(inner, "result->value")?
         ));
+            result_emitted.push(inner.clone());
+        }
+        if before == result_emitted.len() + nullable_emitted.len() {
+            return Err(unsupported(
+                "native C nullable/Result value layouts are recursive",
+            ));
+        }
     }
     if !result_types.is_empty() {
         out.push('\n');
@@ -4679,6 +5185,66 @@ static bool ku_value_equal(KuValue left, KuValue right) {
 
 "#
     );
+    if program_uses_intrinsic(program, "__ku_object_take_required")
+        || program_uses_intrinsic(program, "__ku_object_pattern_convert")
+    {
+        out.push_str(
+            r#"/* The caller owns the source object and provides an empty output slot. A
+ * present null moves successfully; a missing key leaves the output untouched. */
+static bool __ku_object_take(KuObject* object, KuString key, KuValue* out) {
+  if (!object) return false;
+  ku_object_require_valid(object);
+  size_t capacity = object->cap;
+  size_t mask = capacity - 1;
+  KuEntry* entries = object->entries;
+  size_t hole = (size_t)ku_obj_hash(key) & mask;
+  for (size_t probes = 0; probes < capacity; probes++) {
+    if (!entries[hole].used) return false;
+    if (ku_string_equal(entries[hole].key, key)) {
+      *out = ku_value_move(&entries[hole].value);
+      ku_string_drop(&entries[hole].key);
+      size_t next = (hole + 1) & mask;
+      for (size_t scanned = 1; scanned < capacity; scanned++) {
+        if (!entries[next].used) {
+          entries[hole] = (KuEntry){0};
+          object->len--;
+          return true;
+        }
+        size_t home = (size_t)ku_obj_hash(entries[next].key) & mask;
+        // Move an entry back only when its search would cross the hole.
+        if (((hole - home) & mask) < ((next - home) & mask)) {
+          entries[hole] = entries[next];
+          hole = next;
+        }
+        next = (next + 1) & mask;
+      }
+      ku_object_internal_fail("object hash table retirement exhausted");
+      return false;
+    }
+    hole = (hole + 1) & mask;
+  }
+  ku_object_internal_fail("object hash table probe exhausted");
+  return false;
+}
+
+static KuValue __ku_object_take_required(KuObject* object, KuString key) {
+  KuValue value = ku_v_null();
+  if (__ku_object_take(object, key, &value)) return value;
+  __ku_sync_raise_http_json((const uint8_t*)"object has no key", sizeof("object has no key") - 1u);
+  return value;
+}
+
+static KuValue __ku_object_pattern_checked(KuValue value, uint8_t tag) {
+  if (value.tag == tag) return value;
+  ku_value_drop(&value);
+  static const uint8_t message[] = "object field does not match its checked type";
+  __ku_sync_raise_http_json(message, sizeof(message) - 1u);
+  return (KuValue){.tag=tag};
+}
+
+"#,
+        );
+    }
     Ok(())
 }
 
@@ -4708,7 +5274,9 @@ fn emit_kuvalue_array_wrappers(out: &mut COutput, program: &IrProgram) -> KuResu
         // The drop can therefore release the old backing buffer without freeing
         // strings/objects/nested arrays that now belong to KuValueArray.
         let moved = c_move_value(element, "array.data[index]")?;
-        let wrap_element = if let IrType::Array(inner) = element {
+        let wrap_element = if let IrType::Nullable(inner) = element {
+            format!("    KuValue element_value = ku_v_null();\n    if (!__ku_try_v_nullable_{}({}, &element_value)) {{ ku_value_array_drop(boxed); ku_array_drop_{suffix}(&array); return false; }}\n",c_type_suffix(inner)?,moved)
+        } else if let IrType::Array(inner) = element {
             format!(
                 "    KuValue element_value = ku_v_null();\n\
                      if (!ku_try_v_typed_array_{}({}, &element_value)) {{\n\
@@ -4899,6 +5467,10 @@ fn collect_kuvalue_array_elements_expr(expr: &IrExpr, output: &mut Vec<IrType>) 
 }
 
 fn collect_kuvalue_array_element_type(ty: &IrType, output: &mut Vec<IrType>) {
+    if let IrType::Nullable(inner) = ty {
+        collect_kuvalue_array_element_type(inner, output);
+        return;
+    }
     let IrType::Array(element) = ty else {
         return;
     };
@@ -4911,8 +5483,8 @@ fn collect_kuvalue_array_element_type(ty: &IrType, output: &mut Vec<IrType>) {
 fn kuvalue_array_element_supported(ty: &IrType) -> bool {
     match ty {
         IrType::Int | IrType::Float | IrType::Bool | IrType::Str | IrType::Null => true,
-        IrType::Named(name) => name == "__ku_object" || name == "__ku_value",
-        IrType::Array(inner) => kuvalue_array_element_supported(inner),
+        IrType::Named(name) => c_object_type_name(name) || name == "__ku_value",
+        IrType::Array(inner) | IrType::Nullable(inner) => kuvalue_array_element_supported(inner),
         _ => false,
     }
 }
@@ -4924,6 +5496,57 @@ fn emit_object_result_helpers(out: &mut COutput, program: &IrProgram, force: boo
     out.check()?;
     if !force && !program_uses_object(program) {
         return Ok(());
+    }
+    if program_uses_intrinsic(program, "__ku_object_required_field") {
+        out.push_str(
+            r#"static KuValue __ku_object_required_field(KuObject* object, KuString key) {
+  const KuValue* found = ku_object_get(object, key);
+  KuValue owned = ku_v_null();
+  if (!found) {
+    static const uint8_t message[] = "object has no key";
+    __ku_sync_raise_http_json(message, sizeof(message) - 1u);
+  } else if (!ku_value_try_clone(*found, &owned)) {
+    static const uint8_t message[] = "object allocation failed";
+    __ku_sync_raise_http_json(message, sizeof(message) - 1u);
+  }
+  return owned;
+}
+
+"#,
+        );
+    }
+    if [
+        "__ku_object_optional_field",
+        "__ku_object_optional_field_view",
+        "__ku_value_optional_field",
+        "__ku_value_optional_field_view",
+    ]
+    .into_iter()
+    .any(|name| program_uses_intrinsic(program, name))
+    {
+        out.push_str(
+            r#"static KuValue __ku_object_optional_field(KuObject* object, KuString key, bool borrow) {
+  KuValue* found = ku_object_get(object, key);
+  if (!found) return ku_v_null();
+  if (borrow) return *found;
+  KuValue owned = ku_v_null();
+  if (!ku_value_try_clone(*found, &owned)) {
+    const uint8_t* message = (const uint8_t*)"object allocation failed";
+    __ku_sync_raise_http_json(message, sizeof("object allocation failed") - 1);
+  }
+  return owned;
+}
+
+static KuValue __ku_value_optional_field(KuValue value, KuString key, bool borrow) {
+  if (value.tag == KU_NULL) return ku_v_null();
+  if (value.tag == KU_OBJECT) return __ku_object_optional_field(value.as.o, key, borrow);
+  const uint8_t* message = (const uint8_t*)"type error: optional field receiver has no fields";
+  __ku_sync_raise_http_json(message, sizeof("type error: optional field receiver has no fields") - 1);
+  return ku_v_null();
+}
+
+"#,
+        );
     }
     out.push_str(
         r#"static KuResult_kuvalue ku_object_out_of_memory_result(void) {
@@ -5098,6 +5721,12 @@ fn json_struct_layout<'a>(program: &'a IrProgram, name: &str) -> Option<&'a IrSt
 /// the Rust emitter. C prototypes are emitted for the whole set before bodies.
 fn collect_json_writer_types(ty: &IrType, program: &IrProgram, output: &mut Vec<IrType>) {
     match ty {
+        IrType::Nullable(inner) => {
+            if !output.contains(ty) {
+                output.push(ty.clone());
+                collect_json_writer_types(inner, program, output);
+            }
+        }
         IrType::Array(element) => {
             if output.contains(ty) {
                 return;
@@ -5105,7 +5734,11 @@ fn collect_json_writer_types(ty: &IrType, program: &IrProgram, output: &mut Vec<
             output.push(ty.clone());
             collect_json_writer_types(element, program, output);
         }
-        IrType::Named(name) if name == "__ku_time" || name == "__ku_error_type" => {
+        IrType::Named(name)
+            if c_time_scalar_name(name)
+                || name == "__ku_error_type"
+                || name == "__ku_http_response" =>
+        {
             if !output.contains(ty) {
                 output.push(ty.clone());
             }
@@ -5128,8 +5761,8 @@ fn collect_json_writer_types(ty: &IrType, program: &IrProgram, output: &mut Vec<
 
 fn json_typed_root_required(ty: &IrType) -> bool {
     match ty {
-        IrType::Array(_) | IrType::Result(_) => true,
-        IrType::Named(name) => name != "__ku_object" && name != "__ku_value",
+        IrType::Array(_) | IrType::Result(_) | IrType::Nullable(_) => true,
+        IrType::Named(name) => !c_object_type_name(name) && name != "__ku_value",
         _ => false,
     }
 }
@@ -5172,20 +5805,26 @@ fn json_typed_write_call(
         IrType::Null => Ok(format!(
             "ku_json_write_value({output}, ku_v_null(), {depth}, {error})"
         )),
-        IrType::Array(_) => Ok(format!(
+        IrType::Array(_) | IrType::Nullable(_) => Ok(format!(
             "ku_json_write_typed_{}({output}, {expression}, {depth}, {error})",
             c_type_suffix(ty)?
         )),
-        IrType::Named(name) if name == "__ku_object" => Ok(format!(
+        IrType::Named(name) if c_object_type_name(name) => Ok(format!(
             "ku_json_write_value({output}, ku_v_object({expression}), {depth}, {error})"
         )),
         IrType::Named(name) if name == "__ku_value" => Ok(format!(
             "ku_json_write_value({output}, {expression}, {depth}, {error})"
         )),
-        IrType::Named(name) if name == "__ku_time" || name == "__ku_error_type" => Ok(format!(
-            "ku_json_write_typed_{}({output}, {expression}, {depth}, {error})",
-            c_type_suffix(ty)?
-        )),
+        IrType::Named(name)
+            if c_time_scalar_name(name)
+                || name == "__ku_error_type"
+                || name == "__ku_http_response" =>
+        {
+            Ok(format!(
+                "ku_json_write_typed_{}({output}, {expression}, {depth}, {error})",
+                c_type_suffix(ty)?
+            ))
+        }
         IrType::Named(name) if json_struct_layout(program, name).is_some() => Ok(format!(
             "ku_json_write_typed_{}({output}, {expression}, {depth}, {error})",
             c_type_suffix(ty)?
@@ -5250,6 +5889,11 @@ fn emit_json_typed_writer(out: &mut COutput, ty: &IrType, program: &IrProgram) -
     ));
 
     match ty {
+        IrType::Nullable(inner) => {
+            let call =
+                json_typed_write_call(inner, "value.value", "depth", "output", "error", program)?;
+            out.push_str(&format!("  if (value.is_null) return ku_json_write_value(output, ku_v_null(), depth, error);\n  return {call};\n}}\n"));
+        }
         IrType::Array(element) => {
             let element_call = json_typed_write_call(
                 element,
@@ -5268,9 +5912,9 @@ fn emit_json_typed_writer(out: &mut COutput, ty: &IrType, program: &IrProgram) -
             out.push_str(&format!("    if (!{element_call}) return false;\n"));
             out.push_str("  }\n  return ku_json_write_byte(output, ']', error);\n}\n");
         }
-        IrType::Named(name) if name == "__ku_time" => {
+        IrType::Named(name) if c_time_scalar_name(name) => {
             out.push_str(
-                "  ku_time_validate(value);\n\
+                &                "  ku_time_validate(value);\n\
                  \x20 if (!ku_json_write_byte(output, '{', error)\n\
                  \x20     || !ku_json_write_string(output, ku_string_static((const uint8_t*)\"kind\", 4), error)\n\
                  \x20     || !ku_json_write_byte(output, ':', error)\n\
@@ -5279,8 +5923,15 @@ fn emit_json_typed_writer(out: &mut COutput, ty: &IrType, program: &IrProgram) -
                  \x20     || !ku_json_write_string(output, ku_string_static((const uint8_t*)\"millis\", 6), error)\n\
                  \x20     || !ku_json_write_byte(output, ':', error)\n\
                  \x20     || !ku_json_write_value(output, ku_v_int(value.millis), depth + 1, error)) return false;\n\
-                 \x20 return ku_json_write_byte(output, '}', error);\n}\n",
+                 \x20 return ku_json_write_byte(output, '}', error);\n}\n"
+                .replace("ku_time_validate", &format!("{}_validate", c_time_prefix(name)))
+                .replace("ku_time_kind", &format!("{}_kind", c_time_prefix(name)))
             );
+        }
+        IrType::Named(name) if name == "__ku_http_response" => {
+            out.push_str("  if(!ku_json_write_byte(output,'{',error) || !ku_json_write_string(output,ku_string_static((const uint8_t*)\"body\",4),error) || !ku_json_write_byte(output,':',error) || !ku_json_write_value(output,ku_v_str(value.body),depth+1,error) || !ku_json_write_byte(output,',',error) || !ku_json_write_string(output,ku_string_static((const uint8_t*)\"headers\",7),error) || !ku_json_write_byte(output,':',error))return false;\n");
+            out.push_str("  if(value.headers) {if(!ku_json_write_value(output,ku_v_object(value.headers),depth+1,error))return false;} else {\n    if(!ku_json_write_byte(output,'{',error))return false; bool comma=false; KuString fields[2]={value.content_type,value.location}; const char* names[2]={\"content-type\",\"location\"};\n    for(size_t i=0;i<2;i++)if(fields[i].len){if(comma&&!ku_json_write_byte(output,',',error))return false;comma=true;if(!ku_json_write_string(output,ku_string_static((const uint8_t*)names[i],strlen(names[i])),error)||!ku_json_write_byte(output,':',error)||!ku_json_write_value(output,ku_v_str(fields[i]),depth+2,error))return false;}if(!ku_json_write_byte(output,'}',error))return false;\n  }\n");
+            out.push_str("  return ku_json_write_byte(output,',',error)&&ku_json_write_string(output,ku_string_static((const uint8_t*)\"status\",6),error)&&ku_json_write_byte(output,':',error)&&ku_json_write_value(output,ku_v_int(value.status),depth+1,error)&&ku_json_write_byte(output,'}',error);\n}\n");
         }
         IrType::Named(name) if name == "__ku_error_type" => {
             out.push_str(
@@ -6820,7 +7471,7 @@ fn try_emit_object_construction(out: &mut COutput, target: &str, value: &IrExpr)
     else {
         return Ok(false);
     };
-    if name != "__ku_object" {
+    if !c_object_type_name(name) {
         return Ok(false);
     }
     out.push_str(&format!(
@@ -6871,14 +7522,90 @@ fn try_emit_object_construction(out: &mut COutput, target: &str, value: &IrExpr)
 
 /// Wrap a native value into a tagged KuValue by its IR type (object fields are
 /// heterogeneous, so each is boxed into a KuValue).
+fn object_pattern_scalar_tag(ty: &IrType) -> Option<(&'static str, &'static str)> {
+    Some(match ty {
+        IrType::Int => ("KU_INT", "i"),
+        IrType::Float => ("KU_FLOAT", "f"),
+        IrType::Bool => ("KU_BOOL", "b"),
+        IrType::Str => ("KU_STR", "s"),
+        IrType::Null => ("KU_NULL", "i"),
+        IrType::Named(name) if c_object_type_name(name) => ("KU_OBJECT", "o"),
+        _ => return None,
+    })
+}
+
+fn emit_object_pattern_array_moves(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+    let mut emitted = HashSet::new();
+    for function in &program.functions {
+        for block in &function.blocks {
+            for instruction in &block.instructions {
+                let IrInst::Temp { value, .. } = instruction else {
+                    continue;
+                };
+                if !matches!(&value.kind, IrExprKind::Call { kind: IrCallKind::Intrinsic(name), .. }
+                    if name == "__ku_object_pattern_convert")
+                {
+                    continue;
+                }
+                let ty = match &value.ty {
+                    IrType::Nullable(inner) => inner.as_ref(),
+                    ty => ty,
+                };
+                let IrType::Array(element) = ty else { continue };
+                let suffix = c_type_suffix(element)?;
+                if !emitted.insert(suffix.clone()) {
+                    continue;
+                }
+                let (tag, member) = object_pattern_scalar_tag(element)
+                    .ok_or_else(|| unsupported("native object pattern array element type"))?;
+                let element_type = c_type(element)?;
+                let array = c_type(ty)?;
+                out.push_str(&format!(r#"
+static {array} __ku_object_pattern_array_{suffix}(KuValue value) {{
+  value = __ku_object_pattern_checked(value, KU_ARRAY);
+  KuValueArray* source = value.as.arr;
+  if (!source) return ({array}){{0}};
+  size_t count = source->len;
+  {element_type}* data = NULL;
+  for (size_t i = 0; i < count; ++i) {{
+    if (source->data[i].tag != {tag}) {{
+      ku_value_drop(&value);
+      static const uint8_t message[] = "object array item does not match its checked type";
+      __ku_sync_raise_http_json(message, sizeof(message) - 1u);
+      return ({array}){{0}};
+    }}
+  }}
+  if (count) {{
+    if (count <= SIZE_MAX / sizeof(*data))
+      data = ({element_type}*)ku_object_malloc(KU_OBJECT_ALLOC_VALUE_ARRAY_DATA, count * sizeof(*data));
+    if (!data) {{
+      ku_value_drop(&value);
+      static const uint8_t message[] = "out of memory moving object array field";
+      __ku_sync_raise_http_json(message, sizeof(message) - 1u);
+      return ({array}){{0}};
+    }}
+    for (size_t i = 0; i < count; ++i)
+      data[i] = ku_value_move(&source->data[i]).as.{member};
+  }}
+  ku_value_drop(&value);
+  return ({array}){{.data=data, .len=count, .capacity=count}};
+}}
+"#));
+            }
+        }
+    }
+    out.check()
+}
+
 fn ku_value_wrap(ty: &IrType, expr: &str) -> KuResult<String> {
     match ty {
+        IrType::Nullable(inner) => Ok(format!("__ku_v_nullable_{}({expr})", c_type_suffix(inner)?)),
         IrType::Str => Ok(format!("ku_v_str({expr})")),
         IrType::Int => Ok(format!("ku_v_int({expr})")),
         IrType::Float => Ok(format!("ku_v_float({expr})")),
         IrType::Bool => Ok(format!("ku_v_bool({expr})")),
         IrType::Null => Ok("ku_v_null()".to_string()),
-        IrType::Named(name) if name == "__ku_object" => Ok(format!("ku_v_object({expr})")),
+        IrType::Named(name) if c_object_type_name(name) => Ok(format!("ku_v_object({expr})")),
         IrType::Named(name) if name == "__ku_value" => Ok(expr.to_string()),
         IrType::Array(element) => Ok(format!(
             "ku_v_typed_array_{}({expr})",
@@ -6911,12 +7638,18 @@ fn ir_type_is_ku_value(ty: &IrType) -> bool {
 /// their homogeneous ABI is not layout-compatible with `KuValueArray`.
 fn ku_value_borrow_wrap(ty: &IrType, expr: &str) -> KuResult<Option<String>> {
     let wrapped = match ty {
+        IrType::Nullable(inner) => {
+            if ku_value_borrow_wrap(inner, &format!("({expr}).value"))?.is_none() {
+                return Ok(None);
+            }
+            format!("__ku_v_nullable_{}({expr})", c_type_suffix(inner)?)
+        }
         IrType::Str => format!("ku_v_str({expr})"),
         IrType::Int => format!("ku_v_int({expr})"),
         IrType::Float => format!("ku_v_float({expr})"),
         IrType::Bool => format!("ku_v_bool({expr})"),
         IrType::Null => "ku_v_null()".to_string(),
-        IrType::Named(name) if name == "__ku_object" => format!("ku_v_object({expr})"),
+        IrType::Named(name) if c_object_type_name(name) => format!("ku_v_object({expr})"),
         IrType::Named(name) if name == "__ku_value" => expr.to_string(),
         IrType::Closure {
             params,
@@ -6930,6 +7663,48 @@ fn ku_value_borrow_wrap(ty: &IrType, expr: &str) -> KuResult<Option<String>> {
         _ => return Ok(None),
     };
     Ok(Some(wrapped))
+}
+
+fn emit_nullable_value_wrappers(
+    out: &mut COutput,
+    program: &IrProgram,
+    prototypes: bool,
+) -> KuResult<()> {
+    if !program_uses_object(program) {
+        return Ok(());
+    }
+    let mut boxed_elements = Vec::new();
+    collect_kuvalue_array_elements_program(program, &mut boxed_elements);
+    for inner in array_optional::nullable_elements(program) {
+        if !kuvalue_array_element_supported(&inner) && !matches!(inner, IrType::Closure { .. }) {
+            continue;
+        }
+        if let IrType::Array(element) = &inner {
+            if !boxed_elements.contains(element.as_ref()) {
+                continue;
+            }
+        }
+        let suffix = c_type_suffix(&inner)?;
+        let nullable = array_optional::nullable_type(&inner)?;
+        if prototypes {
+            out.push_str(&format!("static bool __ku_try_v_nullable_{suffix}({nullable} value, KuValue* out);\nstatic KuValue __ku_v_nullable_{suffix}({nullable} value);\n"));
+        } else {
+            out.push_str(&format!("static bool __ku_try_v_nullable_{suffix}({nullable} value, KuValue* out) {{\n  *out=ku_v_null(); if (value.is_null) return true;\n"));
+            if let IrType::Array(element) = &inner {
+                out.push_str(&format!(
+                    "  return ku_try_v_typed_array_{}(value.value,out);\n",
+                    c_type_suffix(element)?
+                ));
+            } else {
+                out.push_str(&format!(
+                    "  *out={}; return true;\n",
+                    ku_value_wrap(&inner, "value.value")?
+                ));
+            }
+            out.push_str(&format!("}}\nstatic KuValue __ku_v_nullable_{suffix}({nullable} value) {{ KuValue result=ku_v_null(); if (!__ku_try_v_nullable_{suffix}(value,&result)) ku_object_hard_fail_oom(); return result; }}\n"));
+        }
+    }
+    out.check()
 }
 
 /// Emit a `ku_v_closure_{suffix}` per closure signature that boxes a closure
@@ -7136,125 +7911,12 @@ fn emit_fs_runtime(out: &mut COutput, usage: FsUsage, fs_base: &NativeFsBase) {
     if !usage.any() {
         return;
     }
-    out.push_str(
-        r#"#define KU_FS_MAX_PATH_BYTES ((size_t)32768)
-#define KU_FS_MAX_IO_BYTES ((size_t)1000000)
-#define KU_FS_MAX_DIRECTORY_ENTRIES ((size_t)10000)
-#define KU_FS_MAX_DIRECTORY_OUTPUT_BYTES ((size_t)1000000)
-
-typedef struct KuFsAllocatorV1 {
-  void* context;
-  void* (*allocate)(void*, size_t);
-  void (*release)(void*, void*);
-} KuFsAllocatorV1;
-static void* ku_fs_allocate(KuFsAllocatorV1* allocator, size_t bytes) {
-  return allocator ? allocator->allocate(allocator->context,bytes) : malloc(bytes);
-}
-static void ku_fs_release(KuFsAllocatorV1* allocator, void* pointer) {
-  if (allocator) allocator->release(allocator->context,pointer); else free(pointer);
-}
-
-static bool ku_fs_utf8_valid(const uint8_t* data, size_t len) {
-  if (len != 0 && !data) return false;
-  size_t i = 0;
-  while (i < len) {
-    uint8_t c = data[i];
-    if (c <= 0x7f) { i++; continue; }
-    if (c >= 0xc2 && c <= 0xdf) {
-      if (i + 1 >= len || (data[i + 1] & 0xc0) != 0x80) return false;
-      i += 2; continue;
-    }
-    if (c == 0xe0) {
-      if (i + 2 >= len || data[i + 1] < 0xa0 || data[i + 1] > 0xbf || (data[i + 2] & 0xc0) != 0x80) return false;
-      i += 3; continue;
-    }
-    if ((c >= 0xe1 && c <= 0xec) || (c >= 0xee && c <= 0xef)) {
-      if (i + 2 >= len || (data[i + 1] & 0xc0) != 0x80 || (data[i + 2] & 0xc0) != 0x80) return false;
-      i += 3; continue;
-    }
-    if (c == 0xed) {
-      if (i + 2 >= len || data[i + 1] < 0x80 || data[i + 1] > 0x9f || (data[i + 2] & 0xc0) != 0x80) return false;
-      i += 3; continue;
-    }
-    if (c == 0xf0) {
-      if (i + 3 >= len || data[i + 1] < 0x90 || data[i + 1] > 0xbf || (data[i + 2] & 0xc0) != 0x80 || (data[i + 3] & 0xc0) != 0x80) return false;
-      i += 4; continue;
-    }
-    if (c >= 0xf1 && c <= 0xf3) {
-      if (i + 3 >= len || (data[i + 1] & 0xc0) != 0x80 || (data[i + 2] & 0xc0) != 0x80 || (data[i + 3] & 0xc0) != 0x80) return false;
-      i += 4; continue;
-    }
-    if (c == 0xf4) {
-      if (i + 3 >= len || data[i + 1] < 0x80 || data[i + 1] > 0x8f || (data[i + 2] & 0xc0) != 0x80 || (data[i + 3] & 0xc0) != 0x80) return false;
-      i += 4; continue;
-    }
-    return false;
-  }
-  return true;
-}
-
-static bool ku_fs_path_valid(KuString path) {
-  if (path.len > KU_FS_MAX_PATH_BYTES) return false;
-  if (!ku_fs_utf8_valid(path.ptr, path.len)) return false;
-  return path.len == 0 || memchr(path.ptr, 0, path.len) == NULL;
-}
-
-static void ku_fs_set_error(KuError* error, const char* code, const char* message) {
-  if (!error) return;
-  *error = ku_error_make(
-      ku_string_static((const uint8_t*)"fs", 2),
-      ku_string_static((const uint8_t*)code, strlen(code)),
-      ku_string_static((const uint8_t*)message, strlen(message)));
-}
-
-"#,
-    );
+    out.push_str(concat!(include_str!("c_fs_common.c"), "\n"));
 
     match fs_base {
-        NativeFsBase::CurrentWorkingDirectory => out.push_str(
-            r#"#if defined(_WIN32)
-typedef wchar_t KuFsNativeChar;
-static KuFsNativeChar* ku_fs_native_path_with_allocator(KuString path, KuError* error, const char* code, const char* message, KuFsAllocatorV1* allocator) {
-  if (!ku_fs_path_valid(path)) { ku_fs_set_error(error, code, message); return NULL; }
-  if (path.len == 0) {
-    wchar_t* empty = (wchar_t*)ku_fs_allocate(allocator,2 * sizeof(wchar_t));
-    if (!empty) { ku_fs_set_error(error, code, message); return NULL; }
-    empty[0] = L'.';
-    empty[1] = L'\0';
-    return empty;
-  }
-  int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, (const char*)path.ptr, (int)path.len, NULL, 0);
-  if (count <= 0 || (size_t)count > SIZE_MAX / sizeof(wchar_t) - 1) {
-    ku_fs_set_error(error, code, message); return NULL;
-  }
-  wchar_t* native = (wchar_t*)ku_fs_allocate(allocator,((size_t)count + 1) * sizeof(wchar_t));
-  if (!native) { ku_fs_set_error(error, code, message); return NULL; }
-  if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, (const char*)path.ptr, (int)path.len, native, count) != count) {
-    ku_fs_release(allocator,native); ku_fs_set_error(error, code, message); return NULL;
-  }
-  native[count] = L'\0';
-  return native;
-}
-#else
-typedef char KuFsNativeChar;
-static KuFsNativeChar* ku_fs_native_path_with_allocator(KuString path, KuError* error, const char* code, const char* message, KuFsAllocatorV1* allocator) {
-  if (!ku_fs_path_valid(path)) { ku_fs_set_error(error, code, message); return NULL; }
-  size_t capacity = path.len == 0 ? 2 : path.len + 1;
-  char* native = (char*)ku_fs_allocate(allocator,capacity);
-  if (!native) { ku_fs_set_error(error, code, message); return NULL; }
-  if (path.len) {
-    memcpy(native, path.ptr, path.len);
-    native[path.len] = '\0';
-  } else {
-    native[0] = '.';
-    native[1] = '\0';
-  }
-  return native;
-}
-#endif
-
-"#,
-        ),
+        NativeFsBase::CurrentWorkingDirectory => {
+            out.push_str(concat!(include_str!("c_fs_current_directory.c"), "\n"));
+        }
         NativeFsBase::ExecutableRelative(locator) => {
             out.push_str(&format!(
                 "static KuString ku_fs_base_locator(void) {{ return {}; }}\n\n",
@@ -7583,97 +8245,7 @@ static KuFsNativeChar* ku_fs_native_path_with_allocator(KuString path, KuError* 
 "#);
 
     if usage.read || usage.try_read {
-        out.push_str(
-            r#"static bool ku_fs_read_native_impl(const KuFsNativeChar*, KuString*, KuError*, KuFsAllocatorV1*);
-static bool ku_fs_read_impl(KuString path, KuString* value, KuError* error) {
-  if (value) *value = (KuString){0};
-  if (error) *error = (KuError){0};
-  KuFsNativeChar* native = ku_fs_native_path(path, error, "read_failed", "failed to read: invalid path");
-  if (!native) return false;
-  bool ok=ku_fs_read_native_impl(native,value,error,NULL);
-  free(native); return ok;
-}
-
-static bool ku_fs_read_native_impl(const KuFsNativeChar* native, KuString* value, KuError* error, KuFsAllocatorV1* allocator) {
-#if defined(_WIN32)
-  FILE* file = _wfopen(native, L"rb");
-#else
-  FILE* file = fopen(native, "rb");
-#endif
-  if (!file) { ku_fs_set_error(error, "read_failed", "failed to read file"); return false; }
-
-  size_t capacity = 4096;
-  uint8_t* data = (uint8_t*)ku_fs_allocate(allocator,capacity);
-  if (!data) {
-    (void)fclose(file);
-    ku_fs_set_error(error, "read_failed", "failed to read: out of memory");
-    return false;
-  }
-  size_t len = 0;
-  bool failed = false;
-  while (!failed) {
-    if (len == KU_FS_MAX_IO_BYTES) {
-      uint8_t extra = 0;
-      size_t got = fread(&extra, 1, 1, file);
-      if (got == 1) {
-        ku_fs_set_error(error, "file_too_large", "failed to read: file is too large");
-        failed = true;
-      } else if (ferror(file)) {
-        ku_fs_set_error(error, "read_failed", "failed to read file");
-        failed = true;
-      }
-      break;
-    }
-    if (len == capacity) {
-      size_t next = capacity <= KU_FS_MAX_IO_BYTES / 2 ? capacity * 2 : KU_FS_MAX_IO_BYTES;
-      if (next <= capacity) {
-        ku_fs_set_error(error, "read_failed", "failed to read: buffer limit reached");
-        failed = true;
-        break;
-      }
-      uint8_t* grown;
-      if (allocator) {
-        grown=(uint8_t*)ku_fs_allocate(allocator,next);
-        if (grown) { memcpy(grown,data,len); ku_fs_release(allocator,data); }
-      } else grown=(uint8_t*)realloc(data,next);
-      if (!grown) {
-        ku_fs_set_error(error, "read_failed", "failed to read: out of memory");
-        failed = true;
-        break;
-      }
-      data = grown;
-      capacity = next;
-    }
-    size_t got = fread(data + len, 1, capacity - len, file);
-    if (got != 0) {
-      len += got;
-      continue;
-    }
-    if (ferror(file)) {
-      ku_fs_set_error(error, "read_failed", "failed to read file");
-      failed = true;
-    }
-    break;
-  }
-  if (fclose(file) != 0 && !failed) {
-    ku_fs_set_error(error, "read_failed", "failed to close file after reading");
-    failed = true;
-  }
-  if (!failed && !ku_fs_utf8_valid(data, len)) {
-    ku_fs_set_error(error, "read_failed", "failed to read: file is not valid UTF-8");
-    failed = true;
-  }
-  if (failed) {
-    ku_fs_release(allocator,data);
-    return false;
-  }
-  if (value) *value = (KuString){ data, len, capacity, KU_STRING_OWNED };
-  else ku_fs_release(allocator,data);
-  return true;
-}
-
-"#,
-        );
+        out.push_str(concat!(include_str!("c_fs_read.c"), "\n"));
         if usage.read {
             out.push_str(
                 r#"static KuResult_str ku_fs_read(KuString path) {
@@ -8081,6 +8653,9 @@ static KuResult_array_str ku_fs_read_dir(KuString path) {
 }
 
 fn program_uses_object(program: &IrProgram) -> bool {
+    if calendar::uses_runtime(program) {
+        return true;
+    }
     // Stage 8b: every HTTP program carries `KuObject`-typed request fields
     // (`params`/`query`/`headers`), so the full object/KuValue runtime must be
     // emitted for the request struct to reference it, even when the program
@@ -8111,8 +8686,10 @@ fn program_uses_object(program: &IrProgram) -> bool {
 
 fn ir_type_uses_object(ty: &IrType) -> bool {
     match ty {
-        IrType::Named(name) => name == "__ku_object" || name == "__ku_value",
-        IrType::Array(inner) | IrType::Result(inner) => ir_type_uses_object(inner),
+        IrType::Named(name) => c_object_type_name(name) || name == "__ku_value",
+        IrType::Array(inner) | IrType::Result(inner) | IrType::Nullable(inner) => {
+            ir_type_uses_object(inner)
+        }
         _ => false,
     }
 }
@@ -8139,7 +8716,7 @@ fn expr_uses_object(expr: &IrExpr) -> bool {
     match &expr.kind {
         IrExprKind::Call { callee, args, kind } => {
             matches!(kind, IrCallKind::Intrinsic(name)
-                if name == "__ku_object"
+                if c_object_type_name(name)
                     || name == "json.stringify"
                     || name == "json.encode"
                     || name == "json.parse"
@@ -8164,6 +8741,18 @@ fn expr_uses_object(expr: &IrExpr) -> bool {
 /// additionally link `ws2_32`). The synthetic HTTP types only arise from the HTTP
 /// intrinsics, so a type scan over every temp/param/return type catches every such
 /// program.
+fn program_uses_http_server(program: &IrProgram) -> bool {
+    program_uses_native_named(program, "__ku_http_server")
+        || [
+            "http.server",
+            "http.service",
+            "__ku_http_listen",
+            "__ku_http_bind",
+        ]
+        .iter()
+        .any(|name| program_uses_intrinsic(program, name))
+}
+
 fn program_uses_http(program: &IrProgram) -> bool {
     program.functions.iter().any(|function| {
         ir_type_uses_http(&function.return_type)
@@ -10596,66 +11185,9 @@ fn emit_bytes_runtime(out: &mut COutput, program: &IrProgram, force: bool) {
     if !force && !program_uses_bytes(program) {
         return;
     }
+    out.push_str(include_str!("c_bytes_storage.c"));
     out.push_str(
         r#"
-#define KU_BYTES_MAX_LENGTH (64ULL * 1024ULL * 1024ULL)
-
-static KuError ku_bytes_error(const char* code, const char* message) {
-  return ku_error_make(
-      ku_string_static((const uint8_t*)"bytes", 5),
-      ku_string_static((const uint8_t*)code, strlen(code)),
-      ku_string_static((const uint8_t*)message, strlen(message)));
-}
-
-static int ku_bytes_try_copy(const uint8_t* data, size_t len, KuBytes* out) {
-  if (!out || (len != 0 && !data) || len > (size_t)KU_BYTES_MAX_LENGTH) return -1;
-  *out = (KuBytes){0};
-  if (len == 0) return 1;
-  uint8_t* copy = (uint8_t*)malloc(len);
-  if (!copy) return 0;
-  memcpy(copy, data, len);
-  *out = (KuBytes){ copy, len, len, KU_BYTES_OWNED };
-  return 1;
-}
-
-static KuBytes ku_move_bytes(KuBytes* value) {
-  if (!value) return (KuBytes){0};
-  KuBytes moved = *value;
-  *value = (KuBytes){0};
-  return moved;
-}
-
-static KuBytes ku_clone_bytes(KuBytes value) {
-  if (value.storage == KU_BYTES_STATIC) return value;
-  KuBytes copy = (KuBytes){0};
-  int copied = ku_bytes_try_copy(value.ptr, value.len, &copy);
-  if (copied != 1) {
-    fputs(copied == 0 ? "bytes clone allocation failed\n" : "invalid bytes clone source\n", stderr);
-    exit(1);
-  }
-  return copy;
-}
-
-static void ku_drop_bytes(KuBytes* value) {
-  if (!value) return;
-  if (value->storage == KU_BYTES_OWNED && value->ptr) free(value->ptr);
-  *value = (KuBytes){0};
-}
-
-static KuResult_bytes ku_bytes_from_str(KuString text) {
-  if ((text.len != 0 && !text.ptr) || text.len > (size_t)KU_BYTES_MAX_LENGTH) {
-    return (KuResult_bytes){ false, (KuBytes){0},
-      ku_bytes_error("too_large", "bytes input is invalid or exceeds 64 MiB") };
-  }
-  KuBytes value = (KuBytes){0};
-  int copied = ku_bytes_try_copy(text.ptr, text.len, &value);
-  if (copied != 1) {
-    return (KuResult_bytes){ false, (KuBytes){0},
-      ku_bytes_error("out_of_memory", "bytes allocation failed") };
-  }
-  return (KuResult_bytes){ true, value, (KuError){0} };
-}
-
 static int ku_bytes_utf8_valid(const uint8_t* data, size_t len) {
   if (len != 0 && !data) return 0;
   size_t i = 0;
@@ -10694,23 +11226,11 @@ static int ku_bytes_utf8_valid(const uint8_t* data, size_t len) {
   }
   return 1;
 }
-
-static int64_t ku_bytes_len(KuBytes value) {
-  if (value.len > (size_t)INT64_MAX) {
-    fputs("bytes length is outside Ku int range\n", stderr);
-    exit(1);
-  }
-  return (int64_t)value.len;
-}
-
-static KuResult_int ku_bytes_get(KuBytes value, int64_t index) {
-  if (index < 0 || (uint64_t)index >= (uint64_t)value.len || !value.ptr) {
-    return (KuResult_int){ false, 0,
-      ku_bytes_error("index_out_of_bounds", "bytes index is out of bounds") };
-  }
-  return (KuResult_int){ true, (int64_t)value.ptr[(size_t)index], (KuError){0} };
-}
-
+"#,
+    );
+    out.push_str(include_str!("c_bytes_index.c"));
+    out.push_str(
+        r#"
 static KuResult_str ku_bytes_to_str(KuBytes value) {
   if (!ku_bytes_utf8_valid(value.ptr, value.len)) {
     return (KuResult_str){ false, (KuString){0},
@@ -15732,7 +16252,7 @@ fn inst_uses_http(inst: &IrInst) -> bool {
 /// Result ABI and value-ownership paths pick them up automatically). Emitted
 /// before the Result ABI so `KuResult_struct___ku_http_response` can embed the
 /// response struct.
-fn emit_http_types(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+fn emit_http_types(out: &mut COutput, program: &IrProgram, synchronous: bool) -> KuResult<()> {
     out.check()?;
     if !program_uses_http(program) {
         return Ok(());
@@ -15741,15 +16261,17 @@ fn emit_http_types(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
     // server pointer before the socket runtime completes its private layout.
     out.push_str("typedef struct KuHttpServer KuHttpServer;\n");
     out.push_str(
-        "typedef struct { int64_t status; KuString content_type; KuString body; KuString location; } KuStruct___ku_http_response;\n\
+        "typedef struct { int64_t status; KuString content_type; KuString body; KuString location; KuObject* headers; } KuStruct___ku_http_response;\n\
          static KuStruct___ku_http_response ku_move_struct___ku_http_response(KuStruct___ku_http_response* v) { KuStruct___ku_http_response r = *v; *v = (KuStruct___ku_http_response){0}; return r; }\n\
-         static KuStruct___ku_http_response ku_clone_struct___ku_http_response(KuStruct___ku_http_response v) { v.content_type = ku_string_clone(v.content_type); v.body = ku_string_clone(v.body); v.location = ku_string_clone(v.location); return v; }\n\
-         static void ku_drop_struct___ku_http_response(KuStruct___ku_http_response* v) { if (!v) return; ku_string_drop(&v->content_type); ku_string_drop(&v->body); ku_string_drop(&v->location); *v = (KuStruct___ku_http_response){0}; }\n\
          typedef struct { KuString method; KuString path; KuString body; KuObject* params; KuObject* query; KuObject* headers; } KuStruct___ku_http_request;\n\
          static KuStruct___ku_http_request ku_move_struct___ku_http_request(KuStruct___ku_http_request* v) { KuStruct___ku_http_request r = *v; *v = (KuStruct___ku_http_request){0}; return r; }\n\
          static KuStruct___ku_http_request ku_clone_struct___ku_http_request(KuStruct___ku_http_request v) { v.method = ku_string_clone(v.method); v.path = ku_string_clone(v.path); v.body = ku_string_clone(v.body); v.params = ku_object_clone(v.params); v.query = ku_object_clone(v.query); v.headers = ku_object_clone(v.headers); return v; }\n\
          static void ku_drop_struct___ku_http_request(KuStruct___ku_http_request* v) { if (!v) return; ku_string_drop(&v->method); ku_string_drop(&v->path); ku_string_drop(&v->body); ku_object_drop(v->params); ku_object_drop(v->query); ku_object_drop(v->headers); *v = (KuStruct___ku_http_request){0}; }\n\n",
     );
+    if synchronous {
+        out.push_str("#define KU_HTTP_RESPONSE_SYNC 1\n");
+    }
+    out.push_str(include_str!("c_http_response_headers.c"));
     Ok(())
 }
 
@@ -15763,7 +16285,9 @@ fn emit_http_runtime(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
     if !program_uses_http(program) {
         return Ok(());
     }
-    out.push_str(include_str!("c_http_runtime.c"));
+    if program_uses_http_server(program) {
+        out.push_str(include_str!("c_http_runtime.c"));
+    }
     if program_uses_intrinsic(program, "__ku_http_json_response") {
         out.push_str(
             r#"
@@ -15847,30 +16371,7 @@ fn emit_string_slice_helper(out: &mut COutput, program: &IrProgram) -> KuResult<
     if !result_inners.contains(&IrType::Str) {
         return Ok(());
     }
-    out.push_str(
-        "static KuResult_str ku_string_slice(KuString s, int64_t start, int64_t end) {\n\
-        \x20 if (start < 0 || end < 0) {\n\
-        \x20   return (KuResult_str){ false, (KuString){0}, ku_error_make(ku_string_static((const uint8_t*)\"string\", 6), ku_string_static((const uint8_t*)\"slice_error\", 11), ku_string_static((const uint8_t*)\"string.slice indexes must be >= 0\", 33)) };\n\
-        \x20 }\n\
-        \x20 if (start > end) {\n\
-        \x20   return (KuResult_str){ false, (KuString){0}, ku_error_make(ku_string_static((const uint8_t*)\"string\", 6), ku_string_static((const uint8_t*)\"slice_error\", 11), ku_string_static((const uint8_t*)\"string.slice start must be <= end\", 33)) };\n\
-        \x20 }\n\
-        \x20 size_t clen = ku_string_char_len(s);\n\
-        \x20 if ((uint64_t)end > (uint64_t)clen) {\n\
-        \x20   char buf[96]; int n = snprintf(buf, sizeof(buf), \"string.slice end %lld out of bounds for length %zu\", (long long)end, clen);\n\
-        \x20   KuString msg = (KuString){0}; if (n > 0) { msg = ku_string_alloc((size_t)n); memcpy(msg.ptr, buf, (size_t)n); }\n\
-        \x20   return (KuResult_str){ false, (KuString){0}, ku_error_make(ku_string_static((const uint8_t*)\"string\", 6), ku_string_static((const uint8_t*)\"slice_error\", 11), msg) };\n\
-        \x20 }\n\
-        \x20 size_t bi = 0, ci = 0;\n\
-        \x20 while (bi < s.len && ci < (size_t)start) { bi++; while (bi < s.len && (s.ptr[bi] & 0xC0) == 0x80) bi++; ci++; }\n\
-        \x20 size_t bstart = bi;\n\
-        \x20 while (bi < s.len && ci < (size_t)end) { bi++; while (bi < s.len && (s.ptr[bi] & 0xC0) == 0x80) bi++; ci++; }\n\
-        \x20 size_t blen = bi - bstart;\n\
-        \x20 KuString outv = ku_string_alloc(blen);\n\
-        \x20 if (blen) memcpy(outv.ptr, s.ptr + bstart, blen);\n\
-        \x20 return (KuResult_str){ true, outv, (KuError){0} };\n\
-        }\n\n",
-    );
+    out.push_str(concat!(include_str!("c_string_slice.c"), "\n"));
     Ok(())
 }
 
@@ -15921,18 +16422,22 @@ fn emit_string_chars_helper(out: &mut COutput, program: &IrProgram) -> KuResult<
 }
 
 fn program_uses_intrinsic(program: &IrProgram, intrinsic: &str) -> bool {
+    program_has_intrinsic(program, |name, _| name == intrinsic)
+}
+
+fn program_has_intrinsic(program: &IrProgram, predicate: impl Fn(&str, &[IrExpr]) -> bool) -> bool {
     program.functions.iter().any(|function| {
         function.blocks.iter().any(|block| {
             let mut used = false;
             for inst in &block.instructions {
                 walk_inst_exprs(inst, &mut |expr| {
-                    if expr_uses_intrinsic(expr, intrinsic) {
+                    if expr_has_intrinsic(expr, &predicate) {
                         used = true;
                     }
                 });
             }
             walk_terminator_exprs(&block.terminator, &mut |expr| {
-                if expr_uses_intrinsic(expr, intrinsic) {
+                if expr_has_intrinsic(expr, &predicate) {
                     used = true;
                 }
             });
@@ -15977,7 +16482,7 @@ fn expr_mentions_native_tls_config(expr: &IrExpr) -> bool {
         ..
     } = &expr.kind
     {
-        if name == "__ku_object"
+        if c_object_type_name(name)
             && args
                 .as_chunks::<2>()
                 .0
@@ -16002,16 +16507,17 @@ fn expr_mentions_native_tls_config(expr: &IrExpr) -> bool {
         .any(expr_mentions_native_tls_config)
 }
 
-fn expr_uses_intrinsic(expr: &IrExpr, intrinsic: &str) -> bool {
+fn expr_has_intrinsic(expr: &IrExpr, predicate: &impl Fn(&str, &[IrExpr]) -> bool) -> bool {
     matches!(
         &expr.kind,
         IrExprKind::Call {
             kind: IrCallKind::Intrinsic(name),
+            args,
             ..
-        } if name == intrinsic
+        } if predicate(name, args)
     ) || expr_children(expr)
         .into_iter()
-        .any(|child| expr_uses_intrinsic(child, intrinsic))
+        .any(|child| expr_has_intrinsic(child, predicate))
 }
 
 fn collect_array_elements_program(program: &IrProgram, output: &mut Vec<IrType>) {
@@ -16109,6 +16615,7 @@ fn collect_result_inners_program(program: &IrProgram, output: &mut Vec<IrType>) 
             }
         }
     }
+    dedup_c_types(output);
     Ok(())
 }
 
@@ -16122,6 +16629,8 @@ fn collect_result_type(ty: &IrType, result_types: &mut Vec<IrType>) -> KuResult<
                 | IrType::Str
                 | IrType::Null
                 | IrType::Array(_)
+                | IrType::Nullable(_)
+                | IrType::Result(_)
                 | IrType::Named(_) => {}
                 _ => {
                     return Err(unsupported(format!(
@@ -16132,8 +16641,9 @@ fn collect_result_type(ty: &IrType, result_types: &mut Vec<IrType>) -> KuResult<
             if !result_types.contains(inner.as_ref()) {
                 result_types.push(*inner.clone());
             }
+            collect_result_type(inner, result_types)?;
         }
-        IrType::Array(inner) => collect_result_type(inner, result_types)?,
+        IrType::Array(inner) | IrType::Nullable(inner) => collect_result_type(inner, result_types)?,
         _ => {}
     }
     Ok(())
@@ -16162,7 +16672,14 @@ fn emit_main_wrapper(
             "native C main wrapper does not support main parameters",
         ));
     }
-    let service = program_uses_http(program);
+    let service = [
+        "http.server",
+        "http.service",
+        "__ku_http_listen",
+        "__ku_http_bind",
+    ]
+    .iter()
+    .any(|name| program_uses_intrinsic(program, name));
     let exit = |value: &str| {
         if service {
             format!("ku_service_output_exit({value})")
@@ -16189,6 +16706,7 @@ fn emit_main_wrapper(
     // result tag or output. Failed frames returned only a typed transport zero.
     match &function.return_type {
         IrType::Void => out.push_str("  ku_main();\n"),
+        IrType::Null => out.push_str("  (void)ku_main();\n"),
         IrType::Int | IrType::Bool | IrType::Str | IrType::Result(_) => out.push_str(&format!(
             "  {} result = ku_main();\n",
             c_type(&function.return_type)?,
@@ -16208,7 +16726,7 @@ fn emit_main_wrapper(
         "  const char* message = __ku_sync_error_message(signal); ku_output_stream_write(stderr, message, __ku_sync_error_message_length(signal)); ku_output_stream_write(stderr, \"\\n\", 1); return {};\n  }}\n", exit("1")
     ));
     match &function.return_type {
-        IrType::Void => {
+        IrType::Void | IrType::Null => {
             out.push_str(mysql_shutdown);
             out.push_str(&format!("  return {};\n", exit("0")));
         }
@@ -16445,6 +16963,23 @@ fn c_http_intrinsic_expr(name: &str, args: &[IrExpr]) -> KuResult<Option<String>
         // Borrow the closure value; ku_http_server_add_route retains its own env
         // reference, and the route table releases that reference on server free.
         let handler = c_expr(handler)?;
+        if arity == "2" {
+            // C checks the real View signature at this assignment. Never cast
+            // const-request callbacks to the owned/by-value request ABI.
+            let member = match returns_result {
+                "0" => "response",
+                "1" => "result",
+                "3" => "object",
+                "4" => "object_result",
+                "5" => "value",
+                "6" => "value_result",
+                _ => return Err(unsupported("invalid native HTTP View response ABI")),
+            };
+            return Ok(Some(format!(
+                "(ku_http_server_add_view_route({}, {}, {}, (KuHttpViewInvoke){{.{member}=({handler}).invoke}}, ({handler}).env, {returns_result}), (uint8_t)0)",
+                c_expr(server)?, c_static_string(method), c_value_expr(path)?
+            )));
+        }
         return Ok(Some(format!(
             "(ku_http_server_add_route({}, {}, {}, (void*)({handler}).invoke, ({handler}).env, {arity}, {returns_result}), (uint8_t)0)",
             c_expr(server)?,
@@ -16644,8 +17179,8 @@ fn c_net_intrinsic_expr(method: &str, args: &[IrExpr]) -> KuResult<String> {
 /// Lower a `string.<method>` intrinsic. The receiver and any string arguments are
 /// read as borrows (`c_expr`): the helpers only read them, so the caller's cleanup
 /// still owns and drops the originals. Byte/codepoint-exact to the interpreter's
-/// Rust semantics; the Unicode-table-dependent methods (trim/lower/upper) are loud
-/// gaps rather than silent ASCII-only divergences.
+/// Rust semantics, including Unicode transforms generated from the same pinned
+/// Rust implementation used by the interpreter.
 fn c_string_method_expr(method: &str, args: &[IrExpr]) -> KuResult<String> {
     let recv = args
         .first()
@@ -16689,11 +17224,7 @@ fn c_string_method_expr(method: &str, args: &[IrExpr]) -> KuResult<String> {
             arg(1)?,
             arg(2)?
         )),
-        // Exact parity needs a Unicode case/whitespace table; ASCII-only versions
-        // would silently diverge from the interpreter on non-ASCII input.
-        "trim" | "lower" | "upper" => Err(unsupported(format!(
-            "native C string.{method}() needs Unicode support and is not implemented yet"
-        ))),
+        "trim" | "lower" | "upper" => Ok(format!("ku_string_unicode_{method}({})", c_expr(recv)?)),
         other => Err(unsupported(format!(
             "native C string.{other}() is not implemented yet"
         ))),
@@ -16701,6 +17232,122 @@ fn c_string_method_expr(method: &str, args: &[IrExpr]) -> KuResult<String> {
 }
 
 fn c_intrinsic_expr(name: &str, args: &[IrExpr], ty: &IrType) -> KuResult<String> {
+    if let Some(expr) = interop::expression(name, args, ty)? {
+        return Ok(expr);
+    }
+    if let Some(expression) = http_client::intrinsic_expr(name, args)? {
+        return Ok(expression);
+    }
+    if let Some(expression) = calendar::intrinsic_expr(name, args)? {
+        return Ok(expression);
+    }
+    if let Some(expression) = array_optional::intrinsic_expr(name, args, ty)? {
+        return Ok(expression);
+    }
+    match name {
+        "__ku_optional_select" => {
+            let [receiver, field] = args else {
+                return Err(unsupported(
+                    "optional field selection requires a receiver and payload",
+                ));
+            };
+            if !matches!(receiver.ty, IrType::Nullable(_)) {
+                return Err(unsupported(
+                    "optional field selection requires a nullable receiver",
+                ));
+            }
+            let present = if field.ty == *ty {
+                c_expr(field)?
+            } else if matches!(ty, IrType::Nullable(inner) if **inner == field.ty) {
+                format!("({}){{ false, {} }}", c_type(ty)?, c_expr(field)?)
+            } else {
+                return Err(unsupported("optional field payload type mismatch"));
+            };
+            return Ok(format!(
+                "(({}).is_null ? {} : {present})",
+                c_expr(receiver)?,
+                c_zero_value(ty)?,
+            ));
+        }
+        "__ku_object_optional_field"
+        | "__ku_object_optional_field_view"
+        | "__ku_value_optional_field"
+        | "__ku_value_optional_field_view" => {
+            let [receiver, key] = args else {
+                return Err(unsupported(
+                    "optional object field requires a receiver and key",
+                ));
+            };
+            let dynamic = name.starts_with("__ku_value_");
+            let correct_receiver = matches!(&receiver.ty, IrType::Named(ty)
+                if if dynamic { ty == "__ku_value" } else { c_object_type_name(ty) });
+            if !correct_receiver || key.ty != IrType::Str || !ir_type_is_ku_value(ty) {
+                return Err(unsupported("optional object field type mismatch"));
+            }
+            return Ok(format!(
+                "{}({}, {}, {})",
+                if dynamic {
+                    "__ku_value_optional_field"
+                } else {
+                    "__ku_object_optional_field"
+                },
+                c_expr(receiver)?,
+                c_expr(key)?,
+                name.ends_with("_view"),
+            ));
+        }
+        "__ku_nullable_null" => return c_zero_value(ty),
+        "__ku_nullable_some" => {
+            let [value] = args else {
+                return Err(unsupported("nullable construction requires one value"));
+            };
+            if matches!(ty, IrType::Nullable(inner) if matches!(inner.as_ref(),IrType::Named(name) if name=="__ku_value"))
+            {
+                return Ok(format!(
+                    "__ku_nullable_some_kuvalue({})",
+                    c_value_expr(value)?
+                ));
+            }
+            return Ok(format!(
+                "({}){{ false, {} }}",
+                c_type(ty)?,
+                c_value_expr(value)?
+            ));
+        }
+        "__ku_nullable_get" | "__ku_nullable_take" | "__ku_nullable_is_null" => {
+            let [wrapper] = args else {
+                return Err(unsupported("nullable operation requires one wrapper"));
+            };
+            let IrType::Nullable(inner) = &wrapper.ty else {
+                return Err(unsupported("nullable operation requires nullable input"));
+            };
+            return match name {
+                "__ku_nullable_is_null" => Ok(format!(
+                    "__ku_nullable_is_null_{}({})",
+                    c_type_suffix(inner)?,
+                    c_expr(wrapper)?
+                )),
+                "__ku_nullable_get" => Ok(format!("({}).value", c_expr(wrapper)?)),
+                _ => {
+                    let place = c_move_place(wrapper)?
+                        .ok_or_else(|| unsupported("nullable take requires owned place"))?;
+                    Ok(format!(
+                        "__ku_nullable_take_{}(&{place})",
+                        c_type_suffix(inner)?
+                    ))
+                }
+            };
+        }
+        _ => {}
+    }
+    if let Some((module, method)) = name.split_once('.') {
+        if matches!(module, "zstd" | "gzip" | "deflate") {
+            return compression::intrinsic_expr(module, method, args);
+        }
+    }
+    if let Some(expr) = http_status::expression(name, args)? {
+        return Ok(expr);
+    }
     if let Some(expr) = c_http_intrinsic_expr(name, args)? {
         return Ok(expr);
     }
@@ -16757,6 +17404,76 @@ fn c_intrinsic_expr(name: &str, args: &[IrExpr], ty: &IrType) -> KuResult<String
             c_value_expr(&args[1])?,
             c_value_expr(&args[2])?
         ));
+    }
+    if matches!(
+        name,
+        "__ku_object_has_key" | "__ku_object_take_required" | "__ku_object_required_field"
+    ) {
+        let [object, key] = args else {
+            return Err(unsupported("object lookup requires an object and key"));
+        };
+        if !matches!(&object.ty, IrType::Named(name) if c_object_type_name(name))
+            || key.ty != IrType::Str
+        {
+            return Err(unsupported("object lookup has incompatible input types"));
+        }
+        let object = c_expr(object)?;
+        let key = c_expr(key)?;
+        return Ok(if name == "__ku_object_has_key" {
+            format!("(ku_object_get({object}, {key}) != NULL)")
+        } else {
+            format!("{name}({object}, {key})")
+        });
+    }
+    if name == "__ku_object_pattern_box" {
+        let [value] = args else {
+            return Err(unsupported("object pattern default requires one value"));
+        };
+        return ku_value_wrap(&value.ty, &c_value_expr(value)?);
+    }
+    if name == "__ku_object_pattern_convert" {
+        let [value] = args else {
+            return Err(unsupported(
+                "object pattern conversion requires a tagged value",
+            ));
+        };
+        if !ir_type_is_ku_value(&value.ty) || crate::ir::ir_expr_is_borrowed(value) {
+            return Err(unsupported(
+                "object pattern conversion requires an owned tagged value",
+            ));
+        }
+        let inner = match ty {
+            IrType::Nullable(inner) => inner.as_ref(),
+            ty => ty,
+        };
+        let moved = c_value_expr(value)?;
+        let payload = if let IrType::Array(element) = inner {
+            format!(
+                "__ku_object_pattern_array_{}({moved})",
+                c_type_suffix(element)?
+            )
+        } else {
+            let (tag, member) = object_pattern_scalar_tag(inner).ok_or_else(|| {
+                unsupported(format!(
+                    "object pattern field conversion to {ty} is unsupported"
+                ))
+            })?;
+            format!("__ku_object_pattern_checked({moved}, {tag}).as.{member}")
+        };
+        if matches!(ty, IrType::Nullable(_)) {
+            if !matches!(value.kind, IrExprKind::Temp(_) | IrExprKind::Local(_)) {
+                return Err(unsupported(
+                    "nullable object field requires a materialized value",
+                ));
+            }
+            return Ok(format!(
+                "(({}).tag == KU_NULL ? {} : ({}){{false, {payload}}})",
+                c_expr(value)?,
+                c_zero_value(ty)?,
+                c_type(ty)?,
+            ));
+        }
+        return Ok(payload);
     }
     if name == "__ku_object_get" {
         let object = args
@@ -16875,16 +17592,14 @@ fn c_intrinsic_expr(name: &str, args: &[IrExpr], ty: &IrType) -> KuResult<String
         let value = args
             .first()
             .ok_or_else(|| unsupported("enum payload access requires one argument"))?;
-        // Binding a payload in a `match` arm MOVES it out of the enum (Ku matches
-        // by value), so clear the enum's slot: the enum is deep-dropped afterwards
-        // and would otherwise free the same buffer the binding now owns.
-        let place = format!(
+        // Tag tests, deeper projections and guarded arm candidates must
+        // inspect this place without consuming it. Only c_value_expr moves.
+        return Ok(format!(
             "({}).payload.{}.{}",
             c_expr(value)?,
             c_ident(variant),
             c_ident(field)
-        );
-        return c_move_value(ty, &place);
+        ));
     }
     if let Some(method) = name.strip_prefix("array.") {
         let receiver = args
@@ -16965,6 +17680,9 @@ fn c_intrinsic_expr(name: &str, args: &[IrExpr], ty: &IrType) -> KuResult<String
             }
         }
     }
+    if let Some(expression) = time::intrinsic_expr(name, args)? {
+        return Ok(expression);
+    }
     if name == "time.now" {
         if !args.is_empty() {
             return Err(unsupported("native C time.now expects no arguments"));
@@ -16986,6 +17704,25 @@ fn c_intrinsic_expr(name: &str, args: &[IrExpr], ty: &IrType) -> KuResult<String
                 "native C time.elapsed(value) requires a value returned by time.instant()",
             )),
             _ => Err(unsupported("native C time.elapsed expects one argument")),
+        };
+    }
+    if name == "time.unix" {
+        // Match the interpreter's signed millisecond division, including
+        // truncation toward zero before the epoch. Read/validate the Time once.
+        return match args {
+            [] => Ok("(ku_time_now_millis() / INT64_C(1000))".to_string()),
+            [value] if matches!(&value.ty, IrType::Named(type_name) if type_name == "__ku_time") => {
+                Ok(format!(
+                    "(ku_time_value_millis({}) / INT64_C(1000))",
+                    c_expr(value)?
+                ))
+            }
+            [_] => Err(unsupported(
+                "native C time.unix(value) requires a value returned by time.instant()",
+            )),
+            _ => Err(unsupported(
+                "native C time.unix expects zero or one argument",
+            )),
         };
     }
     if name == "time.millis" {
@@ -17172,6 +17909,9 @@ fn c_intrinsic_expr(name: &str, args: &[IrExpr], ty: &IrType) -> KuResult<String
             IrType::Bool => Ok(format!("ku_string_from_bool({})", c_expr(arg)?)),
             IrType::Str => Ok(format!("ku_string_clone({})", c_expr(arg)?)),
             IrType::Null => Ok("ku_string_static((const uint8_t*)\"null\", 4)".to_string()),
+            IrType::Nullable(inner) if **inner == IrType::Int => {
+                Ok(format!("__ku_string_from_nullable_int({})", c_expr(arg)?))
+            }
             other => Err(unsupported(format!(
                 "native C str() is not implemented for {other} yet"
             ))),
@@ -17207,13 +17947,18 @@ fn c_intrinsic_expr(name: &str, args: &[IrExpr], ty: &IrType) -> KuResult<String
 
 fn c_zero_value(ty: &IrType) -> KuResult<String> {
     match ty {
+        IrType::Nullable(inner) => Ok(format!(
+            "({}){{ true, {} }}",
+            c_type(ty)?,
+            c_zero_value(inner)?
+        )),
         IrType::Int | IrType::Null => Ok("0".to_string()),
         IrType::Float => Ok("0.0".to_string()),
         IrType::Bool => Ok("false".to_string()),
         IrType::Str => Ok("(KuString){0}".to_string()),
-        IrType::Named(name) if name == "__ku_object" => Ok("NULL".to_string()),
+        IrType::Named(name) if c_object_type_name(name) => Ok("NULL".to_string()),
         IrType::Named(name) if name == "__ku_value" => Ok("ku_v_null()".to_string()),
-        IrType::Named(name) if name == "__ku_time" => Ok("(KuTime){0}".to_string()),
+        IrType::Named(name) if c_time_scalar_name(name) => Ok("(KuTime){0}".to_string()),
         IrType::Named(name) if name == "__ku_http_server" => Ok("NULL".to_string()),
         IrType::Named(name) if pg_native_suffix(name).is_some() => Ok("NULL".to_string()),
         IrType::Array(_) | IrType::Named(_) | IrType::Result(_) | IrType::Closure { .. } => {
@@ -17232,13 +17977,14 @@ fn is_native_zero(expr: &IrExpr) -> bool {
 
 fn c_zero_initializer(ty: &IrType) -> KuResult<String> {
     match ty {
+        IrType::Nullable(_) => c_zero_value(ty),
         IrType::Int | IrType::Null => Ok("0".to_string()),
         IrType::Float => Ok("0.0".to_string()),
         IrType::Bool => Ok("false".to_string()),
         IrType::Str => Ok("(KuString){0}".to_string()),
-        IrType::Named(name) if name == "__ku_object" => Ok("NULL".to_string()),
+        IrType::Named(name) if c_object_type_name(name) => Ok("NULL".to_string()),
         IrType::Named(name) if name == "__ku_value" => Ok("ku_v_null()".to_string()),
-        IrType::Named(name) if name == "__ku_time" => Ok("(KuTime){0}".to_string()),
+        IrType::Named(name) if c_time_scalar_name(name) => Ok("(KuTime){0}".to_string()),
         IrType::Named(name) if name == "__ku_http_server" => Ok("NULL".to_string()),
         IrType::Named(name) if pg_native_suffix(name).is_some() => Ok("NULL".to_string()),
         IrType::Array(_) | IrType::Named(_) | IrType::Result(_) | IrType::Closure { .. } => {
@@ -17274,6 +18020,11 @@ fn c_binary(op: BinaryOp) -> &'static str {
 /// `c_value_expr`; copy types return the place unchanged.
 fn c_move_value(ty: &IrType, place: &str) -> KuResult<String> {
     match ty {
+        IrType::Nullable(inner) if is_c_owned_type(inner) => Ok(format!(
+            "__ku_nullable_move_{}(&{place})",
+            c_type_suffix(inner)?
+        )),
+        IrType::Nullable(_) => Ok(place.into()),
         IrType::Named(name) if name == "__ku_pg_capture" => {
             Ok(format!("ku_task_pg_capture_move(&{place})"))
         }
@@ -17286,9 +18037,9 @@ fn c_move_value(ty: &IrType, place: &str) -> KuResult<String> {
             "ku_result_move_{}(&{place})",
             c_type_suffix(inner)?
         )),
-        IrType::Named(name) if name == "__ku_object" => Ok(format!("ku_object_move(&{place})")),
+        IrType::Named(name) if c_object_type_name(name) => Ok(format!("ku_object_move(&{place})")),
         IrType::Named(name) if name == "__ku_value" => Ok(format!("ku_value_move(&{place})")),
-        IrType::Named(name) if name == "__ku_time" => Ok(place.to_string()),
+        IrType::Named(name) if c_time_scalar_name(name) => Ok(place.to_string()),
         IrType::Named(name) if name == "__ku_http_server" => Ok(place.to_string()),
         IrType::Named(name) if name == "__ku_error_type" => Ok(format!("ku_error_move(&{place})")),
         IrType::Named(name) => Ok(format!("{}(&{place})", c_named_move_function(name))),
@@ -17309,6 +18060,10 @@ fn c_move_value(ty: &IrType, place: &str) -> KuResult<String> {
 
 fn c_clone_value(ty: &IrType, expression: &str) -> KuResult<String> {
     match ty {
+        IrType::Nullable(inner) => Ok(format!(
+            "__ku_nullable_clone_{}({expression})",
+            c_type_suffix(inner)?
+        )),
         IrType::Array(element) => Ok(format!(
             "ku_array_clone_{}({expression})",
             c_type_suffix(element)?
@@ -17320,11 +18075,11 @@ fn c_clone_value(ty: &IrType, expression: &str) -> KuResult<String> {
         IrType::Named(name) if name == "__ku_error_type" => {
             Ok(format!("ku_error_clone({expression})"))
         }
-        IrType::Named(name) if name == "__ku_object" => {
+        IrType::Named(name) if c_object_type_name(name) => {
             Ok(format!("ku_object_clone({expression})"))
         }
         IrType::Named(name) if name == "__ku_value" => Ok(format!("ku_value_clone({expression})")),
-        IrType::Named(name) if name == "__ku_time" => Ok(expression.to_string()),
+        IrType::Named(name) if c_time_scalar_name(name) => Ok(expression.to_string()),
         // Stage 8a: the server value is a shared heap pointer, cloned by copy.
         IrType::Named(name) if name == "__ku_http_server" => Ok(expression.to_string()),
         IrType::Named(name) => Ok(format!("{}({expression})", c_named_clone_function(name))),
@@ -17349,6 +18104,7 @@ fn c_clone_value(ty: &IrType, expression: &str) -> KuResult<String> {
 
 fn c_drop_value(ty: &IrType, expression: &str) -> KuResult<String> {
     match ty {
+        IrType::Nullable(inner) => Ok(format!("__ku_nullable_drop_{}(&{expression});", c_type_suffix(inner)?)),
         IrType::Named(name) if name == "__ku_pg_capture" => Ok(format!("ku_task_pg_capture_drop(&{expression});")),
         IrType::Array(element) => Ok(format!(
             "ku_array_drop_{}(&{expression});",
@@ -17361,13 +18117,13 @@ fn c_drop_value(ty: &IrType, expression: &str) -> KuResult<String> {
         IrType::Named(name) if name == "__ku_error_type" => {
             Ok(format!("ku_error_drop(&{expression});"))
         }
-        IrType::Named(name) if name == "__ku_object" => {
+        IrType::Named(name) if c_object_type_name(name) => {
             Ok(format!("ku_object_drop({expression});"))
         }
         IrType::Named(name) if name == "__ku_value" => {
             Ok(format!("ku_value_drop(&{expression});"))
         }
-        IrType::Named(name) if name == "__ku_time" => Ok(String::new()),
+        IrType::Named(name) if c_time_scalar_name(name) => Ok(String::new()),
         // Stage 8a: the server outlives every local (freed by the accept loop on
         // exit, or reclaimed by the OS), so a local going out of scope drops nothing.
         IrType::Named(name) if name == "__ku_http_server" => Ok(String::new()),
@@ -17395,6 +18151,7 @@ fn c_unary(op: UnaryOp) -> &'static str {
 }
 
 fn c_ident(name: &str) -> String {
+    const ESCAPE_PREFIX: &str = "ku_c_name_";
     let mut output = String::new();
     for (index, ch) in name.chars().enumerate() {
         if (index == 0 && (ch.is_ascii_alphabetic() || ch == '_'))
@@ -17406,10 +18163,30 @@ fn c_ident(name: &str) -> String {
         }
     }
     if output.is_empty() {
-        "_".to_string()
-    } else {
-        output
+        output.push('_');
     }
+    // Keep conflicting spellings out of C declarations, field selections and
+    // references. Escaping the prefix itself keeps the mapping one-to-one
+    // for otherwise valid C identifiers.
+    if output.starts_with(ESCAPE_PREFIX)
+        || matches!(
+            output.as_str(),
+            "auto" | "break" | "case" | "char" | "const" | "continue" | "default" | "do"
+                | "double" | "else" | "enum" | "extern" | "float" | "for" | "goto" | "if"
+                | "inline" | "int" | "long" | "register" | "restrict" | "return" | "short"
+                | "signed" | "sizeof" | "static" | "struct" | "switch" | "typedef" | "union"
+                | "unsigned" | "void" | "volatile" | "while" | "_Alignas" | "_Alignof"
+                | "_Atomic" | "_Bool" | "_Complex" | "_Generic" | "_Imaginary" | "_Noreturn"
+                | "_Static_assert" | "_Thread_local"
+                // Names supplied as macros by the runtime's standard headers.
+                | "bool" | "true" | "false" | "NULL" | "EOF" | "stdin" | "stdout" | "stderr"
+                // Standard functions used by emitted control flow and closures.
+                | "abort" | "exit" | "malloc" | "free" | "fprintf" | "fputc"
+        )
+    {
+        output.insert_str(0, ESCAPE_PREFIX);
+    }
+    output
 }
 
 fn c_symbol(name: &str) -> String {
@@ -17441,7 +18218,17 @@ fn c_type_suffix(ty: &IrType) -> KuResult<String> {
         IrType::Str => Ok("str".to_string()),
         IrType::Null => Ok("null".to_string()),
         IrType::Named(name) if name == "__ku_value" => Ok("kuvalue".to_string()),
-        IrType::Named(name) if name == "__ku_time" => Ok("time".to_string()),
+        IrType::Named(name)
+            if matches!(name.as_str(), "__ku_calendar_date" | "__ku_calendar_parts") =>
+        {
+            Ok("struct___ku_object".into())
+        }
+        IrType::Named(name) if c_time_scalar_name(name) => Ok(if name == "__ku_duration" {
+            "duration"
+        } else {
+            "time"
+        }
+        .to_string()),
         IrType::Named(name) if name == "__ku_http_server" => Ok("http_server".to_string()),
         IrType::Named(name) if name == "__ku_bytes" => Ok("bytes".to_string()),
         IrType::Named(name) if pg_native_suffix(name).is_some() => {
@@ -17455,6 +18242,7 @@ fn c_type_suffix(ty: &IrType) -> KuResult<String> {
         // Stage 8a: a closure returning `Result<T>` (e.g. an HTTP handler) needs a
         // stable suffix for its ABI struct name.
         IrType::Result(inner) => Ok(format!("result_{}", c_type_suffix(inner)?)),
+        IrType::Nullable(inner) => Ok(format!("nullable_{}", c_type_suffix(inner)?)),
         IrType::Closure {
             params,
             param_modes,
@@ -17478,7 +18266,8 @@ fn unsupported(message: impl Into<String>) -> KuError {
 fn is_c_owned_type(ty: &IrType) -> bool {
     match ty {
         IrType::Str | IrType::Array(_) | IrType::Result(_) | IrType::Closure { .. } => true,
-        IrType::Named(name) => name != "__ku_time",
+        IrType::Nullable(inner) => is_c_owned_type(inner),
+        IrType::Named(name) => !c_time_scalar_name(name),
         _ => false,
     }
 }
@@ -17606,6 +18395,10 @@ fn emit_owned_cleanup(out: &mut COutput, locals: &[OwnedLocal]) -> KuResult<()> 
 fn emit_drop_expr(out: &mut COutput, ty: &IrType, expression: &str) -> KuResult<()> {
     out.check()?;
     match ty {
+        IrType::Nullable(_) => {
+            out.push_str(&format!("  {}\n", c_drop_value(ty, expression)?));
+            Ok(())
+        }
         IrType::Str => {
             out.push_str(&format!("  ku_string_drop(&{});\n", expression));
             Ok(())
@@ -17622,7 +18415,7 @@ fn emit_drop_expr(out: &mut COutput, ty: &IrType, expression: &str) -> KuResult<
             out.push_str(&format!("  ku_error_drop(&{});\n", expression));
             Ok(())
         }
-        IrType::Named(name) if name == "__ku_object" => {
+        IrType::Named(name) if c_object_type_name(name) => {
             out.push_str(&format!("  ku_object_drop({expression});\n"));
             out.push_str(&format!("  {expression} = NULL;\n"));
             Ok(())
@@ -17631,7 +18424,7 @@ fn emit_drop_expr(out: &mut COutput, ty: &IrType, expression: &str) -> KuResult<
             out.push_str(&format!("  ku_value_drop(&{expression});\n"));
             Ok(())
         }
-        IrType::Named(name) if name == "__ku_time" => Ok(()),
+        IrType::Named(name) if c_time_scalar_name(name) => Ok(()),
         // Stage 8a: the HTTP server outlives every local (freed by the accept loop,
         // or reclaimed at process exit), so a local scope drop is a no-op.
         IrType::Named(name) if name == "__ku_http_server" => Ok(()),
@@ -17677,10 +18470,11 @@ fn emit_drop_expr(out: &mut COutput, ty: &IrType, expression: &str) -> KuResult<
 /// A field whose type carries no ownership (a plain bitwise copy) needs no clone
 /// or drop.
 fn is_copy_ir_type(ty: &IrType) -> bool {
-    matches!(
-        ty,
-        IrType::Int | IrType::Float | IrType::Bool | IrType::Null
-    )
+    matches!(ty, IrType::Nullable(inner) if is_copy_ir_type(inner))
+        || matches!(
+            ty,
+            IrType::Int | IrType::Float | IrType::Bool | IrType::Null
+        )
 }
 
 fn emit_named_ownership_helpers(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
@@ -17733,10 +18527,23 @@ fn emit_struct_ownership_helper(out: &mut COutput, layout: &IrStructLayout) -> K
             continue;
         }
         let f = c_ident(&field.name);
-        clone_body.push_str(&format!(
-            " value.{f} = {};",
-            c_clone_value(&field.ty, &format!("value.{f}"))?
-        ));
+        match &field.ty {
+            // The Task-only ABI emits move/drop wrappers for nullable
+            // records. Its inline field reads still use the fallible host.
+            IrType::Nullable(inner)
+                if crate::ir::task::record_type(&IrType::Named(name.clone())) =>
+            {
+                let place = format!("value.{f}.value");
+                clone_body.push_str(&format!(
+                    " if (!value.{f}.is_null) {place} = {};",
+                    c_clone_value(inner, &place)?
+                ));
+            }
+            _ => clone_body.push_str(&format!(
+                " value.{f} = {};",
+                c_clone_value(&field.ty, &format!("value.{f}"))?
+            )),
+        }
         drop_body.push_str(&format!(
             " {}",
             c_drop_value(&field.ty, &format!("value->{f}"))?

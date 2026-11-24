@@ -185,6 +185,13 @@ impl<'a> Lexer<'a> {
                 c if is_ident_start(c) => {
                     let kind = self.identifier(c);
                     let span = Span::new(start, self.position());
+                    if matches!(&kind, TokenKind::Ident(name) if name.starts_with(crate::interop::BOUND_PREFIX))
+                    {
+                        return Err(KuError::lex(
+                            "interop binding names are internal to the compiler",
+                            span,
+                        ));
+                    }
                     tokens.push(Token::new(kind, span));
                     continue;
                 }

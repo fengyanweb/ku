@@ -14,6 +14,8 @@ const MAX_EMBEDDED_TOKENS: usize = 100_000;
 const MAX_AST_OUTPUT_BYTES: usize = 1_000_000;
 
 pub fn eval(module: &str, function: &str, args: &[Value], span: Span) -> KuResult<Option<Value>> {
+    #[cfg(feature = "browser")]
+    crate::browser::preflight_args(args, span)?;
     match (module, function) {
         ("lexer", "scan") => {
             expect_arg_count("lexer.scan", args.len(), 1, span)?;

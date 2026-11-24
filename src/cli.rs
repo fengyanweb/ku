@@ -20,6 +20,18 @@ use std::time::UNIX_EPOCH;
 
 use sha2::{Digest, Sha256};
 
+#[cfg(unix)]
+#[path = "cli_build_interrupt.rs"]
+mod build_interrupt;
+#[path = "cli_gnu_workspace.rs"]
+mod gnu_workspace;
+#[path = "cli_calendar.rs"]
+mod native_calendar;
+#[path = "cli_compression.rs"]
+mod native_compression;
+#[path = "cli_http_client.rs"]
+mod native_http_client;
+
 use crate::{
     ast::*,
     backend,
@@ -104,6 +116,13 @@ pub(crate) fn run_build_process_bounded(
     let started = Instant::now();
     let deadline = started.checked_add(timeout).unwrap_or(started);
     loop {
+        if let Err(error) = check_build_interruption() {
+            let cleanup = merge_build_cleanup(
+                process_tree.terminate(&mut child),
+                reap_build_process(&mut child),
+            );
+            return Err(with_build_cleanup_error(error, cleanup));
+        }
         match child.try_wait() {
             Ok(Some(status)) => {
                 if let Err(detail) = process_tree.terminate_descendants() {
@@ -273,6 +292,16 @@ pub(crate) fn run_build_process_capture_stdout(
     let started = Instant::now();
     let deadline = started.checked_add(timeout).unwrap_or(started);
     loop {
+        if let Err(error) = check_build_interruption() {
+            let cleanup = merge_build_cleanup(
+                merge_build_cleanup(
+                    process_tree.terminate(&mut child),
+                    reap_build_process(&mut child),
+                ),
+                receive_bounded_build_output(&capture_rx).map(|_| ()),
+            );
+            return Err(with_build_cleanup_error(error, cleanup));
+        }
         if output_limit_exceeded.load(Ordering::Acquire) {
             let cleanup = merge_build_cleanup(
                 merge_build_cleanup(
@@ -431,6 +460,7 @@ fn terminate_direct_build_child(child: &mut std::process::Child) -> Result<(), S
 fn spawn_contained_build_process(
     command: &mut Command,
 ) -> io::Result<(std::process::Child, BuildProcessTree)> {
+    check_build_interruption()?;
     #[cfg(all(test, windows))]
     let delay_before_job_attach = command.get_envs().any(|(name, value)| {
         name == "KU_TEST_DELAY_BUILD_JOB_ATTACH" && value.is_some_and(|value| value == "1")
@@ -854,7 +884,47 @@ impl BuildProcessTree {
         Err("process-tree containment is unavailable on this host".to_string())
     }
 }
+mod interop_binding;
+mod package_install;
+
 const HELP: &str = crate::cli_contract::TOP_LEVEL_HELP;
+
+fn check_build_interruption() -> io::Result<()> {
+    #[cfg(unix)]
+    if build_interrupt::received() != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "ku build interrupted",
+        ));
+    }
+    Ok(())
+}
+
+/// Runs the CLI in its own executable. Library callers keep their own signal policy.
+#[doc(hidden)]
+pub fn run_cli_process(args: Vec<String>) -> Result<(), KuError> {
+    #[cfg(unix)]
+    if args.get(1).is_some_and(|command| command == "build") {
+        let handlers = build_interrupt::BuildInterruptHandlers::install().map_err(|error| {
+            KuError::message(format!(
+                "failed to set up build interruption handling: {error}"
+            ))
+        })?;
+        let result = run_cli(args);
+        drop(handlers);
+        let signal = build_interrupt::received();
+        if signal != 0 {
+            if let Err(error) = &result {
+                if error.message.contains(BUILD_PROCESS_CLEANUP_UNCONFIRMED) {
+                    let _ = writeln!(io::stderr().lock(), "{error}");
+                }
+            }
+            build_interrupt::exit_with_signal(signal);
+        }
+        return result;
+    }
+    run_cli(args)
+}
 
 pub fn run_cli(args: Vec<String>) -> Result<(), KuError> {
     let hint = crate::cli_contract::error_hint(&args);
@@ -938,12 +1008,14 @@ fn dispatch_cli(args: Vec<String>) -> Result<(), KuError> {
             }
             Ok(())
         }
+        Some("i") => package_install::run(&args[2..]),
         Some("package") => {
             let subcommand = args
                 .get(2)
                 .map(String::as_str)
                 .ok_or_else(|| command_error("missing package command"))?;
             match subcommand {
+                "install" => package_install::run(&args[3..]),
                 "gc" => {
                     let package = package_context_arg(&args, "package gc")?;
                     let removed = package::gc_cache(&package, 64)?;
@@ -1106,6 +1178,7 @@ fn package_context_from_path(path: &Path) -> KuResult<PackageContext> {
 struct CheckOptions {
     deny_unused: bool,
     dependency_mode: DependencyResolveMode,
+    embedded_entry: bool,
 }
 
 impl Default for CheckOptions {
@@ -1113,6 +1186,7 @@ impl Default for CheckOptions {
         Self {
             deny_unused: false,
             dependency_mode: DependencyResolveMode::Update,
+            embedded_entry: false,
         }
     }
 }
@@ -1748,7 +1822,7 @@ enum BuildLockMode {
     Exclusive,
 }
 
-struct BuildFileLock {
+pub(crate) struct BuildFileLock {
     file: fs::File,
 }
 
@@ -1765,6 +1839,7 @@ fn acquire_build_file_lock_until(
 ) -> Result<BuildFileLock, KuError> {
     let file = package::open_validated_package_operation_lock_file(path)?;
     loop {
+        check_build_interruption().map_err(|error| KuError::message(error.to_string()))?;
         let result = match mode {
             BuildLockMode::Shared => file.try_lock_shared(),
             BuildLockMode::Exclusive => file.try_lock(),
@@ -1792,6 +1867,14 @@ fn acquire_build_file_lock_until(
             }
         }
     }
+}
+
+pub(crate) fn acquire_interop_artifact_lock(path: &Path) -> KuResult<BuildFileLock> {
+    acquire_build_file_lock_until(
+        path,
+        BuildLockMode::Exclusive,
+        Instant::now() + BUILD_LOCK_TIMEOUT,
+    )
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1944,7 +2027,7 @@ fn run_build_command(args: &[String]) -> Result<(), KuError> {
             let llvm_output = write_llvm_ir_artifact(&plan, options.dependency_mode)?;
             println!("llvm ir ok: {}", llvm_output.display());
             return Err(KuError::message(format!(
-                "LLVM backend does not link executables yet; wrote {}\nhelp: use `ku build` for a runnable wrapper, or `ku build --emit-llvm` when you only need text IR",
+                "LLVM backend does not link executables yet; wrote {}\nhelp: use `ku build` for a native executable, `ku build --backend runner` for the interpreter wrapper, or `ku build --emit-llvm` when you need the additional text IR artifact",
                 llvm_output.display()
             )));
         }
@@ -1959,7 +2042,7 @@ fn parse_build_options(args: &[String]) -> Result<BuildOptions, KuError> {
         output: None,
         profile: BuildProfile::Debug,
         target: None,
-        backend: BuildBackend::Runner,
+        backend: BuildBackend::C,
         emit_c: false,
         emit_ir: false,
         emit_llvm: false,
@@ -2331,12 +2414,18 @@ fn write_native_c_artifact(
 ) -> Result<PathBuf, KuError> {
     let output = plan.native_c_output.clone();
     let fs_base = native_fs_base_for_output(&plan.entry, &plan.output)?;
-    write_native_c_to(
+    let delivery = interop_binding::Delivery {
+        output_dir: link_output_directory(&plan.output),
+        matches_host: plan.target.as_ref().is_none_or(BuildTarget::matches_host),
+        needs_linked_runner: None,
+    };
+    write_native_c_for_delivery(
         &path_string(&plan.entry),
         &plan.source,
         &output,
         fs_base,
         dependency_mode,
+        Some(&delivery),
     )
 }
 
@@ -2576,7 +2665,6 @@ fn build_executable_to(
     output: &Path,
     config: RunnerBuildConfig<'_>,
 ) -> Result<PathBuf, KuError> {
-    check_source_with_dependency_mode(path, source, config.dependency_mode)?;
     validate_native_output_name(output)?;
     let output_directory = link_output_directory(output);
     fs::create_dir_all(output_directory).map_err(|err| {
@@ -2591,11 +2679,60 @@ fn build_executable_to(
         .unwrap_or_else(|_| Path::new(path).to_path_buf())
         .to_string_lossy()
         .to_string();
-    let rust_source = build_runner_source(&embedded_path, source, config.dependency_mode);
-    let temp_guard = TempBuildDir::create_private("runner").map_err(|err| {
-        KuError::message(format!("failed to create private build directory: {err}"))
-    })?;
-    let temp_dir = temp_guard.path().to_path_buf();
+    let original =
+        parse_source(source).map_err(|err| KuError::message(err.diagnostic(path, source)))?;
+    let rust_source = if program_has_imports(&original) && !program_has_only_std_imports(&original)
+    {
+        let needs_linked_runner = std::cell::Cell::new(false);
+        let delivery = interop_binding::Delivery {
+            output_dir: output_directory,
+            matches_host: config.target.is_none_or(BuildTarget::matches_host),
+            needs_linked_runner: Some(&needs_linked_runner),
+        };
+        let parsed = (|| {
+            deny_unused_imports(&original)?;
+            let program = parse_and_expand_for_delivery(
+                path,
+                source,
+                config.dependency_mode,
+                Some(&delivery),
+            )?;
+            Checker::new().check(&program)?;
+            reject_native_only_compression(&program)?;
+            Ok::<_, KuError>(program)
+        })()
+        .map_err(|err| KuError::message(err.diagnostic(path, source)))?;
+        if needs_linked_runner.get() {
+            build_linked_runner_source(&parsed, path, source)?
+        } else {
+            build_runner_source(&embedded_path, source, config.dependency_mode)
+        }
+    } else {
+        let program = checked_program_with_dependency_mode(path, source, config.dependency_mode)?;
+        reject_native_only_compression(&program)?;
+        build_runner_source(&embedded_path, source, config.dependency_mode)
+    };
+    let bundle =
+        crate::runner_bundle::RuntimeBundle::load(config.target.map(|target| target.rust_triple))?;
+    let windows_gnu = cfg!(windows) && bundle.target.ends_with("-windows-gnu");
+    let temp_guard = if windows_gnu {
+        gnu_workspace::create_ascii_temp("runner")?
+    } else {
+        TempBuildDir::create_private("runner").map_err(|err| {
+            KuError::message(format!("failed to create private build directory: {err}"))
+        })?
+    };
+    let temp_dir = temp_guard.path();
+    let gnu_output = if windows_gnu {
+        let absolute_output = std::path::absolute(temporary_output).map_err(|err| {
+            KuError::message(format!("failed to resolve the Runner output path: {err}"))
+        })?;
+        // Rustc forwards the output filename to MinGW's narrow-character
+        // linker. Keep Unicode paths on the Rust I/O side of the transaction.
+        (!absolute_output.to_str().is_some_and(str::is_ascii)).then(|| temp_dir.join("program.exe"))
+    } else {
+        None
+    };
     let runner = temp_dir.join("runner.rs");
     let mut runner_options = fs::OpenOptions::new();
     runner_options.create_new(true).write(true);
@@ -2620,8 +2757,6 @@ fn build_executable_to(
         })?;
     drop(runner_file);
 
-    let bundle =
-        crate::runner_bundle::RuntimeBundle::load(config.target.map(|target| target.rust_triple))?;
     let compiler = bundle.compiler()?;
     if bundle.mode == "source-development" {
         bundle.link_probe(&compiler)?;
@@ -2629,13 +2764,16 @@ fn build_executable_to(
     let prepared = bundle.prepare(&temp_dir.join("runtime"))?;
     let lib = &prepared.runtime;
     let mut command = compiler.command();
+    if windows_gnu {
+        gnu_workspace::configure_temp(&mut command, temp_dir);
+    }
     command
         .arg("--edition=2021")
         .arg(&runner)
         .arg("--extern")
         .arg(format!("ku={}", lib.display()))
         .arg("-o")
-        .arg(temporary_output);
+        .arg(gnu_output.as_deref().unwrap_or(temporary_output));
     crate::runner_bundle::add_search_paths(&mut command, &prepared);
     command.arg("--target").arg(&bundle.target);
     if let Some(opt_level) = config.profile.rustc_opt_level() {
@@ -2665,14 +2803,18 @@ fn build_executable_to(
             )));
         }
     };
-    temp_guard.cleanup();
     if !status.success() {
         return Err(KuError::message(format!(
             "ku build failed: rustc exited with {status}\nhelp: run `ku doctor --backend runner`; keep the compiler diagnostics above. If E0514 is reported, the bundle/compiler identities are still inconsistent; do not mix runtime files"
         )));
     }
+    if let Some(gnu_output) = &gnu_output {
+        let verified = validate_runner_output_candidate(gnu_output, config.target)?;
+        gnu_workspace::copy_output(&verified, temporary_output)?;
+    }
     let verified = validate_runner_output_candidate(temporary_output, config.target)?;
     install_verified_link_output(verified, &output_staging)?;
+    temp_guard.cleanup();
     Ok(output.to_path_buf())
 }
 
@@ -2698,21 +2840,34 @@ fn write_native_c_to(
     fs_base: backend::c::NativeFsBase,
     dependency_mode: DependencyResolveMode,
 ) -> Result<PathBuf, KuError> {
-    let program = parse_and_expand_with_dependency_mode(path, source, dependency_mode)?;
+    write_native_c_for_delivery(path, source, output, fs_base, dependency_mode, None)
+}
+
+fn write_native_c_for_delivery(
+    path: &str,
+    source: &str,
+    output: &Path,
+    fs_base: backend::c::NativeFsBase,
+    dependency_mode: DependencyResolveMode,
+    delivery: Option<&interop_binding::Delivery<'_>>,
+) -> Result<PathBuf, KuError> {
+    let program = parse_and_expand_for_delivery(path, source, dependency_mode, delivery)?;
     let native_task_entry = ir::task_lower::has_async_entry(&program);
-    Checker::new().check(&program).map_err(|err| {
-        let id = err.diagnostic_id();
-        if matches!(
-            id,
-            DiagnosticId::HttpCapturedMutation | DiagnosticId::HttpSharedCallableReassignment
-        ) {
-            KuError::message(err.diagnostic(path, source)).with_diagnostic_id(id)
-        } else {
-            // Keep unrelated native build API errors unchanged. HTTP needs
-            // the registration/assignment diagnostic at every CLI entry.
-            err
-        }
-    })?;
+    let fields = Checker::new()
+        .check_with_native_fields(&program)
+        .map_err(|err| {
+            let id = err.diagnostic_id();
+            if matches!(
+                id,
+                DiagnosticId::HttpCapturedMutation | DiagnosticId::HttpSharedCallableReassignment
+            ) {
+                KuError::message(err.diagnostic(path, source)).with_diagnostic_id(id)
+            } else {
+                // Keep unrelated native build API errors unchanged. HTTP needs
+                // the registration/assignment diagnostic at every CLI entry.
+                err
+            }
+        })?;
     let options = backend::c::CBackendOptions {
         fs_base,
         // Test-only, generation-time opt-in. This environment is read by
@@ -2729,13 +2884,14 @@ fn write_native_c_to(
     } else {
         // Preserve each async handler's real lexical capture cells before
         // replacing its setup-side body with a fatal signature placeholder.
-        let (lowered, bindings) = ir::lower_mixed_http_setup(&program)?;
+        let (lowered, bindings) = ir::lower_mixed_http_setup_with_fields(&program, fields)?;
         let optimized = ir::optimize_program(&lowered);
         if bindings.is_empty() {
             backend::c::generate_c_source_with_options(&optimized, &options)?
         } else {
-            let tasks = ir::task_lower::lower_bound_service_handlers(&program, &bindings)?;
-            backend::c::generate_mixed_http_c_source(&optimized, &tasks, &options)?
+            let tasks =
+                ir::task_lower::lower_bound_service_handlers_with_layouts(&program, &bindings)?;
+            backend::c::generate_mixed_http_task_c_source(&optimized, &tasks, &options)?
         }
     };
     write_text_artifact(output, c_source)
@@ -2771,6 +2927,11 @@ struct CSourceFeatures {
     libpq: bool,
     libmysql: bool,
     native_tls: bool,
+    native_calendar: bool,
+    native_http_client: bool,
+    zstd: bool,
+    zlib: bool,
+    interop: bool,
 }
 
 impl CSourceFeatures {
@@ -2793,6 +2954,15 @@ impl CSourceFeatures {
             native_tls: text
                 .lines()
                 .any(|line| line == "#define KU_FEATURE_NATIVE_TLS 1"),
+            native_http_client: text
+                .lines()
+                .any(|line| line == "#define KU_FEATURE_NATIVE_HTTP_CLIENT 1"),
+            native_calendar: text
+                .lines()
+                .any(|line| line == "#define KU_FEATURE_NATIVE_CALENDAR 1"),
+            zstd: text.lines().any(|line| line == "#define KU_FEATURE_ZSTD 1"),
+            zlib: text.lines().any(|line| line == "#define KU_FEATURE_ZLIB 1"),
+            interop: text.lines().any(|line| line == "#define KU_INTEROP_HOST 1"),
         })
     }
 }
@@ -3590,6 +3760,22 @@ impl NativeTlsPack {
     }
 }
 
+/// Default native packs belong to the installed executable, not the directory
+/// containing a launcher symlink (for example ~/.cargo/bin/ku on macOS).
+/// Explicit pack overrides never use this fallback or require a resolvable CLI.
+fn native_pack_root_beside(executable: &Path, namespace: &str) -> Result<PathBuf, KuError> {
+    let executable = fs::canonicalize(executable).map_err(|error| {
+        KuError::message(format!(
+            "failed to resolve Ku executable '{}' for native SDK pack discovery: {error}",
+            executable.display()
+        ))
+    })?;
+    let directory = executable
+        .parent()
+        .ok_or_else(|| KuError::message("Ku executable has no parent for native SDK lookup"))?;
+    Ok(directory.join(namespace).join("v1"))
+}
+
 fn resolve_native_tls_pack_root(
     configured: Option<OsString>,
 ) -> Result<NativeTlsPackRoot, KuError> {
@@ -3619,10 +3805,7 @@ fn resolve_native_tls_pack_root_from(
         }
         path
     } else {
-        let parent = executable.parent().ok_or_else(|| {
-            KuError::message("the Ku executable has no parent directory for native TLS discovery")
-        })?;
-        parent.join("native-tls").join("v1")
+        native_pack_root_beside(executable, "native-tls")?
     };
     let canonical = fs::canonicalize(&requested).map_err(|error| {
         KuError::message(format!(
@@ -5507,7 +5690,14 @@ fn verify_native_binary_dynamic_dependencies_file(
     libpq_requirement: Option<&LibpqRuntimeDependency>,
     mysql_requirement: Option<&MysqlRuntimeDependency>,
 ) -> Result<(), String> {
-    if !features.libpq && !features.libmysql && !features.native_tls {
+    if !features.libpq
+        && !features.libmysql
+        && !features.native_tls
+        && !features.native_calendar
+        && !features.native_http_client
+        && !features.zstd
+        && !features.zlib
+    {
         return Ok(());
     }
     let names = match target.binary_format {
@@ -5532,6 +5722,29 @@ fn verify_native_binary_dynamic_dependencies_file(
     {
         return Err(
             "linked output records a dynamic ku-native-tls dependency; the v1 contract requires the verified static archive"
+                .to_string(),
+        );
+    }
+    if features.native_calendar
+        && names
+            .iter()
+            .any(|name| dynamic_dependency_is_native_calendar_library(name))
+    {
+        return Err("linked output records a dynamic native calendar dependency; the calendar contract requires the verified static archive".into());
+    }
+    if features.native_http_client
+        && names
+            .iter()
+            .any(|name| dynamic_dependency_is_native_http_client_library(name))
+    {
+        return Err("linked output records a dynamic native HTTP client dependency; the HTTP client contract requires the verified static archive".into());
+    }
+    if names
+        .iter()
+        .any(|name| dynamic_dependency_is_compression_library(name, features.zstd, features.zlib))
+    {
+        return Err(
+            "linked output records a dynamic zstd/zlib dependency; native compression requires the verified static codec archive (target CRT dependencies remain permitted)"
                 .to_string(),
         );
     }
@@ -5629,6 +5842,77 @@ fn dynamic_dependency_is_native_tls_library(name: &[u8]) -> bool {
             || lower
                 .windows(b"ku-native-tls".len())
                 .any(|window| window == b"ku-native-tls"))
+}
+
+fn dynamic_dependency_is_native_calendar_library(name: &[u8]) -> bool {
+    let name = name
+        .rsplit(|byte| matches!(byte, b'/' | b'\\'))
+        .next()
+        .unwrap_or(name);
+    let lower = name.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
+    let dynamic_suffix = lower.ends_with(b".dll")
+        || lower.ends_with(b".dylib")
+        || lower.ends_with(b".so")
+        || lower.windows(4).any(|window| window == b".so.");
+    dynamic_suffix
+        && (lower
+            .windows(b"ku_native_calendar".len())
+            .any(|window| window == b"ku_native_calendar")
+            || lower
+                .windows(b"ku-native-calendar".len())
+                .any(|window| window == b"ku-native-calendar"))
+}
+
+fn dynamic_dependency_is_native_http_client_library(name: &[u8]) -> bool {
+    let name = name
+        .rsplit(|byte| matches!(byte, b'/' | b'\\'))
+        .next()
+        .unwrap_or(name);
+    let lower = name.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
+    let dynamic_suffix = lower.ends_with(b".dll")
+        || lower.ends_with(b".dylib")
+        || lower.ends_with(b".so")
+        || lower.windows(4).any(|window| window == b".so.");
+    dynamic_suffix
+        && (lower
+            .windows(b"ku_native_http_client".len())
+            .any(|window| window == b"ku_native_http_client")
+            || lower
+                .windows(b"ku-native-http-client".len())
+                .any(|window| window == b"ku-native-http-client"))
+}
+
+fn dynamic_dependency_is_compression_library(name: &[u8], zstd: bool, zlib: bool) -> bool {
+    let basename = name
+        .rsplit(|byte| matches!(byte, b'/' | b'\\'))
+        .next()
+        .unwrap_or(name);
+    let lower = basename
+        .iter()
+        .map(u8::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    let stem = if let Some(stem) = lower.strip_suffix(b".dll") {
+        stem
+    } else if let Some(stem) = lower.strip_suffix(b".dylib") {
+        stem
+    } else if let Some(index) = lower.windows(3).position(|part| part == b".so") {
+        if index + 3 != lower.len() && lower.get(index + 3) != Some(&b'.') {
+            return false;
+        }
+        &lower[..index]
+    } else {
+        return false;
+    };
+    let family = |prefix: &[u8], numbered: bool| {
+        stem == prefix
+            || stem.strip_prefix(prefix).is_some_and(|tail| {
+                tail.first().is_some_and(|byte| {
+                    matches!(*byte, b'.' | b'-') || (numbered && byte.is_ascii_digit())
+                })
+            })
+    };
+    (zstd && (family(b"zstd", true) || family(b"libzstd", true)))
+        || (zlib && (family(b"zlib", true) || family(b"libz", false) || stem == b"zlibwapi"))
 }
 
 fn dynamic_dependency_matches_selected_loader(
@@ -6724,6 +7008,7 @@ fn install_verified_link_output(
     // outputs use hard-link create-if-absent before unlinking the staging name.
     // Never delete a previous output as a fallback: a failed install must leave
     // the last verified artifact intact.
+    check_build_interruption().map_err(|error| KuError::message(error.to_string()))?;
     replace_link_output_atomically(
         &verified.path,
         &staging.output,
@@ -6858,6 +7143,9 @@ fn compile_c_source_with_output(
     let features = CSourceFeatures::inspect(source)?;
     validate_c_target_features(features, target)?;
     let needs_native_tls = features.native_tls;
+    let needs_compression = features.zstd || features.zlib;
+    let needs_calendar = features.native_calendar;
+    let needs_http_client = features.native_http_client;
     validate_native_tls_link_mode(needs_native_tls, static_link)?;
     let native_tls_root = needs_native_tls
         .then(|| resolve_native_tls_pack_root(env::var_os("KU_NATIVE_TLS_PACK")))
@@ -6956,8 +7244,18 @@ fn compile_c_source_with_output(
             && candidate.kind == CCompilerKind::Clang;
         let needs_native_tls_probe = needs_native_tls
             && (target.is_none() || candidate.kind == CCompilerKind::Preconfigured);
+        let needs_compression_probe = (needs_compression || needs_calendar || needs_http_client)
+            && (target.is_none() || candidate.kind == CCompilerKind::Preconfigured);
+        // Even Hello can inherit a POSIX MinGW runtime DLL without a native
+        // Rust pack. Determine the actual compiler ABI before
+        // choosing its default runtime link mode; executable names can lie.
+        let needs_windows_runtime_probe =
+            target_is_windows && candidate.kind != CCompilerKind::ZigCc;
         let probed_compiler_target = if declared_target.is_none()
-            && (needs_database_clang_probe || needs_native_tls_probe)
+            && (needs_database_clang_probe
+                || needs_native_tls_probe
+                || needs_compression_probe
+                || needs_windows_runtime_probe)
         {
             match probe_clang_default_target(&candidate, link_deadline) {
                 Ok(target) => Some(target),
@@ -6968,22 +7266,100 @@ fn compile_c_source_with_output(
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     if candidate.explicitly_configured {
-                        return Err(KuError::message(format!(
-                            "failed to run configured C compiler '{}' target probe: {error}",
-                            candidate.label
-                        )));
+                        return Err(configured_c_compiler_target_probe_error(&candidate, &error));
                     }
                     continue;
                 }
                 Err(error) => {
                     if candidate.explicitly_configured {
-                        return Err(KuError::message(format!(
-                            "failed to determine configured C compiler '{}' target: {error}",
-                            candidate.label
-                        )));
+                        return Err(configured_c_compiler_target_probe_error(&candidate, &error));
                     }
                     compiler_failures
                         .push(format!("{} target probe failed: {error}", candidate.label));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let injected_native_target = if target.is_some() && declared_target.is_none() {
+            native_output_target
+                .as_ref()
+                .and_then(|output_target| match candidate.kind {
+                    CCompilerKind::Clang => Some(output_target.rust_triple),
+                    CCompilerKind::ZigCc => Some(output_target.c_triple),
+                    CCompilerKind::Preconfigured => None,
+                })
+        } else {
+            None
+        };
+        let effective_native_target = declared_target
+            .or(injected_native_target)
+            .or(probed_compiler_target.as_deref());
+        let compression_inputs = if needs_compression {
+            let output_target = native_output_target
+                .as_ref()
+                .expect("supported native compression output has a validated target");
+            let resolved = native_compression::compiler_target(
+                output_target,
+                effective_native_target,
+                &candidate.label,
+            )
+            .and_then(|selected| {
+                native_compression::validate_link_mode(true, &selected, static_link)?;
+                native_compression::resolve(&selected, features.zstd, features.zlib)
+            });
+            match resolved {
+                Ok(inputs) => Some(inputs),
+                Err(error) => {
+                    if candidate.explicitly_configured {
+                        return Err(error);
+                    }
+                    compiler_failures.push(format!("{}: {error}", candidate.label));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let staged_calendar = if needs_calendar {
+            let resolved = native_compression::compiler_target(
+                native_output_target
+                    .as_ref()
+                    .expect("validated calendar target"),
+                effective_native_target,
+                &candidate.label,
+            )
+            .and_then(|selected| native_calendar::resolve(&selected, static_link));
+            match resolved {
+                Ok(pack) => Some(pack),
+                Err(error) => {
+                    if candidate.explicitly_configured {
+                        return Err(error);
+                    }
+                    compiler_failures.push(format!("{}: {error}", candidate.label));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let staged_http_client = if needs_http_client {
+            let resolved = native_compression::compiler_target(
+                native_output_target
+                    .as_ref()
+                    .expect("validated HTTP client target"),
+                effective_native_target,
+                &candidate.label,
+            )
+            .and_then(|selected| native_http_client::resolve(&selected, static_link));
+            match resolved {
+                Ok(pack) => Some(pack),
+                Err(error) => {
+                    if candidate.explicitly_configured {
+                        return Err(error);
+                    }
+                    compiler_failures.push(format!("{}: {error}", candidate.label));
                     continue;
                 }
             }
@@ -7125,6 +7501,12 @@ fn compile_c_source_with_output(
             .as_ref()
             .map(NativeTlsPack::stage_for_link)
             .transpose()?;
+        // Keep the private header tree and every opened archive alive until
+        // the compiler has terminated (including failure/timeout cleanup).
+        let staged_compression = compression_inputs
+            .as_ref()
+            .map(native_compression::CompressionInputs::stage_for_link)
+            .transpose()?;
         let mysql_requirement = libmysql_library
             .as_ref()
             .map(|library| {
@@ -7138,10 +7520,45 @@ fn compile_c_source_with_output(
         // starts from a fresh staging path and can never touch the old output.
         let output_staging = LinkOutputStaging::create(output)?;
         let temporary_output = output_staging.path();
+        let mut tool_workspace = if cfg!(windows)
+            && target_is_windows
+            && (cfg!(target_env = "gnu")
+                || compiler_uses_windows_mingw_abi(&candidate)
+                || effective_native_target.is_some_and(|target| {
+                    target.contains("windows-gnu") || target.contains("mingw")
+                })) {
+            Some(gnu_workspace::Workspace::create()?)
+        } else {
+            None
+        };
+        let compiler_source = if let Some(workspace) = &mut tool_workspace {
+            workspace.source(source)?
+        } else {
+            source.to_path_buf()
+        };
+        let compiler_output = tool_workspace.as_ref().map_or_else(
+            || temporary_output.to_path_buf(),
+            |workspace| workspace.output_argument(),
+        );
+        let compiler_includes = staged_compression
+            .as_ref()
+            .map_or(&[][..], |inputs| inputs.include_dirs.as_slice());
+        let compiler_includes = if let Some(workspace) = &mut tool_workspace {
+            compiler_includes
+                .iter()
+                .map(|path| workspace.include(path))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            compiler_includes.to_vec()
+        };
+        let compiler_mysql_header =
+            if let (Some(workspace), Some(header)) = (&mut tool_workspace, &libmysql_include) {
+                Some(workspace.mysql_headers(header)?)
+            } else {
+                libmysql_include.clone()
+            };
         let mut command = Command::new(&candidate.program);
-        for arg in &candidate.args {
-            command.arg(arg);
-        }
+        add_c_compiler_arguments(&mut command, &candidate.args, &compiler_includes);
         for argument in target_arguments {
             command.arg(argument);
         }
@@ -7150,17 +7567,22 @@ fn compile_c_source_with_output(
                 command.arg(format!("--target={probed_target}"));
             }
         }
-        let compiler_output = temporary_output;
-        command
-            .arg(source)
-            .arg("-std=c11")
-            .arg("-o")
-            .arg(compiler_output);
+        add_gnu_c_source_and_output(&mut command, &compiler_source, &compiler_output);
+        if let Some(workspace) = &tool_workspace {
+            workspace.configure(&mut command);
+        }
         if needs_native_tls {
             command.arg("-DKU_NATIVE_TLS_ENABLED=1");
         }
+        let msvc_dynamic_crt = staged_calendar.as_ref().is_some_and(|pack| pack.msvc)
+            || staged_http_client.as_ref().is_some_and(|pack| pack.msvc)
+            || compression_inputs.as_ref().and_then(|inputs| inputs.abi) == Some("msvc")
+            || native_tls_pack
+                .as_ref()
+                .is_some_and(|pack| pack.contract.crt == "msvc-dynamic");
+        add_gnu_msvc_dynamic_crt(&mut command, msvc_dynamic_crt);
         if needs_libmysql {
-            let header = libmysql_include
+            let header = compiler_mysql_header
                 .as_ref()
                 .expect("std.mysql requires an exact selected development header");
             let family = mysql_requirement
@@ -7172,9 +7594,12 @@ fn compile_c_source_with_output(
         if let Some(opt_level) = profile.rustc_opt_level() {
             command.arg(format!("-O{opt_level}"));
         }
-        if static_link {
-            command.arg("-static");
-        }
+        add_gnu_runtime_link_mode(
+            &mut command,
+            candidate.kind,
+            effective_native_target,
+            static_link,
+        );
         if needs_winsock {
             command.arg("-lws2_32");
         }
@@ -7185,16 +7610,55 @@ fn compile_c_source_with_output(
             let library = staged_libpq_library
                 .as_ref()
                 .expect("a PG compiler candidate has a private libpq link copy");
-            command.arg(strip_verbatim(library.path()));
+            command.arg(gnu_workspace::library_argument(
+                tool_workspace.as_mut(),
+                library,
+            )?);
         }
         if needs_libmysql {
             if let Some(library) = &staged_libmysql_library {
-                command.arg(strip_verbatim(library.path()));
+                command.arg(gnu_workspace::library_argument(
+                    tool_workspace.as_mut(),
+                    library,
+                )?);
             }
         }
         if let Some(pack) = &staged_native_tls_pack {
-            command.arg(strip_verbatim(pack.archive.path()));
-            for library in pack.contract.native_libraries {
+            command.arg(gnu_workspace::library_argument(
+                tool_workspace.as_mut(),
+                &pack.archive,
+            )?);
+            add_gnu_native_tls_libraries(&mut command, pack.contract);
+        }
+        if let Some(compression) = &staged_compression {
+            for archive in &compression.archives {
+                command.arg(gnu_workspace::library_argument(
+                    tool_workspace.as_mut(),
+                    archive,
+                )?);
+            }
+        }
+        if let Some(calendar) = &staged_calendar {
+            command.arg(gnu_workspace::library_argument(
+                tool_workspace.as_mut(),
+                &calendar.archive,
+            )?);
+            for library in &calendar.libraries {
+                if calendar.msvc {
+                    command.arg("-Xlinker");
+                }
+                command.arg(library);
+            }
+        }
+        if let Some(http_client) = &staged_http_client {
+            command.arg(gnu_workspace::library_argument(
+                tool_workspace.as_mut(),
+                &http_client.archive,
+            )?);
+            for library in &http_client.libraries {
+                if http_client.msvc {
+                    command.arg("-Xlinker");
+                }
                 command.arg(library);
             }
         }
@@ -7212,8 +7676,12 @@ fn compile_c_source_with_output(
         }
         match run_build_process_bounded(&mut command, compiler_timeout) {
             Ok(status) if status.success() => {
-                let verified = match validate_link_output_candidate(
-                    temporary_output,
+                let compiler_artifact = tool_workspace.as_ref().map_or_else(
+                    || temporary_output.to_path_buf(),
+                    |workspace| workspace.output_file(),
+                );
+                let mut verified = match validate_link_output_candidate(
+                    &compiler_artifact,
                     source,
                     target,
                     &candidate.label,
@@ -7230,6 +7698,27 @@ fn compile_c_source_with_output(
                         continue;
                     }
                 };
+                if tool_workspace.is_some() {
+                    // A different tool volume never participates in the final
+                    // rename. Unicode-capable Rust I/O copies into the original
+                    // same-volume transaction, which is checked again before
+                    // the existing destination snapshot/atomic install path.
+                    gnu_workspace::copy_output(&verified, temporary_output)?;
+                    verified = validate_link_output_candidate(
+                        temporary_output,
+                        source,
+                        target,
+                        &candidate.label,
+                        features,
+                        libpq_requirement.as_ref(),
+                        mysql_requirement.as_ref(),
+                    )?;
+                }
+                if candidate.kind != CCompilerKind::ZigCc
+                    && effective_native_target.is_some_and(crate::interop::gnu_paths::is_target)
+                {
+                    interop_binding::publish_gnu_runtime_notice(output, features.interop)?;
+                }
                 install_verified_link_output(verified, &output_staging)?;
                 return Ok(());
             }
@@ -7338,6 +7827,30 @@ fn compile_c_source_with_output(
                     .as_ref()
                     .map(NativeTlsPack::stage_for_link)
                     .transpose()?;
+                let msvc_compression_inputs = if needs_compression {
+                    let selected = native_compression::compiler_target(
+                        native_output_target.as_ref().expect("validated MSVC output target"),
+                        Some("x86_64-pc-windows-msvc"), "cl (MSVC)",
+                    )?;
+                    native_compression::validate_link_mode(true, &selected, static_link)?;
+                    Some(native_compression::resolve(&selected, features.zstd, features.zlib)?)
+                } else { None };
+                let staged_msvc_compression = msvc_compression_inputs.as_ref()
+                    .map(native_compression::CompressionInputs::stage_for_link).transpose()?;
+                let staged_msvc_calendar = if needs_calendar {
+                    let selected = native_compression::compiler_target(
+                        native_output_target.as_ref().expect("validated MSVC calendar target"),
+                        Some("x86_64-pc-windows-msvc"), "cl (MSVC)",
+                    )?;
+                    Some(native_calendar::resolve(&selected, static_link)?)
+                } else { None };
+                let staged_msvc_http_client = if needs_http_client {
+                    let selected = native_compression::compiler_target(
+                        native_output_target.as_ref().expect("validated MSVC HTTP client target"),
+                        Some("x86_64-pc-windows-msvc"), "cl (MSVC)",
+                    )?;
+                    Some(native_http_client::resolve(&selected, static_link)?)
+                } else { None };
                 let libpq_requirement = msvc_libpq_library
                     .as_ref()
                     .map(|library| {
@@ -7371,6 +7884,9 @@ fn compile_c_source_with_output(
                                 native_libraries: pack.contract.native_libraries,
                             }
                         }),
+                        compression: staged_msvc_compression.as_ref(),
+                        calendar: staged_msvc_calendar.as_ref(),
+                        http_client: staged_msvc_http_client.as_ref(),
                     },
                     MsvcCompileOptions {
                         quiet_stdout,
@@ -7439,6 +7955,55 @@ fn compile_c_source_with_output(
     )))
 }
 
+fn add_gnu_runtime_link_mode(
+    command: &mut Command,
+    compiler: CCompilerKind,
+    actual_target: Option<&str>,
+    explicit_static: bool,
+) {
+    let windows_gnu = actual_target.is_some_and(|target| {
+        let target = target.to_ascii_lowercase();
+        target.ends_with("-windows-gnu")
+            || target.ends_with("-mingw32")
+            || target.ends_with("-mingw64")
+    });
+    // MinGW's ordinary C executable otherwise imports toolchain-private
+    // libwinpthread even without a Rust pack. Statically resolve its GNU
+    // runtime while retaining Windows OS imports and explicitly supplied DLL
+    // import archives. This does not change Rust panic/unwind or the C ABI.
+    // Zig owns a different runtime and must not inherit GCC's policy.
+    if explicit_static || (windows_gnu && compiler != CCompilerKind::ZigCc) {
+        command.arg("-static");
+    }
+}
+
+fn add_gnu_msvc_dynamic_crt(command: &mut Command, required: bool) {
+    if required {
+        // The GNU-style clang MSVC driver in supported LLVM versions injects
+        // libcmt at link time even when -fms-runtime-lib=dll sets /MD macros
+        // and object directives. Select the pack's CRT at both stages; mixing
+        // static UCRT objects and imported /MD symbols is not a valid fallback.
+        command.args([
+            "-fms-runtime-lib=dll",
+            "-Xlinker",
+            "/NODEFAULTLIB:libcmt",
+            "-Xlinker",
+            "/DEFAULTLIB:msvcrt",
+        ]);
+    }
+}
+
+fn add_gnu_native_tls_libraries(command: &mut Command, contract: NativeTlsLinkContract) {
+    for library in contract.native_libraries {
+        // MSVC system-library names must reach the linker, which searches the
+        // SDK library paths. Clang treats a bare .lib as an input file instead.
+        if contract.flavor == "msvc" {
+            command.arg("-Xlinker");
+        }
+        command.arg(library);
+    }
+}
+
 fn c_compiler_supports_explicit_target(
     candidate: &CCompilerCandidate,
     target: &BuildTarget,
@@ -7446,6 +8011,57 @@ fn c_compiler_supports_explicit_target(
     target.matches_host()
         || candidate.kind != CCompilerKind::Preconfigured
         || candidate.explicitly_configured
+}
+
+fn add_gnu_c_source_and_output(command: &mut Command, source: &Path, output: &Path) {
+    // GCC's cc1 does not accept Rust's Windows verbatim paths, even though
+    // CreateProcess accepts them. Use the same external-tool path form as
+    // pinned headers, archives and the MSVC path already use.
+    command
+        .arg(strip_verbatim(source))
+        .arg("-std=c11")
+        .arg("-o")
+        .arg(strip_verbatim(output));
+}
+
+fn add_c_compiler_arguments(
+    command: &mut Command,
+    arguments: &[String],
+    codec_includes: &[PathBuf],
+) {
+    if codec_includes.is_empty() {
+        command.args(arguments);
+        return;
+    }
+    // Keep compiler-wrapper/subcommand prefixes (e.g. `zig cc`, `ccache clang`)
+    // in place. Only ordinary -I search options move behind pinned headers.
+    let mut includes = Vec::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        if matches!(argument.as_str(), "-Xclang" | "-Xpreprocessor") {
+            command.arg(argument);
+            index += 1;
+            if let Some(next) = arguments.get(index) {
+                command.arg(next);
+            }
+        } else if argument == "-I" {
+            includes.push(argument);
+            index += 1;
+            if let Some(directory) = arguments.get(index) {
+                includes.push(directory);
+            }
+        } else if argument.starts_with("-I") {
+            includes.push(argument);
+        } else {
+            command.arg(argument);
+        }
+        index += 1;
+    }
+    for include in codec_includes {
+        command.arg("-I").arg(strip_verbatim(include));
+    }
+    command.args(includes);
 }
 
 fn compiler_declared_target(candidate: &CCompilerCandidate) -> Result<Option<&str>, KuError> {
@@ -7510,6 +8126,16 @@ fn compiler_target_matches_build(value: &str, target: &BuildTarget) -> bool {
         }
     };
     architecture_matches && operating_system_matches
+}
+
+fn configured_c_compiler_target_probe_error(
+    candidate: &CCompilerCandidate,
+    error: &io::Error,
+) -> KuError {
+    KuError::message(format!(
+        "failed to determine configured C compiler '{}' target: {error}\nhelp: set KU_CC to a working C compiler, or unset it for automatic detection",
+        candidate.label
+    ))
 }
 
 fn probe_clang_default_target(
@@ -7651,6 +8277,9 @@ struct MsvcDatabaseLinks<'a> {
     libmysql_header: Option<&'a MysqlHeaderSelection>,
     libmysql_family: Option<MysqlClientFamily>,
     native_tls: Option<MsvcNativeTlsLink<'a>>,
+    compression: Option<&'a native_compression::StagedCompressionInputs>,
+    calendar: Option<&'a native_calendar::StagedCalendarInputs>,
+    http_client: Option<&'a native_http_client::StagedHttpClientInputs>,
 }
 
 #[derive(Clone, Copy)]
@@ -7699,12 +8328,21 @@ fn compile_with_msvc(
     if let Some(opt) = options.profile.msvc_opt_flag() {
         command.arg(opt);
     }
-    if database.native_tls.is_some() {
-        // ku-native-tls is built against the dynamic MSVC CRT. Make the
+    if database.native_tls.is_some()
+        || database.compression.is_some()
+        || database.calendar.is_some()
+        || database.http_client.is_some()
+    {
+        // Verified native packs are built against the dynamic MSVC CRT. Make the
         // choice explicit so a project-wide default cannot silently mix CRTs.
         command.arg("/MD");
     } else if options.static_link {
         command.arg("/MT");
+    }
+    if let Some(compression) = database.compression {
+        for include in &compression.include_dirs {
+            command.arg("/I").arg(strip_verbatim(include));
+        }
     }
     match (database.libmysql_header, database.libmysql_family) {
         (Some(header), Some(family)) => {
@@ -7735,7 +8373,13 @@ fn compile_with_msvc(
     command.arg(format!("/Fo:{}", obj.display()));
     // Keep a single `/link` boundary: every following argument is consumed by
     // link.exe, so emitting another `/link` for a second database is invalid.
-    if database.libpq.is_some() || database.libmysql.is_some() || database.native_tls.is_some() {
+    if database.libpq.is_some()
+        || database.libmysql.is_some()
+        || database.native_tls.is_some()
+        || database.compression.is_some()
+        || database.calendar.is_some()
+        || database.http_client.is_some()
+    {
         command.arg("/link");
         if let Some(library) = database.libpq {
             command.arg(strip_verbatim(library));
@@ -7760,9 +8404,38 @@ fn compile_with_msvc(
                 command.arg(library);
             }
         }
+        if let Some(calendar) = database.calendar {
+            command.arg(strip_verbatim(calendar.archive.path()));
+            for library in &calendar.libraries {
+                command.arg(library);
+            }
+        }
+        if let Some(http_client) = database.http_client {
+            command.arg(strip_verbatim(http_client.archive.path()));
+            for library in &http_client.libraries {
+                command.arg(library);
+            }
+        }
+        if let Some(compression) = database.compression {
+            for archive in &compression.archives {
+                if !path_is_plain_regular_file(archive.path()) {
+                    return Err(KuError::message(
+                        "private compression archive changed before MSVC linking",
+                    ));
+                }
+                command.arg(strip_verbatim(archive.path()));
+            }
+        }
     }
     if options.verbose {
         println!("msvc: {} (env from {})", cl.display(), vcvars.display());
+        // Printing Command itself would also expose the explicitly restored
+        // vcvars environment. The reproducible compiler argv is sufficient.
+        println!(
+            "c compiler command: {:?} {:?}",
+            command.get_program(),
+            command.get_args().collect::<Vec<_>>()
+        );
     }
 
     let timeout = remaining_build_phase_timeout(
@@ -8074,9 +8747,14 @@ impl TempBuildDir {
     }
 
     pub(crate) fn create_private(label: &str) -> io::Result<Self> {
+        Self::create_private_in(&env::temp_dir(), label)
+    }
+
+    fn create_private_in(parent: &Path, label: &str) -> io::Result<Self> {
         const MAX_ATTEMPTS: usize = 8;
         for _ in 0..MAX_ATTEMPTS {
-            let path = unique_build_tool_path(label, "dir")?;
+            let name = unique_build_tool_path(label, "dir")?;
+            let path = parent.join(name.file_name().expect("generated temporary name"));
             #[cfg(unix)]
             let builder = {
                 use std::os::unix::fs::DirBuilderExt;
@@ -8122,8 +8800,61 @@ fn build_runner_source(path: &str, source: &str, dependency_mode: DependencyReso
         DependencyResolveMode::Offline => "Offline",
     };
     format!(
-        "const SOURCE: &str = {literal};\nfn main() {{\n    if let Err(err) = ku::cli::run_source_with_dependency_mode(\n        {path:?},\n        SOURCE,\n        ku::package::DependencyResolveMode::{dependency_mode},\n    ) {{\n        eprintln!(\"{{err}}\");\n        std::process::exit(1);\n    }}\n}}\n"
+        "const SOURCE: &str = {literal};\nfn main() {{\n    if let Err(err) = ku::cli::run_embedded_runner_source(\n        {path:?},\n        SOURCE,\n        ku::package::DependencyResolveMode::{dependency_mode},\n    ) {{\n        eprintln!(\"{{err}}\");\n        std::process::exit(1);\n    }}\n}}\n"
     )
+}
+
+fn build_linked_runner_source(program: &Program, path: &str, source: &str) -> KuResult<String> {
+    let serialized = serde_json::to_string(program)
+        .map_err(|error| KuError::message(format!("cannot package resolved project: {error}")))?;
+    if serialized.len() > MAX_LINKED_PROGRAM_BYTES {
+        return Err(KuError::message(
+            "resolved project exceeds the Runner payload limit",
+        ));
+    }
+    let payload = raw_string_literal(&serialized);
+    let diagnostic_source = raw_string_literal(source);
+    let file = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("main.ku");
+    Ok(format!(
+        "fn main() {{\n    if let Err(error) = ku::cli::run_linked_project({payload}, {file:?}, {diagnostic_source}) {{\n        eprintln!(\"{{error}}\");\n        std::process::exit(1);\n    }}\n}}\n"
+    ))
+}
+
+const MAX_LINKED_PROGRAM_BYTES: usize = 128 * 1024 * 1024;
+
+#[doc(hidden)]
+pub fn run_linked_project(payload: &'static str, file: &str, source: &str) -> KuResult<()> {
+    let exe = env::current_exe().map_err(|error| {
+        KuError::message(format!(
+            "could not locate linked project executable: {error}"
+        ))
+    })?;
+    let base = exe
+        .parent()
+        .ok_or_else(|| KuError::message("missing linked project directory"))?;
+    if payload.len() > MAX_LINKED_PROGRAM_BYTES {
+        return Err(KuError::message(
+            "resolved project exceeds the Runner payload limit",
+        ));
+    }
+    run_with_interpreter_stack(base.to_path_buf(), move || {
+        use serde::Deserialize;
+        let mut decoder = serde_json::Deserializer::from_str(payload);
+        // The payload is the checker's finite, compiler-authored AST, with
+        // a source expansion budget. Decode on the interpreter's stack.
+        decoder.disable_recursion_limit();
+        let program = Program::deserialize(&mut decoder).map_err(|error| {
+            KuError::message(format!("cannot restore packaged project: {error}"))
+        })?;
+        decoder.end().map_err(|error| {
+            KuError::message(format!("unexpected packaged project data: {error}"))
+        })?;
+        Ok(program)
+    })
+    .map_err(|error| KuError::message(error.diagnostic(file, source)))
 }
 
 fn raw_string_literal(source: &str) -> String {
@@ -8256,17 +8987,65 @@ pub fn run_source_with_dependency_mode(
     dependency_mode: DependencyResolveMode,
 ) -> Result<(), KuError> {
     let program = checked_program_with_dependency_mode(file, source, dependency_mode)?;
+    run_checked_source(file, source, program)
+}
+
+#[doc(hidden)]
+pub fn run_embedded_runner_source(
+    file: &str,
+    source: &str,
+    dependency_mode: DependencyResolveMode,
+) -> Result<(), KuError> {
+    let program = parse_and_check_with_options(
+        file,
+        source,
+        CheckOptions {
+            dependency_mode,
+            embedded_entry: true,
+            ..CheckOptions::default()
+        },
+    )
+    .map_err(|err| KuError::message(err.diagnostic(file, source)))?;
+    run_checked_source(file, source, program)
+}
+
+fn run_checked_source(file: &str, source: &str, program: Program) -> Result<(), KuError> {
+    reject_native_only_compression(&program)?;
     run_program_with_stack(program, source_base_dir(file))
         .map_err(|err| KuError::message(err.diagnostic(file, source)))
 }
 
+fn reject_native_only_compression(program: &Program) -> Result<(), KuError> {
+    // The module loader already registers the complete dependency closure.
+    // Inspect its capability markers instead of rescanning function ASTs.
+    if let Some(module) = program.items.iter().find_map(|item| match item {
+        Item::Module(module) => module
+            .name
+            .strip_prefix("std:")
+            .filter(|module| matches!(*module, "zstd" | "gzip" | "deflate")),
+        _ => None,
+    }) {
+        return Err(KuError::message(format!(
+            "std.{module} currently requires native C; the interpreter/runner does not implement this module\nhelp: use `ku build --backend c` and run the generated executable"
+        )));
+    }
+    Ok(())
+}
+
 fn run_program_with_stack(program: Program, base_dir: PathBuf) -> Result<(), KuError> {
+    run_with_interpreter_stack(base_dir, move || Ok(program))
+}
+
+fn run_with_interpreter_stack(
+    base_dir: PathBuf,
+    load: impl FnOnce() -> KuResult<Program> + Send + 'static,
+) -> KuResult<()> {
     thread::Builder::new()
         .name("ku-interpreter".to_string())
         .stack_size(INTERPRETER_STACK_SIZE)
         .spawn(move || {
-            let mut interpreter = Interpreter::with_base_dir(base_dir);
-            interpreter.run(program)
+            let mut interpreter = Interpreter::with_checked_base_dir(base_dir);
+            interpreter.run(load()?)
         })
         .map_err(|err| KuError::message(format!("failed to start interpreter: {err}")))?
         .join()
@@ -8312,7 +9091,13 @@ fn parse_and_check_with_options(
 ) -> Result<Program, KuError> {
     let original = parse_source(source)?;
     deny_unused_imports(&original)?;
-    let program = parse_and_expand_with_dependency_mode(file, source, options.dependency_mode)?;
+    let program = expand_source(
+        file,
+        source,
+        options.dependency_mode,
+        options.embedded_entry,
+        None,
+    )?;
     Checker::new().check(&program)?;
     if options.deny_unused {
         deny_unused_local_bindings(&program)?;
@@ -9017,20 +9802,45 @@ fn parse_and_expand_with_dependency_mode(
     source: &str,
     dependency_mode: DependencyResolveMode,
 ) -> Result<Program, KuError> {
+    parse_and_expand_for_delivery(file, source, dependency_mode, None)
+}
+
+fn parse_and_expand_for_delivery(
+    file: &str,
+    source: &str,
+    dependency_mode: DependencyResolveMode,
+    delivery: Option<&interop_binding::Delivery<'_>>,
+) -> Result<Program, KuError> {
+    expand_source(file, source, dependency_mode, false, delivery)
+}
+
+fn expand_source(
+    file: &str,
+    source: &str,
+    dependency_mode: DependencyResolveMode,
+    embedded_entry: bool,
+    delivery: Option<&interop_binding::Delivery<'_>>,
+) -> Result<Program, KuError> {
     let program = parse_source(source)?;
     let program = if program_has_imports(&program) {
         let path = Path::new(file);
-        if !path.exists() {
-            if program_has_only_std_imports(&program) {
-                let mut loader = ModuleLoader::new(None)?;
-                loader.load_virtual_entry(path, program, source.len())?
-            } else {
-                return Err(KuError::runtime(
-                    "imports require a real .ku file path",
-                    Span::default(),
-                ));
-            }
+        let missing = !path.exists();
+        if missing && program_has_only_std_imports(&program) {
+            let mut loader = ModuleLoader::new(None)?;
+            loader.load_virtual_entry(path, program, source.len())?
         } else {
+            let embedded_path = if missing {
+                if !embedded_entry {
+                    return Err(KuError::runtime(
+                        "imports require a real .ku file path",
+                        Span::default(),
+                    ));
+                }
+                Some(canonical_missing_runner_entry(path)?)
+            } else {
+                None
+            };
+            let path = embedded_path.as_deref().unwrap_or(path);
             let mut package = package::discover_for_file(path)?;
             let deadline = package
                 .as_ref()
@@ -9053,7 +9863,19 @@ fn parse_and_expand_with_dependency_mode(
                 )?;
             }
             let mut loader = ModuleLoader::new(package)?;
-            let program = loader.load_entry(path, program, source.len())?;
+            loader.interop_mode = dependency_mode;
+            if let Some(delivery) = delivery {
+                loader.interop_delivery =
+                    Some((delivery.output_dir.to_path_buf(), delivery.matches_host));
+            }
+            let program = if let Some(embedded_path) = embedded_path {
+                loader.load_canonical_entry(embedded_path, program, source.len(), true)?
+            } else {
+                loader.load_entry(path, program, source.len())?
+            };
+            if let Some(linked) = delivery.and_then(|delivery| delivery.needs_linked_runner) {
+                linked.set(loader.uses_package_import || !loader.interop_bindings.is_empty());
+            }
             if matches!(
                 dependency_mode,
                 DependencyResolveMode::Update | DependencyResolveMode::Refresh
@@ -9071,6 +9893,26 @@ fn parse_and_expand_with_dependency_mode(
         program
     };
     Ok(program)
+}
+
+fn canonical_missing_runner_entry(path: &Path) -> KuResult<PathBuf> {
+    let span = Span::default();
+    let missing_path = || KuError::runtime("imports require a real .ku file path", span);
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(missing_path());
+    };
+    // Use only a genuine missing file. A dangling symlink or unreadable entry
+    // must not silently supply a different import anchor.
+    if path.is_absolute()
+        && is_ku_path(path)
+        && matches!(fs::symlink_metadata(path), Err(err) if err.kind() == std::io::ErrorKind::NotFound)
+    {
+        let parent = canonical_file(parent, span)?;
+        if parent.is_dir() {
+            return Ok(parent.join(name));
+        }
+    }
+    Err(missing_path())
 }
 
 fn program_has_imports(program: &Program) -> bool {
@@ -9104,6 +9946,8 @@ const IMPORT_CLOSURE_WORDS: usize = MAX_IMPORT_MODULES.div_ceil(64);
 
 #[derive(Clone)]
 struct ModuleClosure {
+    /// Bits index the loader's dependency-before-dependent completion order,
+    /// independent of the discovery IDs used in canonical names.
     words: [u64; IMPORT_CLOSURE_WORDS],
 }
 
@@ -9114,9 +9958,8 @@ impl ModuleClosure {
         }
     }
 
-    fn insert(&mut self, module_id: usize) {
-        debug_assert!((1..=MAX_IMPORT_MODULES).contains(&module_id));
-        let index = module_id - 1;
+    fn insert(&mut self, index: usize) {
+        debug_assert!(index < MAX_IMPORT_MODULES);
         self.words[index / 64] |= 1_u64 << (index % 64);
     }
 
@@ -9133,7 +9976,7 @@ impl ModuleClosure {
             .flat_map(|(word_index, word)| {
                 let word = *word;
                 (0..64).filter_map(move |bit| {
-                    (word & (1_u64 << bit) != 0).then_some(word_index * 64 + bit + 1)
+                    (word & (1_u64 << bit) != 0).then_some(word_index * 64 + bit)
                 })
             })
     }
@@ -9348,6 +10191,10 @@ struct ModuleLoader {
     package: Option<PackageContext>,
     package_import_scopes: Vec<package::PackageImportScope>,
     dependency_snapshots: Vec<package::LockDependency>,
+    interop_bindings: HashMap<PathBuf, String>,
+    interop_mode: DependencyResolveMode,
+    interop_delivery: Option<(PathBuf, bool)>,
+    uses_package_import: bool,
     budget: ImportBudget,
 }
 
@@ -9370,6 +10217,10 @@ impl ModuleLoader {
             package,
             package_import_scopes,
             dependency_snapshots: Vec::new(),
+            interop_bindings: HashMap::new(),
+            interop_mode: DependencyResolveMode::Update,
+            interop_delivery: None,
+            uses_package_import: false,
             budget: ImportBudget::default(),
         })
     }
@@ -9383,7 +10234,7 @@ impl ModuleLoader {
         self.budget.begin_module(Span::default())?;
         let result = (|| {
             self.budget.charge_source(source_bytes, Span::default())?;
-            self.expand_program(path, program, true, source_bytes)
+            self.expand_program(path, program, true, source_bytes, false)
                 .map(|(program, _, _, _)| program)
         })();
         self.budget.finish_module();
@@ -9397,12 +10248,27 @@ impl ModuleLoader {
         source_bytes: usize,
     ) -> KuResult<Program> {
         let canonical = canonical_file(path, Span::default())?;
+        self.load_canonical_entry(canonical, program, source_bytes, false)
+    }
+
+    fn load_canonical_entry(
+        &mut self,
+        canonical: PathBuf,
+        program: Program,
+        source_bytes: usize,
+        missing_embedded_entry: bool,
+    ) -> KuResult<Program> {
         self.budget.begin_module(Span::default())?;
         let result = (|| {
             self.budget.charge_source(source_bytes, Span::default())?;
             self.states.insert(canonical.clone(), LoadState::Visiting);
-            let (expanded, _, _, _) =
-                self.expand_program(&canonical, program, true, source_bytes)?;
+            let (expanded, _, _, _) = self.expand_program(
+                &canonical,
+                program,
+                true,
+                source_bytes,
+                missing_embedded_entry,
+            )?;
             self.states.insert(canonical.clone(), LoadState::Done);
             let mut items = Vec::new();
             let mut materialized_names = HashSet::new();
@@ -9458,14 +10324,15 @@ impl ModuleLoader {
                 err.with_diagnostic_context(canonical.display().to_string(), source.clone())
             })?;
             let (expanded, material, exports, mut closure) = self
-                .expand_program(&canonical, program, false, source.len())
+                .expand_program(&canonical, program, false, source.len(), false)
                 .map_err(|err| {
                     err.with_diagnostic_context(canonical.display().to_string(), source.clone())
                 })?;
             let module_id = self.module_ids[&canonical];
             let mut check_items = Vec::new();
             let mut check_names = HashSet::new();
-            for dependency_id in closure.iter() {
+            for index in closure.iter() {
+                let dependency_id = self.materialized_order[index];
                 let dependency_material = self.materialized_materials[dependency_id - 1];
                 self.budget.charge_clone(dependency_material, span)?;
                 for item in &self.materialized_modules[dependency_id - 1] {
@@ -9485,7 +10352,7 @@ impl ModuleLoader {
             })?;
             let dependency_snapshot =
                 package::freeze_lock_dependency(&canonical, source.as_bytes())?;
-            closure.insert(module_id);
+            closure.insert(self.materialized_order.len());
             let module = Arc::new(ModuleExports {
                 path: canonical.clone(),
                 exports,
@@ -9527,12 +10394,48 @@ impl ModuleLoader {
         result
     }
 
+    fn interop_for_module(&mut self, path: &Path) -> KuResult<Option<String>> {
+        let Some(context) = &self.package else {
+            return Ok(None);
+        };
+        let scope = package::package_import_scope_for_file(
+            &self.package_import_scopes,
+            path,
+            Span::default(),
+            false,
+        )?;
+        if scope.interop_version.as_deref() != Some("1") {
+            return Ok(None);
+        }
+        if let Some(binding) = self.interop_bindings.get(&scope.import_root) {
+            return Ok(Some(binding.clone()));
+        }
+        let delivery = self
+            .interop_delivery
+            .as_ref()
+            .map(|(output_dir, matches_host)| interop_binding::Delivery {
+                output_dir,
+                matches_host: *matches_host,
+                needs_linked_runner: None,
+            });
+        let binding = interop_binding::prepare(
+            &scope.import_root,
+            &context.cache_dir,
+            self.interop_mode,
+            delivery.as_ref(),
+        )?;
+        self.interop_bindings
+            .insert(scope.import_root.clone(), binding.clone());
+        Ok(Some(binding))
+    }
+
     fn expand_program(
         &mut self,
         path: &Path,
         program: Program,
         is_entry: bool,
         source_bytes: usize,
+        missing_embedded_entry: bool,
     ) -> KuResult<(
         Program,
         ExpandedModuleMaterial,
@@ -9610,7 +10513,14 @@ impl ModuleLoader {
                 import.span,
                 self.package.as_ref(),
                 &self.package_import_scopes,
+                missing_embedded_entry,
             )?;
+            self.uses_package_import |= import
+                .path
+                .strip_prefix('@')
+                .and_then(|path| path.split_once('/'))
+                .zip(self.package.as_ref())
+                .is_some_and(|((name, _), package)| name != package.manifest.name);
             let module = self.load_module(&import_path, import.span)?;
             closure.union_with(&module.closure);
             match &import.kind {
@@ -9689,6 +10599,11 @@ impl ModuleLoader {
             }
         }
 
+        let bridge = if is_entry {
+            None
+        } else {
+            self.interop_for_module(path)?
+        };
         for item in program.items {
             if matches!(item, Item::Import(_)) {
                 continue;
@@ -9701,7 +10616,12 @@ impl ModuleLoader {
                 Item::Module(decl) => decl.span,
             };
             self.budget.charge_item(span)?;
-            let item = rewrite_top_level_names_in_item(item, &reference_renames, &namespace_maps)?;
+            let item = rewrite_top_level_names_in_item(
+                item,
+                &reference_renames,
+                &namespace_maps,
+                bridge.as_deref(),
+            )?;
             // Do not deduplicate source declarations: duplicate declarations in
             // one file must still reach the checker and produce its diagnostic.
             items.push(item);
@@ -9854,13 +10774,21 @@ fn resolve_import_path(
     span: Span,
     package: Option<&PackageContext>,
     package_import_scopes: &[package::PackageImportScope],
+    missing_embedded_entry: bool,
 ) -> KuResult<PathBuf> {
     if package.is_some() {
         package::validate_package_import_text(import_path, span)?;
     }
     let raw = Path::new(import_path);
     let current_scope = package
-        .map(|_| package::package_import_scope_for_file(package_import_scopes, current_file, span))
+        .map(|_| {
+            package::package_import_scope_for_file(
+                package_import_scopes,
+                current_file,
+                span,
+                missing_embedded_entry,
+            )
+        })
         .transpose()?;
     if let Some(current_scope) = current_scope {
         if let Some(path) = package::resolve_dependency_import(
@@ -9967,13 +10895,19 @@ fn rewrite_top_level_names_in_item(
     item: Item,
     rename_map: &HashMap<String, String>,
     namespaces: &NamespaceMaps,
+    bridge: Option<&str>,
 ) -> KuResult<Item> {
     match item {
         Item::Function(mut function) => {
             if let Some(renamed) = rename_map.get(&function.name) {
                 function.name = renamed.clone();
             }
-            rewrite_top_level_references_in_function(&mut function, rename_map, namespaces)?;
+            rewrite_top_level_references_in_function_with_bridge(
+                &mut function,
+                rename_map,
+                namespaces,
+                bridge,
+            )?;
             Ok(Item::Function(function))
         }
         Item::Struct(mut decl) => {
@@ -10080,12 +11014,23 @@ fn rewrite_type_name(
     }
 }
 
+#[cfg(test)]
 fn rewrite_top_level_references_in_function(
     function: &mut FnDecl,
     rename_map: &HashMap<String, String>,
     namespaces: &NamespaceMaps,
 ) -> KuResult<()> {
+    rewrite_top_level_references_in_function_with_bridge(function, rename_map, namespaces, None)
+}
+
+fn rewrite_top_level_references_in_function_with_bridge(
+    function: &mut FnDecl,
+    rename_map: &HashMap<String, String>,
+    namespaces: &NamespaceMaps,
+    bridge: Option<&str>,
+) -> KuResult<()> {
     let mut rewriter = TopLevelReferenceRewriter::new(rename_map, namespaces);
+    rewriter.bridge = bridge;
     if !function.type_params.is_empty() {
         rewriter.type_scopes.push(function.type_params.clone());
     }
@@ -10102,6 +11047,7 @@ fn rewrite_top_level_references_in_function(
 struct TopLevelReferenceRewriter<'a> {
     rename_map: &'a HashMap<String, String>,
     namespaces: &'a NamespaceMaps,
+    bridge: Option<&'a str>,
     scopes: Vec<HashSet<String>>,
     /// Type parameters have a separate namespace from local value bindings.
     /// Empty for non-generic programs, without copying the module rename map.
@@ -10113,6 +11059,7 @@ impl<'a> TopLevelReferenceRewriter<'a> {
         Self {
             rename_map,
             namespaces,
+            bridge: None,
             scopes: Vec::new(),
             type_scopes: Vec::new(),
         }
@@ -10338,6 +11285,24 @@ impl<'a> TopLevelReferenceRewriter<'a> {
                 self.rewrite_expr(right)?;
             }
             ExprKind::Call { callee, args } => {
+                if let ExprKind::Variable(name) = &mut callee.kind {
+                    if crate::interop::ReturnKind::for_builtin(name).is_some() {
+                        let bridge = self.bridge.ok_or_else(|| KuError::runtime(
+                            "interop calls require an imported package with interop.version = \"1\"",
+                            expr.span,
+                        ))?;
+                        let (source, _) = crate::interop::binding_arguments(args, expr.span)?;
+                        if source != "self" {
+                            return Err(KuError::runtime(
+                                "interop package wrappers must bind to the package's own bridge",
+                                expr.span,
+                            ));
+                        }
+                        let suffix = name.trim_start_matches("__ku_interop_");
+                        *name = format!("{}{suffix}", crate::interop::BOUND_PREFIX);
+                        args[0].kind = ExprKind::Literal(Literal::String(bridge.to_owned()));
+                    }
+                }
                 self.rewrite_expr(callee)?;
                 for arg in args {
                     self.rewrite_expr(arg)?;
@@ -10914,10 +11879,39 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_build_defaults_to_c_without_changing_explicit_backends() {
+        let default = parse_build_options(&["ku".into(), "build".into(), "main.ku".into()])
+            .expect("ordinary build options");
+        assert_eq!(default.backend, BuildBackend::C);
+        assert_eq!(default.profile, BuildProfile::Debug);
+        for (name, expected) in [
+            ("c", BuildBackend::C),
+            ("native-c", BuildBackend::C),
+            ("runner", BuildBackend::Runner),
+            ("interp", BuildBackend::Runner),
+            ("interpreter", BuildBackend::Runner),
+            ("llvm", BuildBackend::Llvm),
+            ("ll", BuildBackend::Llvm),
+        ] {
+            let options = parse_build_options(&[
+                "ku".into(),
+                "build".into(),
+                "--backend".into(),
+                name.into(),
+                "main.ku".into(),
+            ])
+            .expect("explicit backend remains available");
+            assert_eq!(options.backend, expected, "{name}");
+        }
+    }
+
+    #[test]
     fn dependency_mode_flags_are_single_and_propagate_to_built_runner() {
         let args = vec![
             "ku".to_string(),
             "build".to_string(),
+            "--backend".to_string(),
+            "runner".to_string(),
             "src/main.ku".to_string(),
             "--offline".to_string(),
         ];
@@ -10936,7 +11930,7 @@ mod tests {
         assert_eq!(mode, DependencyResolveMode::Locked);
 
         let runner = build_runner_source("src/main.ku", "fn main() {}", mode);
-        assert!(runner.contains("run_source_with_dependency_mode"));
+        assert!(runner.contains("run_embedded_runner_source"));
         assert!(runner.contains("DependencyResolveMode::Locked"));
 
         let args = vec![
@@ -12416,6 +13410,163 @@ mod tests {
     }
 
     #[test]
+    fn gnu_tool_workspace_preserves_unicode_cwd_and_typed_input_contents() {
+        let owner = TempBuildDir::create_private("gnu-unicode-contract").unwrap();
+        let cwd = owner.path().join("调用者 cwd");
+        let source_dir = owner.path().join("输入 source");
+        fs::create_dir(&cwd).unwrap();
+        fs::create_dir(&source_dir).unwrap();
+        let source = source_dir.join("原始 中文.c");
+        let code = b"/* original executable-relative resource locator ../source */\nint main(void){return 0;}\n";
+        fs::write(&source, code).unwrap();
+        let mut workspace = gnu_workspace::Workspace::create_at(&cwd, owner.path()).unwrap();
+        let root = workspace.output_file().parent().unwrap().to_path_buf();
+        let staged = workspace.source(&source).unwrap();
+        assert!(staged.to_str().unwrap().is_ascii() && staged.is_relative());
+        assert_eq!(fs::read(cwd.join(&staged)).unwrap(), code);
+        let mut command = Command::new("unused-compiler");
+        let original_args = [
+            "-I",
+            "相对 user headers",
+            "-include",
+            "local.h",
+            "-DNAME=用户文字",
+        ];
+        command.args(original_args);
+        workspace.configure(&mut command);
+        add_gnu_c_source_and_output(&mut command, &staged, &workspace.output_argument());
+        assert_eq!(command.get_current_dir(), Some(cwd.as_path()));
+        let args: Vec<_> = command
+            .get_args()
+            .map(|x| x.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(&args[..original_args.len()], original_args);
+        assert!(args[original_args.len()..].iter().all(|x| x.is_ascii()));
+        for (key, value) in command.get_envs() {
+            assert!(matches!(key.to_str(), Some("TMP" | "TEMP" | "TMPDIR")));
+            assert!(cwd.join(value.unwrap()).is_dir());
+            assert!(value.unwrap().to_str().unwrap().is_ascii());
+            assert!(
+                Path::new(value.unwrap()).is_absolute(),
+                "GCC expands relative TMP beneath its Unicode cwd before invoking as"
+            );
+        }
+        let library = source_dir.join("原始 库.a");
+        fs::write(&library, b"verified-library").unwrap();
+        let checksum: [u8; 32] = Sha256::digest(b"verified-library").into();
+        let copied = workspace.library(&library, checksum).unwrap();
+        assert!(copied.to_str().unwrap().is_ascii());
+        assert_eq!(fs::read(cwd.join(copied)).unwrap(), b"verified-library");
+        assert!(workspace.library(&library, [0; 32]).is_err());
+        drop(workspace);
+        assert!(!root.exists());
+        for (_, value) in command.get_envs() {
+            assert!(
+                !Path::new(value.unwrap()).exists(),
+                "private GNU temporary directory must be removed too"
+            );
+        }
+        assert_eq!(fs::read(source).unwrap(), code);
+        assert_eq!(fs::read(library).unwrap(), b"verified-library");
+    }
+
+    #[test]
+    fn gnu_tool_workspace_keeps_nested_header_layout_and_empty_headers() {
+        let owner = TempBuildDir::create_private("gnu-header-contract").unwrap();
+        let cwd = owner.path().join("调用目录");
+        let sdk = owner.path().join("SDK 中文 includes");
+        fs::create_dir(&cwd).unwrap();
+        fs::create_dir(&sdk).unwrap();
+        fs::create_dir(sdk.join("mysql")).unwrap();
+        fs::write(sdk.join("mysql/mysql.h"), b"#include \"../common.h\"\n").unwrap();
+        fs::write(sdk.join("common.h"), b"/* shared ABI definitions */\n").unwrap();
+        fs::write(sdk.join("empty.h"), b"").unwrap();
+        let selected = MysqlHeaderSelection {
+            header: sdk.join("mysql/mysql.h"),
+            include_dirs: vec![sdk.join("mysql"), sdk.clone()],
+        };
+        let mut workspace = gnu_workspace::Workspace::create_at(&cwd, owner.path()).unwrap();
+        let staged = workspace.mysql_headers(&selected).unwrap();
+        assert!(staged.header.to_str().unwrap().is_ascii());
+        assert_eq!(
+            fs::read(cwd.join(&staged.header)).unwrap(),
+            b"#include \"../common.h\"\n"
+        );
+        assert_eq!(
+            fs::read(cwd.join(&staged.include_dirs[0]).join("../common.h")).unwrap(),
+            b"/* shared ABI definitions */\n"
+        );
+        assert_eq!(
+            fs::read(cwd.join(&staged.include_dirs[1]).join("empty.h")).unwrap(),
+            b""
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&sdk, sdk.join("loop")).unwrap();
+            assert!(workspace.include(&sdk).is_err());
+        }
+    }
+
+    #[test]
+    fn gnu_tool_workspace_copies_into_original_atomic_output_transaction() {
+        let owner = TempBuildDir::create_private("gnu-install-contract").unwrap();
+        let cwd = owner.path().join("编译 cwd");
+        let output_dir = owner.path().join("其他 输出目录");
+        fs::create_dir(&cwd).unwrap();
+        fs::create_dir(&output_dir).unwrap();
+        let output = output_dir.join("结果 中文.exe");
+        fs::write(&output, b"old installed output").unwrap();
+        let workspace = gnu_workspace::Workspace::create_at(&cwd, owner.path()).unwrap();
+        let root = workspace.output_file().parent().unwrap().to_path_buf();
+        let staging = LinkOutputStaging::create(&output).unwrap();
+        assert_eq!(staging.directory.parent(), Some(output_dir.as_path()));
+        fs::write(workspace.output_file(), b"partial invalid compiler output").unwrap();
+        let target = resolve_build_target(Some("x86_64-windows"))
+            .unwrap()
+            .unwrap();
+        assert!(validate_link_output_candidate(
+            &workspace.output_file(),
+            Path::new("original.c"),
+            Some(&target),
+            "fixture",
+            CSourceFeatures::default(),
+            None,
+            None
+        )
+        .is_err());
+        assert_eq!(fs::read(&output).unwrap(), b"old installed output");
+        let data = dependency_pe(&[]);
+        fs::write(workspace.output_file(), &data).unwrap();
+        let verified = validate_link_output_candidate(
+            &workspace.output_file(),
+            Path::new("original.c"),
+            Some(&target),
+            "fixture",
+            CSourceFeatures::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        gnu_workspace::copy_output(&verified, staging.path()).unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"old installed output");
+        let copied = validate_link_output_candidate(
+            staging.path(),
+            Path::new("original.c"),
+            Some(&target),
+            "fixture",
+            CSourceFeatures::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        install_verified_link_output(copied, &staging).unwrap();
+        assert_eq!(fs::read(&output).unwrap(), data);
+        drop(verified);
+        drop(workspace);
+        assert!(!root.exists());
+    }
+
+    #[test]
     fn native_link_install_is_atomic_and_preserves_the_previous_output_on_failure() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -13663,6 +14814,470 @@ fn main(): null! {
     }
 
     #[test]
+    fn compression_feature_markers_are_exact_and_independent() {
+        let directory = TempBuildDir::create_private("compression-marker-test").unwrap();
+        let source = directory.path().join("marker.c");
+        fs::write(&source, "static const char *text = \"#define KU_FEATURE_ZSTD 1\";\n#define KU_FEATURE_ZLIB 10\n").unwrap();
+        let features = CSourceFeatures::inspect(&source).unwrap();
+        assert!(!features.zstd && !features.zlib);
+        fs::write(&source, "#define KU_FEATURE_ZSTD 1\n").unwrap();
+        let features = CSourceFeatures::inspect(&source).unwrap();
+        assert!(features.zstd && !features.zlib);
+        fs::write(&source, "#define KU_FEATURE_ZLIB 1\n").unwrap();
+        let features = CSourceFeatures::inspect(&source).unwrap();
+        assert!(!features.zstd && features.zlib);
+    }
+
+    #[test]
+    fn configured_c_compiler_target_probe_failure_preserves_actionable_native_error() {
+        let candidate = CCompilerCandidate {
+            label: "missing compiler 中文.exe".into(),
+            program: "missing compiler 中文.exe".into(),
+            args: Vec::new(),
+            kind: CCompilerKind::Preconfigured,
+            explicitly_configured: true,
+        };
+        for (kind, reason) in [
+            (io::ErrorKind::NotFound, "compiler executable is absent"),
+            (
+                io::ErrorKind::InvalidData,
+                "compiler target output is invalid",
+            ),
+        ] {
+            let error = io::Error::new(kind, reason);
+            let diagnostic =
+                configured_c_compiler_target_probe_error(&candidate, &error).to_string();
+            assert!(diagnostic.contains("KU_CC"));
+            assert!(diagnostic.contains(&candidate.label));
+            assert!(diagnostic.contains(reason));
+            assert!(!diagnostic.contains("E0514") && !diagnostic.contains("rustc command:"));
+        }
+    }
+
+    #[test]
+    fn windows_gnu_static_runtime_link_policy_tracks_actual_abi_and_preserves_other_targets() {
+        use std::ffi::OsStr;
+
+        for (kind, target, selected) in [
+            (
+                CCompilerKind::Preconfigured,
+                Some("x86_64-w64-mingw32"),
+                true,
+            ),
+            (
+                CCompilerKind::Preconfigured,
+                Some("x86_64-pc-windows-gnu"),
+                true,
+            ),
+            (CCompilerKind::Clang, Some("x86_64-w64-windows-gnu"), true),
+            (
+                CCompilerKind::Preconfigured,
+                Some("x86_64-pc-windows-msvc"),
+                false,
+            ),
+            (CCompilerKind::Clang, Some("x86_64-pc-windows-msvc"), false),
+            (
+                CCompilerKind::Preconfigured,
+                Some("x86_64-unknown-linux-gnu"),
+                false,
+            ),
+            (CCompilerKind::Clang, Some("aarch64-apple-darwin"), false),
+            (CCompilerKind::ZigCc, Some("x86_64-windows-gnu"), false),
+            (CCompilerKind::Preconfigured, None, false),
+        ] {
+            let mut command = Command::new("compiler-below-any-misleading-directory");
+            command.arg("-O2");
+            add_gnu_runtime_link_mode(&mut command, kind, target, false);
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                if selected {
+                    vec![OsStr::new("-O2"), OsStr::new("-static")]
+                } else {
+                    vec![OsStr::new("-O2")]
+                },
+                "{kind:?} {target:?}",
+            );
+            let mut explicit = Command::new("compiler");
+            add_gnu_runtime_link_mode(&mut explicit, kind, target, true);
+            assert_eq!(
+                explicit.get_args().collect::<Vec<_>>(),
+                [OsStr::new("-static")],
+                "an explicit --static retains its existing meaning without a duplicate flag"
+            );
+        }
+    }
+
+    #[test]
+    fn native_pack_dynamic_crt_selects_the_same_compile_and_link_runtime() {
+        let mut unused = Command::new("clang");
+        add_gnu_msvc_dynamic_crt(&mut unused, false);
+        assert_eq!(unused.get_args().count(), 0);
+
+        let mut command = Command::new("clang");
+        add_gnu_msvc_dynamic_crt(&mut command, true);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "-fms-runtime-lib=dll",
+                "-Xlinker",
+                "/NODEFAULTLIB:libcmt",
+                "-Xlinker",
+                "/DEFAULTLIB:msvcrt",
+            ]
+            .map(std::ffi::OsStr::new)
+        );
+    }
+
+    #[test]
+    fn native_gnu_source_and_output_paths_preserve_drive_unc_and_unicode_arguments() {
+        for (source, output, expected_source, expected_output) in [
+            (
+                r"\\?\C:\目录 with spaces\main.c",
+                r"\\?\C:\目录 with spaces\main.exe",
+                r"C:\目录 with spaces\main.c",
+                r"C:\目录 with spaces\main.exe",
+            ),
+            (
+                r"\\?\UNC\host\share\main.c",
+                r"\\?\UNC\host\share\main.exe",
+                r"\\host\share\main.c",
+                r"\\host\share\main.exe",
+            ),
+            (
+                "normal path/中文.c",
+                "normal path/中文",
+                "normal path/中文.c",
+                "normal path/中文",
+            ),
+        ] {
+            let mut command = Command::new("unused-compiler");
+            add_gnu_c_source_and_output(&mut command, Path::new(source), Path::new(output));
+            let actual = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(actual, [expected_source, "-std=c11", "-o", expected_output]);
+        }
+    }
+
+    #[test]
+    fn pinned_codec_headers_preserve_compiler_wrappers_and_unicode_arguments() {
+        let include = PathBuf::from("verified headers 中文");
+        for prefix in ["cc", "clang"] {
+            let arguments = [
+                prefix,
+                "-Iold headers",
+                "--target=x86_64-linux-gnu",
+                "-I",
+                "another path",
+            ]
+            .map(str::to_owned);
+            let mut command = Command::new("unused-compiler-wrapper");
+            add_c_compiler_arguments(&mut command, &arguments, std::slice::from_ref(&include));
+            let actual = command
+                .get_args()
+                .map(|value| value.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual,
+                [
+                    prefix,
+                    "--target=x86_64-linux-gnu",
+                    "-I",
+                    "verified headers 中文",
+                    "-Iold headers",
+                    "-I",
+                    "another path"
+                ]
+            );
+            let mut unused = Command::new("unused-compiler-wrapper");
+            add_c_compiler_arguments(&mut unused, &arguments, &[]);
+            assert_eq!(
+                unused.get_args().collect::<Vec<_>>(),
+                arguments
+                    .iter()
+                    .map(std::ffi::OsStr::new)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn compression_modules_fail_before_runner_output_or_interpreter_execution() {
+        let directory = TempBuildDir::create_private("compression-runner-test").unwrap();
+        for module in ["zstd", "gzip", "deflate"] {
+            let source = format!(
+                r#"import {{bytes,{module}}} from "std"
+fn main(): null! {{
+    input=bytes.from_array([1])?
+    {module}.compress(input, 100)?
+    return ok(null)
+}}"#
+            );
+            let entry = directory.path().join(format!("{module}.ku"));
+            fs::write(&entry, &source).unwrap();
+            let path = entry.to_str().unwrap();
+            let output = directory.path().join(format!("{module}-runner"));
+            let error = build_executable_to(
+                path,
+                &source,
+                &output,
+                RunnerBuildConfig {
+                    profile: BuildProfile::Debug,
+                    target: None,
+                    lto: false,
+                    strip: false,
+                    verbose: false,
+                    dependency_mode: DependencyResolveMode::Update,
+                },
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("--backend c"), "{error}");
+            assert!(!output.exists());
+            let error = run_source(path, &source).unwrap_err().to_string();
+            assert!(error.contains("--backend c"), "{error}");
+        }
+        // Ordinary programs retain their existing backend semantics.
+        reject_native_only_compression(&parse_source("fn main() { println(1) }").unwrap()).unwrap();
+    }
+
+    #[test]
+    fn compression_imported_dependency_is_rejected_by_registered_capability() {
+        let directory = TempBuildDir::create_private("compression-transitive-test").unwrap();
+        let dependency = r#"import {bytes,gzip} from "std"
+fn Zip(): null! { input=bytes.from_array([1])? gzip.compress(input,100)? return ok(null) }"#;
+        fs::write(directory.path().join("codec.ku"), dependency).unwrap();
+        let source = "import {Zip} from \"./codec.ku\" fn main(): null! { Zip()? return ok(null) }";
+        let entry = directory.path().join("main.ku");
+        fs::write(&entry, source).unwrap();
+        let program = checked_program_with_dependency_mode(
+            entry.to_str().unwrap(),
+            source,
+            DependencyResolveMode::Update,
+        )
+        .unwrap();
+        let error = reject_native_only_compression(&program)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("std.gzip") && error.contains("--backend c"));
+    }
+
+    #[test]
+    fn compression_dynamic_codec_sidecars_are_rejected_in_all_output_formats() {
+        let directory = TempBuildDir::create_private("compression-loader-test").unwrap();
+        let features = CSourceFeatures {
+            zstd: true,
+            zlib: true,
+            ..CSourceFeatures::default()
+        };
+        let fixtures = [
+            (
+                "x86_64-linux",
+                dependency_elf(&["libc.so.6", "libzstd.so.1"]),
+                dependency_elf(&["libc.so.6"]),
+            ),
+            (
+                "x86_64-windows",
+                dependency_pe(&["KERNEL32.dll", "libz.dll"]),
+                dependency_pe(&["KERNEL32.dll", "VCRUNTIME140.dll"]),
+            ),
+            (
+                "aarch64-darwin",
+                dependency_macho(&["/usr/lib/libSystem.B.dylib", "@rpath/libz.1.dylib"]),
+                dependency_macho(&["/usr/lib/libSystem.B.dylib"]),
+            ),
+        ];
+        for (slug, rejected, accepted) in fixtures {
+            let target = resolve_build_target(Some(slug)).unwrap().unwrap();
+            let file = directory.path().join(slug);
+            fs::write(&file, rejected).unwrap();
+            let mut opened = fs::File::open(&file).unwrap();
+            let length = opened.metadata().unwrap().len();
+            let error = verify_native_binary_dynamic_dependencies_file(
+                &mut opened,
+                length,
+                &target,
+                features,
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert!(error.contains("dynamic zstd/zlib"), "{error}");
+            drop(opened);
+            fs::write(&file, accepted).unwrap();
+            let mut opened = fs::File::open(&file).unwrap();
+            let length = opened.metadata().unwrap().len();
+            verify_native_binary_dynamic_dependencies_file(
+                &mut opened,
+                length,
+                &target,
+                features,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        for name in [
+            "zstd.dll",
+            "LIBZSTD-1.DLL",
+            "zlib1.dll",
+            "zlibwapi.dll",
+            "libz.so.1",
+            "libzstd.1.dylib",
+        ] {
+            assert!(
+                dynamic_dependency_is_compression_library(name.as_bytes(), true, true),
+                "{name}"
+            );
+        }
+        for name in [
+            "libz3.so.4",
+            "libzone.dylib",
+            "libzstd.a",
+            "zstd_static.lib",
+            "libc.so.6",
+        ] {
+            assert!(
+                !dynamic_dependency_is_compression_library(name.as_bytes(), true, true),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn calendar_dynamic_sidecars_are_rejected_in_all_output_formats() {
+        let directory = TempBuildDir::create_private("calendar-loader-test").unwrap();
+        let features = CSourceFeatures {
+            native_calendar: true,
+            ..CSourceFeatures::default()
+        };
+        let fixtures = [
+            (
+                "x86_64-linux",
+                dependency_elf(&["libc.so.6", "libku_native_calendar.so.1"]),
+                dependency_elf(&["libc.so.6"]),
+            ),
+            (
+                "x86_64-windows",
+                dependency_pe(&["KERNEL32.dll", "ku_native_calendar.dll"]),
+                dependency_pe(&["KERNEL32.dll", "VCRUNTIME140.dll"]),
+            ),
+            (
+                "aarch64-darwin",
+                dependency_macho(&[
+                    "/usr/lib/libSystem.B.dylib",
+                    "@rpath/libku_native_calendar.dylib",
+                ]),
+                dependency_macho(&["/usr/lib/libSystem.B.dylib"]),
+            ),
+        ];
+        for (slug, rejected, accepted) in fixtures {
+            let target = resolve_build_target(Some(slug)).unwrap().unwrap();
+            let file = directory.path().join(slug);
+            fs::write(&file, rejected).unwrap();
+            let mut opened = fs::File::open(&file).unwrap();
+            let length = opened.metadata().unwrap().len();
+            let error = verify_native_binary_dynamic_dependencies_file(
+                &mut opened,
+                length,
+                &target,
+                features,
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert!(error.contains("dynamic native calendar"), "{error}");
+            drop(opened);
+            fs::write(&file, accepted).unwrap();
+            let mut opened = fs::File::open(&file).unwrap();
+            let length = opened.metadata().unwrap().len();
+            verify_native_binary_dynamic_dependencies_file(
+                &mut opened,
+                length,
+                &target,
+                features,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        for name in [
+            "KU_NATIVE_CALENDAR.DLL",
+            "libku-native-calendar.so.1",
+            "@rpath/libku_native_calendar.dylib",
+        ] {
+            assert!(
+                dynamic_dependency_is_native_calendar_library(name.as_bytes()),
+                "{name}"
+            );
+        }
+        for name in [
+            "libku_native_calendar.a",
+            "ku_native_calendar.lib",
+            "libc.so.6",
+        ] {
+            assert!(
+                !dynamic_dependency_is_native_calendar_library(name.as_bytes()),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_client_dynamic_sidecars_are_rejected_but_unused_programs_remain_optional() {
+        let dir = TempBuildDir::create_private("http-client-loader").unwrap();
+        for (slug, data) in [
+            (
+                "x86_64-linux",
+                dependency_elf(&["libc.so.6", "libku_native_http_client.so.1"]),
+            ),
+            (
+                "x86_64-windows",
+                dependency_pe(&["KERNEL32.dll", "ku_native_http_client.dll"]),
+            ),
+            (
+                "aarch64-darwin",
+                dependency_macho(&[
+                    "/usr/lib/libSystem.B.dylib",
+                    "@rpath/libku_native_http_client.dylib",
+                ]),
+            ),
+        ] {
+            let target = resolve_build_target(Some(slug)).unwrap().unwrap();
+            let path = dir.path().join(slug);
+            fs::write(&path, data).unwrap();
+            let mut file = fs::File::open(&path).unwrap();
+            let len = file.metadata().unwrap().len();
+            let error = verify_native_binary_dynamic_dependencies_file(
+                &mut file,
+                len,
+                &target,
+                CSourceFeatures {
+                    native_http_client: true,
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert!(error.contains("dynamic native HTTP client"), "{error}");
+            verify_native_binary_dynamic_dependencies_file(
+                &mut file,
+                len,
+                &target,
+                CSourceFeatures::default(),
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        assert!(!dynamic_dependency_is_native_http_client_library(
+            b"libku_native_http_client.a"
+        ));
+    }
+
+    #[test]
     fn native_tls_pack_root_is_authoritative_absolute_and_has_bounded_fallback() {
         let relative = resolve_native_tls_pack_root_from(
             Some(OsString::from("relative-pack")),
@@ -13690,13 +15305,66 @@ fn main(): null! {
 
         let fallback = dir.join("bin").join("native-tls").join("v1");
         fs::create_dir_all(&fallback).expect("create sibling target-pack root");
+        fs::write(dir.join("bin/ku"), b"fixture executable").expect("create installed Ku fixture");
         let resolved = resolve_native_tls_pack_root_from(None, &dir.join("bin").join("ku"))
             .expect("resolve sibling target-pack root");
         assert_eq!(
             resolved.path,
             fs::canonicalize(&fallback).expect("canonicalize sibling target-pack root")
         );
+        let configured = resolve_native_tls_pack_root_from(
+            Some(fallback.clone().into_os_string()),
+            &dir.join("nonexistent-executable"),
+        )
+        .expect("explicit pack must not require default executable lookup");
+        assert_eq!(configured.path, resolved.path);
         fs::remove_dir_all(dir).expect("remove native TLS root fixture");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_pack_roots_follow_the_executable_symlink_before_selecting_the_sdk() {
+        let directory = TempBuildDir::create_private("native-pack-symlink").unwrap();
+        let sdk = directory.path().join("SDK with spaces 中文");
+        let command_dir = directory.path().join("command aliases");
+        fs::create_dir(&sdk).unwrap();
+        fs::create_dir(&command_dir).unwrap();
+        let executable = sdk.join("ku");
+        fs::write(&executable, b"installed executable fixture").unwrap();
+        let first = command_dir.join("ku-original");
+        let alias = command_dir.join("ku");
+        std::os::unix::fs::symlink("../SDK with spaces 中文/ku", &first).unwrap();
+        std::os::unix::fs::symlink("ku-original", &alias).unwrap();
+        for namespace in [
+            "native-calendar",
+            "native-http",
+            "native-tls",
+            "native-compression",
+        ] {
+            let expected = sdk.join(namespace).join("v1");
+            fs::create_dir_all(&expected).unwrap();
+            assert_eq!(
+                native_pack_root_beside(&alias, namespace).unwrap(),
+                fs::canonicalize(&expected).unwrap(),
+                "{namespace} was resolved beside the launcher rather than the installed executable"
+            );
+        }
+        let tls = resolve_native_tls_pack_root_from(None, &alias).unwrap();
+        assert_eq!(
+            tls.path,
+            fs::canonicalize(sdk.join("native-tls/v1")).unwrap()
+        );
+        fs::remove_file(&executable).unwrap();
+        assert!(native_pack_root_beside(&alias, "native-calendar").is_err());
+        let explicit = resolve_native_tls_pack_root_from(
+            Some(sdk.join("native-tls/v1").into_os_string()),
+            &alias,
+        )
+        .unwrap();
+        assert_eq!(
+            explicit.path, tls.path,
+            "explicit override fell back through a broken launcher"
+        );
     }
 
     #[test]
@@ -13836,6 +15504,50 @@ fn main(): null! {
                 .expect("select MSVC TLS contract"),
             NATIVE_TLS_WINDOWS_MSVC_CONTRACT
         );
+        let mut command = Command::new("clang");
+        add_gnu_native_tls_libraries(&mut command, NATIVE_TLS_WINDOWS_MSVC_CONTRACT);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "-Xlinker",
+                "bcrypt.lib",
+                "-Xlinker",
+                "advapi32.lib",
+                "-Xlinker",
+                "kernel32.lib",
+                "-Xlinker",
+                "ntdll.lib",
+                "-Xlinker",
+                "userenv.lib",
+                "-Xlinker",
+                "ws2_32.lib",
+                "-Xlinker",
+                "dbghelp.lib",
+                "-Xlinker",
+                "/defaultlib:msvcrt",
+            ]
+            .map(std::ffi::OsStr::new)
+        );
+        for contract in [
+            NATIVE_TLS_WINDOWS_GNU_CONTRACT,
+            NATIVE_TLS_LINUX_CONTRACT,
+            NATIVE_TLS_DARWIN_CONTRACT,
+            NativeTlsLinkContract {
+                native_libraries: &["-framework", "Security"],
+                ..NATIVE_TLS_DARWIN_CONTRACT
+            },
+        ] {
+            let mut command = Command::new("clang");
+            add_gnu_native_tls_libraries(&mut command, contract);
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                contract
+                    .native_libraries
+                    .iter()
+                    .map(std::ffi::OsStr::new)
+                    .collect::<Vec<_>>()
+            );
+        }
         let zig = CCompilerCandidate {
             label: "zig cc".to_string(),
             program: "zig".to_string(),

@@ -1,9 +1,13 @@
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
 use std::{
     io::{self, Read, Write},
     net::{Shutdown, TcpListener, TcpStream},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
 #[cfg(unix)]
 use libc::{pollfd as PollFd, POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT};
@@ -39,6 +43,7 @@ pub(super) struct Ready {
 /// Wait for one batch, retaining the borrowed socket owners until the OS call
 /// has finished. Empty batches return immediately rather than waiting without
 /// a descriptor that could wake the caller.
+#[cfg(not(target_arch = "wasm32"))]
 pub(super) fn wait(
     interests: &[Interest<'_>],
     deadline: Option<Instant>,
@@ -116,6 +121,7 @@ pub(super) fn wait(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn timeout_millis(deadline: Option<Instant>) -> i32 {
     let Some(deadline) = deadline else {
         return -1;
@@ -316,4 +322,15 @@ fn wake_init_timeout() -> io::Error {
         io::ErrorKind::TimedOut,
         "socket poll wake channel initialization timed out",
     )
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(super) fn wait(
+    _interests: &[Interest<'_>],
+    _deadline: Option<Instant>,
+) -> io::Result<Vec<Ready>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "unsupported_in_browser: native socket polling",
+    ))
 }

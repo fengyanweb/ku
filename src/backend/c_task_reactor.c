@@ -174,9 +174,13 @@ static uint32_t ku_task_net_dispatch(KuTaskBlockingPoolV1* pool,size_t owner,siz
   }
   int cancelled=job->cancelled || pool->closing;
   ku_task_blocking_unlock(pool);
-#if KU_TASK_BLOCKING_PG
   int done;
   int queue_connect=0;
+#if defined(KU_TASK_OUTBOUND_HTTP)
+  if(job->kind==10u){int result=ku_task_http_step(pool,job,events,cancelled);queue_connect=result==2;done=result==1;}
+  else
+#endif
+#if KU_TASK_BLOCKING_PG
   if(job->kind==9u) {
     KuPgAsyncOp* operation=job->pg_operation;
     done=ku_pg_async_step(operation,events,ku_pg_now_ms(),cancelled);
@@ -202,10 +206,9 @@ static uint32_t ku_task_net_dispatch(KuTaskBlockingPoolV1* pool,size_t owner,siz
         return KU_TASK_DRIVER_SHUTDOWN_TIMEOUT;
       }
     }
-  } else done=ku_task_net_step(pool,job,events,cancelled);
-#else
-  int done=ku_task_net_step(pool,job,events,cancelled);
+  } else
 #endif
+  done=ku_task_net_step(pool,job,events,cancelled);
   /* Resolver copies are freed when connect completes, before its result can
    * move to a frame. Their receipt is refunded after physical free. */
   if(done && job->net_addresses) {
@@ -220,21 +223,19 @@ static uint32_t ku_task_net_dispatch(KuTaskBlockingPoolV1* pool,size_t owner,siz
   job=&pool->jobs[index];
   if(job->generation!=generation || job->state!=KU_TASK_BLOCKING_NET_STEP || job->net_owner!=owner+1u
       || ku_task_blocking_net_state_locked(pool,job,
-#if KU_TASK_BLOCKING_PG
         queue_connect ? KU_TASK_BLOCKING_QUEUED :
-#endif
         done?KU_TASK_BLOCKING_DONE:KU_TASK_BLOCKING_NET_WAIT)!=KU_TASK_DRIVER_OK) {
     pool->fault=KU_TASK_DRIVER_INTERNAL;ku_task_blocking_unlock(pool);return KU_TASK_DRIVER_INTERNAL;
   }
-#if KU_TASK_BLOCKING_PG
   if(queue_connect) {
     /* Timestamp the actual bounded worker enqueue, not the older step entry. */
-    ku_pg_diag_store(&job->pg_operation->waiter.diagnostic.worker_enqueue_ms,ku_pg_now_ms());
+#if KU_TASK_BLOCKING_PG
+    if(job->kind==9u)ku_pg_diag_store(&job->pg_operation->waiter.diagnostic.worker_enqueue_ms,ku_pg_now_ms());
+#endif
     pool->ring[(pool->head+pool->queued)%pool->capacity]=index;pool->queued++;
     if(pool->queued>pool->peak_queued)pool->peak_queued=pool->queued;
     ku_task_blocking_signal(pool);
   }
-#endif
   if(done) {
     if(pool->finished!=UINT64_MAX)pool->finished++;
     uint32_t status=ku_task_driver_wake(&job->ticket);
@@ -280,6 +281,22 @@ static size_t ku_task_net_interests(KuTaskBlockingPoolV1* pool,size_t owner,KuTa
         && job->generation==snapshot.generation;
     if(!active)continue;
     uint64_t generation=job->generation;
+#if defined(KU_TASK_OUTBOUND_HTTP)
+    if(job->kind==10u){
+      if(job->cancelled||pool->closing||ku_net_now_ms()>=job->net_deadline||job->http_finished||!job->http_connected){
+        ku_task_blocking_unlock(pool);
+        if(ku_task_net_dispatch(pool,owner,i,generation,0u)>KU_TASK_DRIVER_PENDING)return SIZE_MAX;
+        if(ku_task_blocking_lock(pool))return SIZE_MAX;job=&pool->jobs[i];
+      }
+      if(job->generation!=generation||job->state!=KU_TASK_BLOCKING_NET_WAIT||job->net_owner!=owner+1u)continue;
+      if(job->net_deadline<*deadline)*deadline=job->net_deadline;
+      if(job->net_client&&job->net_client->socket_value!=KU_NET_INVALID_SOCKET&&job->http_interest){
+        if(count==capacity){pool->fault=KU_TASK_DRIVER_LIMIT;ku_task_blocking_unlock(pool);return SIZE_MAX;}
+        items[count++]=(KuTaskNetPollV1){(uintptr_t)job->net_client->socket_value,i,generation,job->http_interest};
+      }
+      continue;
+    }
+#endif
 #if KU_TASK_BLOCKING_PG
     if(job->kind==9u) {
       KuPgAsyncOp* operation=job->pg_operation;int fd=-1;unsigned int events=0;

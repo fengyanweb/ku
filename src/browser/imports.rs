@@ -148,7 +148,12 @@ fn canonical_file(path: &Path, span: Span) -> KuResult<PathBuf> {
     Ok(path)
 }
 
-fn resolve_import_path(current: &Path, import: &str, span: Span) -> KuResult<PathBuf> {
+fn resolve_import_path(
+    current: &Path,
+    import: &str,
+    span: Span,
+    _missing_embedded_entry: bool,
+) -> KuResult<PathBuf> {
     // Check the raw spelling before joining so an absolute path cannot erase
     // the virtual parent and a Windows path cannot become a normal filename.
     if import.starts_with('/') || import.contains(['\\', ':', '\0', '?', '#']) {

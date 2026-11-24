@@ -1,31 +1,362 @@
 //! Fixed, generated source Task values and callback-only host operations.
 
+use std::borrow::Cow;
+
 use super::super::output::COutput;
-use super::super::unsupported;
+use super::super::{c_ident, c_type, unsupported};
 use crate::error::KuResult;
 use crate::ir::task::TaskProgram;
-use crate::ir::IrType;
+use crate::ir::{IrLayoutTable, IrType};
 
-pub(super) fn field(ty: &IrType) -> KuResult<&'static str> {
+fn record_name(ty: &IrType) -> Option<&str> {
     match ty {
-        IrType::Result(inner) => field(inner),
-        IrType::Int => Ok("integer"),
-        IrType::Bool => Ok("boolean"),
-        IrType::Null => Ok("null_value"),
-        IrType::Str => Ok("string"),
-        ty if crate::ir::task::http_response_type(ty) => Ok("http_response"),
-        IrType::Array(inner) => match inner.as_ref() {
-            IrType::Int => Ok("integer_array"),
-            IrType::Bool => Ok("boolean_array"),
-            IrType::Str => Ok("string_array"),
-            _ => Err(unsupported("unsupported Task array outcome type")),
-        },
-        _ => Err(unsupported("unsupported Task outcome type")),
+        IrType::Result(inner) => record_name(inner),
+        IrType::Named(name) if name.starts_with("__ku_task_record_") => Some(name),
+        _ => None,
     }
 }
-pub(super) fn kind(ty: &IrType) -> KuResult<u32> {
+
+fn record_field(name: &str) -> String {
+    format!("record_{}", c_ident(name))
+}
+
+fn enum_name(ty: &IrType) -> Option<&str> {
+    crate::ir::task::enum_name(match ty {
+        IrType::Result(inner) => inner,
+        ty => ty,
+    })
+}
+
+pub(super) fn nominal_kind_symbol(ty: &IrType) -> Option<String> {
+    if let Some(name) = record_name(ty) {
+        return Some(format!("KU_TASK_OUTCOME_KIND_{}", c_ident(name)));
+    }
+    enum_name(ty).map(|name| format!("KU_TASK_OUTCOME_KIND_ENUM_{}", c_ident(name)))
+}
+
+pub(super) fn field(ty: &IrType) -> KuResult<Cow<'static, str>> {
+    if let Some(name) = record_name(ty) {
+        return Ok(Cow::Owned(record_field(name)));
+    }
+    if let Some(name) = enum_name(ty) {
+        return Ok(Cow::Owned(format!("enum_{}", c_ident(name))));
+    }
+    let primitive = match ty {
+        IrType::Result(inner) => return field(inner),
+        IrType::Int => "integer",
+        IrType::Bool => "boolean",
+        IrType::Null => "null_value",
+        IrType::Str => "string",
+        ty if crate::ir::task::http_response_type(ty) => "http_response",
+        IrType::Array(inner) => match inner.as_ref() {
+            IrType::Int => "integer_array",
+            IrType::Bool => "boolean_array",
+            IrType::Str => "string_array",
+            _ => return Err(unsupported("unsupported Task array outcome type")),
+        },
+        _ => return Err(unsupported("unsupported Task outcome type")),
+    };
+    Ok(Cow::Borrowed(primitive))
+}
+
+pub(super) struct OutcomeKinds<'a> {
+    results: Vec<&'a IrType>,
+}
+
+impl<'a> OutcomeKinds<'a> {
+    pub(super) fn new(tasks: &'a TaskProgram) -> Self {
+        let mut results = Vec::new();
+        // Keep existing custom record kind numbers even when an enum-returning
+        // function precedes a record-returning function.
+        let declarations = tasks.functions.iter().map(|function| &function.result);
+        let records = declarations.clone().filter(|ty| record_name(ty).is_some());
+        let enums = declarations.filter(|ty| enum_name(ty).is_some());
+        for result in records.chain(enums) {
+            if !results.contains(&result) {
+                results.push(result);
+            }
+        }
+        Self { results }
+    }
+
+    pub(super) fn max_kind(&self) -> usize {
+        8 + self.results.len()
+    }
+
+    pub(super) fn kind(&self, ty: &IrType) -> KuResult<u32> {
+        if record_name(ty).is_some() || enum_name(ty).is_some() {
+            let index = self
+                .results
+                .iter()
+                .position(|result| *result == ty)
+                .ok_or_else(|| unsupported("Task nominal outcome has no registered kind"))?;
+            return u32::try_from(index + 9)
+                .map_err(|_| unsupported("too many Task nominal outcome kinds"));
+        }
+        primitive_kind(ty)
+    }
+
+    fn emit(&self, out: &mut COutput, layouts: &IrLayoutTable) -> KuResult<()> {
+        if self.results.is_empty() {
+            out.push_str(
+                &HOST_ABI
+                    .replace("@RECORD_OUTCOME_UNION@", "")
+                    .replace("@RECORD_OUTCOME_EMPTY@", "")
+                    .replace("@RECORD_OUTCOME_DROP@", "")
+                    .replace("@RECORD_OUTCOME_FAILURE@", "")
+                    .replace("@RECORD_OUTCOME_LAYOUT@", ""),
+            );
+            return out.check();
+        }
+        let mut members = String::new();
+        let mut empty = String::new();
+        let mut drop = String::new();
+        let mut failure = String::new();
+        let has_records = self.results.iter().any(|ty| record_name(ty).is_some());
+        if has_records {
+            out.push_str("#define KU_TASK_RECORD_OUTCOMES 1\n");
+        }
+        if self
+            .results
+            .iter()
+            .any(|ty| crate::ir::task::string_enum_value(layouts, ty))
+        {
+            out.push_str(STRING_ENUM_OUTCOME);
+        }
+        for result in &self.results {
+            out.check()?;
+            let IrType::Result(inner) = result else {
+                return Err(unsupported("Task nominal outcome must be a Result"));
+            };
+            let field = field(result)?;
+            let c_ty = c_type(result)?;
+            let suffix = super::super::c_type_suffix(inner)?;
+            let kind = self.kind(result)?;
+            let kind_symbol = nominal_kind_symbol(result)
+                .ok_or_else(|| unsupported("Task nominal outcome has no kind symbol"))?;
+            out.push_str(&format!("enum {{ {kind_symbol}={kind}u }};\n"));
+            if let Some(variant) = crate::ir::task::enum_str_layout(layouts, inner) {
+                emit_string_enum_moves(out, variant, &c_ty, &suffix);
+                let place = format!("output->value.{field}");
+                let empty_value = string_enum_empty_value(variant, &place)?;
+                members.push_str(&format!("          KuTaskStringEnumOutcomeV1 {field};\n"));
+                empty.push_str(&format!("    case {kind_symbol}: if ({place}.ok || !({empty_value})) return 0; error=&{place}.error; break;\n"));
+                drop.push_str(&format!("    case {kind_symbol}: if ({place}.ok) {{ if ({place}.tag=={}) ku_string_drop(&{place}.value); }} else ku_error_drop(&{place}.error); break;\n", variant.tag));
+                failure.push_str(&format!("      case {kind_symbol}: {place}=(KuTaskStringEnumOutcomeV1){{.error=error}}; break;\n"));
+                continue;
+            }
+            if enum_name(result).is_some() {
+                out.push_str(&format!(
+                    "typedef char KuTaskEnumOutcomeFits_{suffix}[\n  sizeof({c_ty}) <= sizeof(KuResult_str)\n  && KU_TASK_FRAME_ALIGNOF({c_ty}) <= KU_TASK_FRAME_ALIGNOF(KuResult_str) ? 1 : -1];\n"
+                ));
+            }
+            members.push_str(&format!("          {c_ty} {field};\n"));
+            let payload_empty =
+                empty_expr(layouts, inner, &format!("output->value.{field}.value"))?;
+            empty.push_str(&format!("    case {kind_symbol}: if (output->value.{field}.ok || !({payload_empty})) return 0; error=&output->value.{field}.error; break;\n"));
+            drop.push_str(&format!(
+                "    case {kind_symbol}: ku_result_drop_{suffix}(&output->value.{field}); break;\n"
+            ));
+            failure.push_str(&format!(
+                "      case {kind_symbol}: output->value.{field}.error=error; break;\n"
+            ));
+        }
+        out.push_str(
+            &HOST_ABI
+                .replace("@RECORD_OUTCOME_UNION@", &members)
+                .replace("@RECORD_OUTCOME_EMPTY@", &empty)
+                .replace("@RECORD_OUTCOME_DROP@", &drop)
+                .replace("@RECORD_OUTCOME_FAILURE@", &failure)
+                .replace(
+                    "@RECORD_OUTCOME_LAYOUT@",
+                    if has_records {
+                        " && !defined(KU_TASK_RECORD_OUTCOMES)"
+                    } else {
+                        ""
+                    },
+                ),
+        );
+        out.check()
+    }
+}
+
+const STRING_ENUM_OUTCOME: &str = r#"
+/* Use the string outcome offsets without accessing the padding of another type. */
+typedef struct KuTaskStringEnumOutcomeV1 {
+  bool ok;
+  int32_t tag;
+  KuString value;
+  KuError error;
+} KuTaskStringEnumOutcomeV1;
+typedef char KuTaskStringEnumOutcomeLayoutV1[
+  sizeof(KuTaskStringEnumOutcomeV1)==sizeof(KuResult_str)
+  && KU_TASK_FRAME_ALIGNOF(KuTaskStringEnumOutcomeV1)==KU_TASK_FRAME_ALIGNOF(KuResult_str)
+  && offsetof(KuTaskStringEnumOutcomeV1,ok)==offsetof(KuResult_str,ok)
+  && offsetof(KuTaskStringEnumOutcomeV1,value)==offsetof(KuResult_str,value)
+  && offsetof(KuTaskStringEnumOutcomeV1,error)==offsetof(KuResult_str,error) ? 1 : -1];
+static uint32_t ku_task_adapter_string_charge(KuString value, size_t* charge);
+static int ku_task_adapter_string_overlaps(KuString value, const void* pointer, size_t bytes);
+"#;
+
+fn emit_string_enum_moves(
+    out: &mut COutput,
+    variant: &crate::ir::IrVariantLayout,
+    result: &str,
+    suffix: &str,
+) {
+    let tag = variant.tag;
+    let field = format!(
+        "value.payload.{}.{}",
+        c_ident(&variant.name),
+        c_ident(&variant.fields[0].name)
+    );
+    out.push_str(&format!(
+        r#"
+static KuTaskStringEnumOutcomeV1 ku_task_pack_{suffix}({result}* source) {{
+  KuTaskStringEnumOutcomeV1 packed={{0}};
+  if (source->ok) {{
+    packed.ok=true; packed.tag=source->value.tag;
+    if (packed.tag=={tag}) packed.value=ku_string_move(&source->{field});
+  }} else packed.error=ku_error_move(&source->error);
+  *source=({result}){{0}};
+  return packed;
+}}
+static {result} ku_task_unpack_{suffix}(KuTaskStringEnumOutcomeV1* source) {{
+  {result} unpacked={{0}};
+  if (source->ok) {{
+    unpacked.ok=true; unpacked.value.tag=source->tag;
+    if (source->tag=={tag}) unpacked.{field}=ku_string_move(&source->value);
+  }} else unpacked.error=ku_error_move(&source->error);
+  *source=(KuTaskStringEnumOutcomeV1){{0}};
+  return unpacked;
+}}
+"#
+    ));
+}
+
+fn string_enum_empty_value(variant: &crate::ir::IrVariantLayout, place: &str) -> KuResult<String> {
+    if variant.tag == 0 {
+        let field =
+            super::super::task::empty_value_expr(&IrType::Str, &format!("({place}).value"))?;
+        return Ok(format!("({place}).tag == 0 && ({field})"));
+    }
+    Ok(format!("({place}).tag == 0"))
+}
+
+pub(super) fn compact_enum_empty_result(
+    variant: &crate::ir::IrVariantLayout,
+    place: &str,
+) -> KuResult<String> {
+    let field = string_enum_empty_value(variant, place)?;
+    let error = super::super::task::empty_value_expr(
+        &IrType::Named("__ku_error_type".into()),
+        &format!("({place}).error"),
+    )?;
+    Ok(format!("!({place}).ok && ({field}) && ({error})"))
+}
+
+pub(super) fn empty_expr(layouts: &IrLayoutTable, ty: &IrType, place: &str) -> KuResult<String> {
+    let payload = match ty {
+        IrType::Result(inner) => inner,
+        ty => ty,
+    };
+    if record_name(ty).is_some()
+        || crate::ir::task::enum_int_layout(layouts, payload).is_some()
+        || crate::ir::task::enum_str_layout(layouts, payload).is_some()
+    {
+        return typed_empty_expr(layouts, ty, place, 0, &mut 64);
+    }
+    super::super::task::empty_value_expr(ty, place)
+}
+
+// Test fields rather than padding. A nullable field may use its null form or
+// the all-zero form emitted for a vacant typed output object.
+fn typed_empty_expr(
+    layouts: &IrLayoutTable,
+    ty: &IrType,
+    place: &str,
+    depth: usize,
+    remaining_fields: &mut usize,
+) -> KuResult<String> {
+    if depth > 24 {
+        return Err(unsupported("Task record outcome layout is too deep"));
+    }
+    if let Some(variant) = crate::ir::task::enum_str_layout(layouts, ty) {
+        if variant.tag != 0 {
+            return Ok(format!("({place}).tag == 0"));
+        }
+        let member = format!(
+            "({place}).payload.{}.{}",
+            c_ident(&variant.name),
+            c_ident(&variant.fields[0].name)
+        );
+        let field = super::super::task::empty_value_expr(&IrType::Str, &member)?;
+        return Ok(format!("({place}).tag == 0 && ({field})"));
+    }
+    if let Some(variant) = crate::ir::task::enum_int_layout(layouts, ty) {
+        // The zero tag chooses the only active storage in a vacant enum.
+        // A unit alternative has no field that needs inspection.
+        if variant.tag != 0 {
+            return Ok(format!("({place}).tag == 0"));
+        }
+        return Ok(format!(
+            "({place}).tag == 0 && ({place}).payload.{}.{} == 0",
+            c_ident(&variant.name),
+            c_ident(&variant.fields[0].name),
+        ));
+    }
+    let mut child = |ty: &IrType, field: &str| {
+        typed_empty_expr(
+            layouts,
+            ty,
+            &format!("({place}).{field}"),
+            depth + 1,
+            remaining_fields,
+        )
+    };
     match ty {
-        IrType::Result(inner) => kind(inner),
+        IrType::Result(inner) => {
+            let error = IrType::Named("__ku_error_type".into());
+            Ok(format!(
+                "!({place}).ok && ({}) && ({})",
+                child(inner, "value")?,
+                child(&error, "error")?
+            ))
+        }
+        IrType::Nullable(inner) => Ok(format!("({place}).is_null || ({})", child(inner, "value")?)),
+        IrType::Named(name) if record_name(ty).is_some() => {
+            let layout = layouts
+                .structs
+                .iter()
+                .find(|layout| layout.name == *name)
+                .ok_or_else(|| unsupported("Task record outcome layout is missing"))?;
+            let mut fields = Vec::new();
+            for field in &layout.fields {
+                *remaining_fields = remaining_fields.checked_sub(1).ok_or_else(|| {
+                    unsupported("Task record outcome has too many transitive fields")
+                })?;
+                let expr = typed_empty_expr(
+                    layouts,
+                    &field.ty,
+                    &format!("({place}).{}", c_ident(&field.name)),
+                    depth + 1,
+                    remaining_fields,
+                )?;
+                fields.push(format!("({expr})"));
+            }
+            Ok(if fields.is_empty() {
+                "1".into()
+            } else {
+                fields.join(" && ")
+            })
+        }
+        _ => super::super::task::empty_value_expr(ty, place),
+    }
+}
+
+fn primitive_kind(ty: &IrType) -> KuResult<u32> {
+    match ty {
+        IrType::Result(inner) => primitive_kind(inner),
         IrType::Int => Ok(1),
         IrType::Bool => Ok(2),
         IrType::Null => Ok(3),
@@ -40,7 +371,11 @@ pub(super) fn kind(ty: &IrType) -> KuResult<u32> {
         _ => Err(unsupported("unsupported Task outcome type")),
     }
 }
-pub(super) fn emit(out: &mut COutput, tasks: &TaskProgram) -> KuResult<()> {
+pub(super) fn emit(
+    out: &mut COutput,
+    tasks: &TaskProgram,
+    layouts: &IrLayoutTable,
+) -> KuResult<()> {
     out.check()?;
     if tasks.functions.iter().any(|function| function.slots.iter().any(|slot| matches!(&slot.ty,crate::ir::task::TaskSlotType::Value {ty,..} if crate::ir::task::pg_capture_type(ty)))) {
         out.push_str(PG_CAPTURE);
@@ -49,7 +384,11 @@ pub(super) fn emit(out: &mut COutput, tasks: &TaskProgram) -> KuResult<()> {
         || function.slots.iter().any(|slot|matches!(&slot.ty,crate::ir::task::TaskSlotType::Value{ty,..} if crate::ir::task::http_type(ty)))) {
         out.push_str("#define KU_TASK_HTTP_TYPES 1\n");
     }
-    out.push_str(HOST_ABI);
+    OutcomeKinds::new(tasks).emit(out, layouts)?;
+    if tasks.functions.iter().any(|function|crate::ir::task::http_type(&function.result)
+        || function.slots.iter().any(|slot|matches!(&slot.ty,crate::ir::task::TaskSlotType::Value{ty,..} if crate::ir::task::http_type(ty)))) {
+        out.push_str(include_str!("c_task_http_headers.c"));
+    }
     if super::super::task::uses_blocking_io(tasks) {
         out.push_str(BLOCKING_HOST);
     }
@@ -110,7 +449,7 @@ typedef struct KuTaskAdapterOutcomeV1 {
 #if defined(KU_TASK_HTTP_TYPES)
           KuResult_struct___ku_http_response http_response;
 #endif
-          } value;
+@RECORD_OUTCOME_UNION@          } value;
 } KuTaskAdapterOutcomeV1;
 /* Appended kind 5--7 members must preserve the original kind 1--4 layout.
  * These compile-time assertions apply to the C target's actual ABI. */
@@ -120,7 +459,7 @@ typedef struct KuTaskAdapterOutcomeLegacyV1 {
   union { KuResult_int integer; KuResult_bool boolean;
           KuResult_null null_value; KuResult_str string; } value;
 } KuTaskAdapterOutcomeLegacyV1;
-#if !defined(KU_TASK_HTTP_TYPES)
+#if !defined(KU_TASK_HTTP_TYPES)@RECORD_OUTCOME_LAYOUT@
 typedef char KuTaskOutcomeSizeUnchangedV1[
   sizeof(KuTaskAdapterOutcomeV1)==sizeof(KuTaskAdapterOutcomeLegacyV1) ? 1 : -1];
 typedef char KuTaskOutcomeAlignmentUnchangedV1[
@@ -154,7 +493,16 @@ typedef struct KuTaskAdapterHostV1 {
   void* allocation_context;
   uint32_t (*reconcile_charge)(void*);
   KuTaskBlockingTokenV1* blocking;
+#if defined(KU_TASK_OUTBOUND_HTTP)
+  uint64_t request_deadline; /* Immutable inherited HTTP D, never a slice quantum. */
+#endif
 } KuTaskAdapterHostV1;
+#if defined(KU_TASK_OUTBOUND_HTTP)
+static KU_THREAD_LOCAL uint64_t ku_task_http_entry_deadline;
+#define KU_TASK_HTTP_HOST_INIT(instance) , (instance)->request_deadline
+#else
+#define KU_TASK_HTTP_HOST_INIT(instance)
+#endif
 #define KU_TASK_ALLOCATION_HOST_ABI_VERSION 1u
 enum { KU_TASK_HOST_ALLOCATION_FAILED = 98u };
 /* Zero is a valid function ID. Initialization lives in the owner's bitmap. */
@@ -303,12 +651,13 @@ static int ku_task_outcome_empty(KuTaskAdapterOutcomeV1* output, uint32_t kind) 
     case 7: if (output->value.string_array.ok || output->value.string_array.value.data || output->value.string_array.value.len || output->value.string_array.value.capacity) return 0; error=&output->value.string_array.error; break;
 #if defined(KU_TASK_HTTP_TYPES)
     case 8: if (output->value.http_response.ok || output->value.http_response.value.status
+        || output->value.http_response.value.headers
         || !ku_task_outcome_empty_string(output->value.http_response.value.content_type)
         || !ku_task_outcome_empty_string(output->value.http_response.value.body)
         || !ku_task_outcome_empty_string(output->value.http_response.value.location)) return 0;
       error=&output->value.http_response.error; break;
 #endif
-    default: return 0;
+@RECORD_OUTCOME_EMPTY@    default: return 0;
   }
   return ku_task_outcome_empty_string(error->domain) && ku_task_outcome_empty_string(error->code) && ku_task_outcome_empty_string(error->message);
 }
@@ -324,7 +673,7 @@ static void ku_task_outcome_drop(KuTaskAdapterOutcomeV1* output) {
 #if defined(KU_TASK_HTTP_TYPES)
     case 8: ku_result_drop_struct___ku_http_response(&output->value.http_response); break;
 #endif
-    default: break;
+@RECORD_OUTCOME_DROP@    default: break;
   }
   *output=(KuTaskAdapterOutcomeV1){0};
 }
@@ -376,7 +725,7 @@ static uint32_t ku_task_value_take(KuTaskValueV1* value,
 #if defined(KU_TASK_HTTP_TYPES)
       case 8: output->value.http_response.error=error; break;
 #endif
-      default: return KU_TASK_DRIVER_INVALID_ARGUMENT;
+@RECORD_OUTCOME_FAILURE@      default: return KU_TASK_DRIVER_INVALID_ARGUMENT;
     }
     *value=(KuTaskValueV1){0}; return KU_TASK_DRIVER_OK;
   }
@@ -549,6 +898,78 @@ static uint32_t ku_task_host_net_status(uint32_t status) {
   return status==KU_TASK_DRIVER_PENDING ? KU_TASK_CONTROL_PENDING
       : status==KU_TASK_DRIVER_OK ? KU_TASK_CONTROL_OK : KU_TASK_CONTROL_INVALID_STATE;
 }
+#if defined(KU_TASK_OUTBOUND_HTTP)
+enum { KU_TASK_HTTP_CONFIG_ERROR=100u };
+static uint32_t ku_task_host_http(KuTaskAdapterHostV1* host,KuString method,KuString url,KuString body,uint32_t has_body,
+    KuArray_str names,KuArray_str values,int64_t timeout,int64_t max_body,int64_t config_fault,KuResult_struct___ku_http_response* output){
+  if(!ku_task_host_net_valid(host)||!output)return KU_TASK_CONTROL_INVALID_ARGUMENT;
+  if(ku_task_control_atomic_load(&host->control->phase)!=KU_TASK_CONTROL_LIVE)return KU_TASK_CONTROL_PENDING;
+  uint32_t status=host->blocking->pool?ku_task_blocking_take(host->ticket,host->blocking,0,10u,NULL,output)
+      :ku_task_blocking_submit_http(host->ticket,host->control,host->blocking,method,url,body,has_body,names,values,NULL,timeout,max_body,config_fault,host->request_deadline,host->allocation_context,host->reconcile_charge,output);
+  return status==KU_TASK_HTTP_CONFIG_ERROR?status:ku_task_host_net_status(status);
+}
+static uint32_t ku_task_http_invalid_config(KuResult_struct___ku_http_response* output,const char* message) {
+  *output=(KuResult_struct___ku_http_response){false,{0},__ku_http_client_error("invalid_config",message)};
+  return KU_TASK_HTTP_CONFIG_ERROR;
+}
+static int64_t ku_task_http_optional_int(const KuValue* value,int64_t fallback) {
+  if(!value||value->tag==KU_NULL)return fallback;
+  /* Zero is outside both allowed ranges. The submit path reports this only
+   * after the header validation, as with scalar slot inputs. */
+  return value->tag==KU_INT?value->as.i:0;
+}
+static uint32_t ku_task_host_http_object(KuTaskAdapterHostV1* host,KuValue config,KuResult_struct___ku_http_response* output) {
+  if(!ku_task_host_net_valid(host)||!output)return KU_TASK_CONTROL_INVALID_ARGUMENT;
+  if(ku_task_control_atomic_load(&host->control->phase)!=KU_TASK_CONTROL_LIVE)return KU_TASK_CONTROL_PENDING;
+  if(host->blocking->pool){
+    return ku_task_host_net_status(ku_task_blocking_take(host->ticket,host->blocking,0,10u,NULL,output));
+  }
+  if(config.tag!=KU_OBJECT||!config.as.o)return ku_task_http_invalid_config(output,"http.request requires an object");
+
+  enum { URL, METHOD, BODY, HEADERS, TIMEOUT, MAX_BODY, FIELD_COUNT };
+  static const char* const names[FIELD_COUNT]={"url","method","body","headers","timeout_ms","max_body_bytes"};
+  const KuValue* fields[FIELD_COUNT]={0};
+  const KuObject* object=config.as.o;
+  for(size_t i=0;i<object->cap;i++){
+    const KuEntry* entry=&object->entries[i];
+    if(!entry->used)continue;
+    size_t index=0;
+    for(;index<FIELD_COUNT;index++){
+      if(ku_string_equal(entry->key,ku_string_static((const uint8_t*)names[index],strlen(names[index]))))break;
+    }
+    if(index==FIELD_COUNT)return ku_task_http_invalid_config(output,"unknown http config field");
+    fields[index]=&entry->value;
+  }
+  if(!fields[URL]||fields[URL]->tag!=KU_STR)return ku_task_http_invalid_config(output,"http.request missing required str url");
+  KuString url=fields[URL]->as.s;
+  KuString method=ku_string_static((const uint8_t*)"GET",3);
+  if(fields[METHOD]&&fields[METHOD]->tag!=KU_NULL){
+    if(fields[METHOD]->tag!=KU_STR)return ku_task_http_invalid_config(output,"http.request method must be str");
+    method=fields[METHOD]->as.s;
+  }
+  KuString body={0};
+  uint32_t has_body=fields[BODY]&&fields[BODY]->tag!=KU_NULL;
+  if(has_body){
+    if(fields[BODY]->tag!=KU_STR)return ku_task_http_invalid_config(output,"http.request body must be str");
+    body=fields[BODY]->as.s;
+  }
+  const KuObject* headers=NULL;
+  if(fields[HEADERS]){
+    if(fields[HEADERS]->tag!=KU_OBJECT||!fields[HEADERS]->as.o){
+      return ku_task_http_invalid_config(output,"http.request headers must be object");
+    }
+    headers=fields[HEADERS]->as.o;
+    if(headers->len>1024u)return ku_task_http_invalid_config(output,"http.request has too many headers");
+  }
+  int64_t timeout=ku_task_http_optional_int(fields[TIMEOUT],5000);
+  int64_t max_body=ku_task_http_optional_int(fields[MAX_BODY],1000000);
+  /* This call copies transport inputs into the async owner before publishing
+   * the job. Neither it nor subsequent takes retain the config/descriptor addresses. */
+  uint32_t status=ku_task_blocking_submit_http(host->ticket,host->control,host->blocking,method,url,body,has_body,
+      (KuArray_str){0},(KuArray_str){0},headers,timeout,max_body,0,host->request_deadline,host->allocation_context,host->reconcile_charge,output);
+  return status==KU_TASK_HTTP_CONFIG_ERROR?status:ku_task_host_net_status(status);
+}
+#endif
 static uint32_t ku_task_host_net_connect(KuTaskAdapterHostV1* host,
     KuValue fields[9], uint16_t present, KuResult_net_client* output) {
   if (!ku_task_host_net_valid(host) || !fields || !output) return KU_TASK_CONTROL_INVALID_ARGUMENT;

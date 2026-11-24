@@ -9,6 +9,8 @@ use crate::{
 };
 
 pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value>> {
+    #[cfg(feature = "browser")]
+    crate::browser::preflight_args(args, span)?;
     match function {
         "len" => {
             let value = one_string("string.len", args, span)?;
@@ -20,6 +22,14 @@ pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value
         }
         "chars" => {
             let value = one_string("string.chars", args, span)?;
+            #[cfg(feature = "browser")]
+            crate::browser::allocation(
+                value
+                    .len()
+                    .checked_mul(36)
+                    .ok_or_else(|| crate::browser::fail(span))?,
+                span,
+            )?;
             Ok(Some(Value::Array(
                 value
                     .chars()
@@ -45,10 +55,26 @@ pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value
         }
         "lower" => {
             let value = one_string("string.lower", args, span)?;
+            #[cfg(feature = "browser")]
+            crate::browser::allocation(
+                value
+                    .len()
+                    .checked_mul(3)
+                    .ok_or_else(|| crate::browser::fail(span))?,
+                span,
+            )?;
             Ok(Some(Value::String(value.to_lowercase())))
         }
         "upper" => {
             let value = one_string("string.upper", args, span)?;
+            #[cfg(feature = "browser")]
+            crate::browser::allocation(
+                value
+                    .len()
+                    .checked_mul(3)
+                    .ok_or_else(|| crate::browser::fail(span))?,
+                span,
+            )?;
             Ok(Some(Value::String(value.to_uppercase())))
         }
         "replace" => {
@@ -62,6 +88,19 @@ pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value
             let Value::String(to) = &args[2] else {
                 return Err(expected_type("str", &args[2], span));
             };
+            #[cfg(feature = "browser")]
+            if crate::browser::active() {
+                let count = value.matches(from.as_str()).count();
+                let length = value
+                    .len()
+                    .checked_add(
+                        count
+                            .checked_mul(to.len())
+                            .ok_or_else(|| crate::browser::fail(span))?,
+                    )
+                    .ok_or_else(|| crate::browser::fail(span))?;
+                crate::browser::allocation(length, span)?;
+            }
             Ok(Some(Value::String(value.replace(from, to))))
         }
         "slice" => {

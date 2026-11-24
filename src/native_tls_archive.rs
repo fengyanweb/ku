@@ -46,6 +46,7 @@ const REQUIRED: [&[u8]; 17] = [
 pub(crate) enum NativeTlsArchiveFormat {
     CoffX86_64,
     ElfX86_64,
+    ElfArm64,
     MachOArm64,
 }
 
@@ -56,6 +57,9 @@ struct Member {
 }
 struct Evidence {
     symbols: BTreeSet<Vec<u8>>,
+    required: BTreeSet<Vec<u8>>,
+    tls: bool,
+    rust_static: bool,
     symbol_count: usize,
     build_id: bool,
     build_id_scan_bytes: u64,
@@ -168,7 +172,11 @@ fn trim_bsd_name_padding(name: &[u8]) -> Result<&[u8], String> {
         .iter()
         .rposition(|byte| *byte != 0)
         .map_or(0, |i| i + 1);
-    if name.len() - end > 7 {
+    // LLVM aligns the combined header/name to eight bytes (up to seven
+    // zeroes). Apple cctools rounds the name and the 60-byte header
+    // separately, adding four more zeroes (up to eleven). Both layouts are
+    // emitted by supported toolchains. Embedded NULs still reach safe_name.
+    if name.len() - end > 11 {
         return Err("BSD member name padding exceeds alignment maximum".into());
     }
     Ok(&name[..end])
@@ -307,9 +315,14 @@ fn record_symbol(
     if ev.symbol_count > MAX_SYMBOLS {
         return Err("aggregate symbol limit exceeded".into());
     }
-    if defined && external && REQUIRED.contains(&name) && !ev.symbols.insert(name.to_vec()) {
+    if defined && external && ev.required.contains(name) && !ev.symbols.insert(name.to_vec()) {
         return Err(format!(
-            "duplicate TLS ABI symbol {}",
+            "duplicate {} symbol {}",
+            if ev.tls {
+                "TLS ABI"
+            } else {
+                "static library API"
+            },
             String::from_utf8_lossy(name)
         ));
     }
@@ -399,6 +412,9 @@ fn scan_build_id(
     id: &[u8],
     ev: &mut Evidence,
 ) -> Result<(), String> {
+    if !ev.tls && !ev.rust_static {
+        return Ok(());
+    }
     ev.build_id_scan_ranges = ev
         .build_id_scan_ranges
         .checked_add(1)
@@ -425,13 +441,109 @@ fn scan_build_id(
     Ok(())
 }
 
+fn windows_system_dll(name: &[u8]) -> bool {
+    if name.is_empty()
+        || name.len() > MAX_NAME
+        || !name
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return false;
+    }
+    let lower: Vec<_> = name.iter().map(u8::to_ascii_lowercase).collect();
+    matches!(
+        lower.as_slice(),
+        b"kernel32.dll"
+            | b"advapi32.dll"
+            | b"bcrypt.dll"
+            | b"bcryptprimitives.dll"
+            | b"ntdll.dll"
+            | b"userenv.dll"
+            | b"ws2_32.dll"
+            | b"dbghelp.dll"
+            | b"synchronization.dll"
+            | b"msvcrt.dll"
+            | b"ucrtbase.dll"
+            | b"vcruntime140.dll"
+            | b"vcruntime140_1.dll"
+    ) || windows_api_set(&lower)
+}
+
+fn windows_api_set(name: &[u8]) -> bool {
+    let Some(contract) = name
+        .strip_prefix(b"api-ms-win-")
+        .or_else(|| name.strip_prefix(b"ext-ms-win-"))
+        .and_then(|value| value.strip_suffix(b".dll"))
+    else {
+        return false;
+    };
+    let mut parts = contract.rsplitn(4, |byte| *byte == b'-');
+    let patch = parts.next().unwrap_or_default();
+    let minor = parts.next().unwrap_or_default();
+    let level = parts.next().unwrap_or_default();
+    let family = parts.next().unwrap_or_default();
+    let digits = |part: &[u8]| !part.is_empty() && part.iter().all(u8::is_ascii_digit);
+    digits(patch)
+        && digits(minor)
+        && level.strip_prefix(b"l").is_some_and(digits)
+        && !family.is_empty()
+        && family
+            .split(|byte| *byte == b'-')
+            .all(|part| !part.is_empty() && part.iter().all(u8::is_ascii_alphanumeric))
+}
+
+fn rust_coff_import(file: &mut File, m: &Member, h: &[u8; 20]) -> Result<(), String> {
+    // PE Import Library Format: the Version=0 short header is not a BigObj,
+    // including when long import/DLL names make its member exceed 56 bytes.
+    // https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#import-library-format
+    if u16le(&h[4..]) != 0 || u16le(&h[6..]) != 0x8664 {
+        return Err("expected AMD64 Version=0 COFF short import".into());
+    }
+    let size = u32le(&h[12..]) as u64;
+    if add(20, size, "COFF import size")? != m.len {
+        return Err("COFF short import SizeOfData differs from member size".into());
+    }
+    let flags = u16le(&h[18..]);
+    if flags & 3 > 2 || (flags >> 2) & 7 > 3 || flags >> 5 != 0 {
+        return Err("unsupported COFF short import type/name flags".into());
+    }
+    let data_offset = member_range(m, 20, size, "COFF import strings")?;
+    let data = bounded_vec(
+        file,
+        data_offset,
+        size,
+        2 * (MAX_NAME + 1),
+        "COFF import strings",
+    )?;
+    let name = cstr(&data, 0, "COFF import symbol")?;
+    if name.is_empty() {
+        return Err("COFF short import symbol is empty".into());
+    }
+    let dll_offset = name.len() + 1;
+    let dll = cstr(&data, dll_offset, "COFF import DLL")?;
+    if dll_offset + dll.len() + 1 != data.len() || !windows_system_dll(dll) {
+        return Err("COFF short import DLL is not a bounded system DLL name".into());
+    }
+    // An import cannot define a required API or supply the build identity.
+    Ok(())
+}
+
 fn coff(file: &mut File, m: &Member, id: &[u8], ev: &mut Evidence) -> Result<(), String> {
     let mut h = [0; 20];
     let header = member_range(m, 0, 20, "COFF header")?;
     read_at(file, header, &mut h, "COFF header")?;
     let bigobj = h[..4] == [0, 0, 0xff, 0xff];
+    if bigobj && ev.rust_static && u16le(&h[4..]) == 0 {
+        return rust_coff_import(file, m, &h);
+    }
     let (header_size, ns, sym_rel, count, symbol_size) = if bigobj {
         if m.len < 56 {
+            if ev.rust_static {
+                return Err("truncated or unsupported Rust COFF BigObj header".into());
+            }
+            if !ev.tls {
+                return Err("codec static archive contains a COFF import member".into());
+            }
             if u16le(&h[6..]) != 0x8664 {
                 return Err("wrong-target COFF import member".into());
             }
@@ -445,6 +557,12 @@ fn coff(file: &mut File, m: &Member, id: &[u8], ev: &mut Evidence) -> Result<(),
             0xdc, 0xb8,
         ];
         if u16le(&big[4..]) < 2 || u16le(&big[6..]) != 0x8664 || big[12..28] != CLASS {
+            if ev.rust_static {
+                return Err("invalid AMD64 Rust COFF BigObj header".into());
+            }
+            if !ev.tls {
+                return Err("codec static archive contains a COFF import member".into());
+            }
             if u16le(&big[6..]) != 0x8664 {
                 return Err("wrong-target COFF import member".into());
             }
@@ -478,6 +596,20 @@ fn coff(file: &mut File, m: &Member, id: &[u8], ev: &mut Evidence) -> Result<(),
     charge_sections(ev, ns)?;
     let section_bytes = mul(ns as u64, 40, "COFF section table size")?;
     member_range(m, header_size as u64, section_bytes, "COFF sections")?;
+    let mut import_sections = false;
+    if ev.rust_static {
+        for index in 0..ns {
+            let relative = add(
+                header_size as u64,
+                mul(index as u64, 40, "COFF section offset")?,
+                "COFF section offset",
+            )?;
+            let offset = member_range(m, relative, 8, "COFF section name")?;
+            let mut name = [0; 8];
+            read_at(file, offset, &mut name, "COFF section name")?;
+            import_sections |= name.starts_with(b".idata") || name.starts_with(b".didat");
+        }
+    }
     if count > MAX_SYMBOLS {
         return Err("COFF symbol limit exceeded".into());
     }
@@ -529,7 +661,7 @@ fn coff(file: &mut File, m: &Member, id: &[u8], ev: &mut Evidence) -> Result<(),
             ((u16le(&s[12..]) as i16) as i32, s[16], s[17] as usize)
         };
         let defined = section > 0 && usize::try_from(section).is_ok_and(|value| value <= ns);
-        record_symbol(ev, name, defined, class == 2)?;
+        record_symbol(ev, name, defined && !import_sections, class == 2)?;
         if i + aux >= count {
             return Err("COFF auxiliary symbol overflow".into());
         }
@@ -544,12 +676,20 @@ fn coff(file: &mut File, m: &Member, id: &[u8], ev: &mut Evidence) -> Result<(),
         )?;
         let section = member_range(m, section_rel, 40, "COFF section")?;
         read_at(file, section, &mut s, "COFF section")?;
+        if !ev.tls
+            && !ev.rust_static
+            && (s[..8].starts_with(b".idata") || s[..8].starts_with(b".didat"))
+        {
+            return Err("codec static archive contains a COFF import section".into());
+        }
         let n = u32le(&s[16..]) as u64;
         let relative = u32le(&s[20..]) as u64;
         let characteristics = u32le(&s[36..]);
         if n > 0 && characteristics & 0x40 != 0 {
             let data = member_range(m, relative, n, "COFF section data")?;
-            scan_build_id(file, data, n, id, ev)?;
+            if !import_sections {
+                scan_build_id(file, data, n, id, ev)?;
+            }
         }
     }
     ev.objects += 1;
@@ -557,11 +697,23 @@ fn coff(file: &mut File, m: &Member, id: &[u8], ev: &mut Evidence) -> Result<(),
 }
 
 fn elf(file: &mut File, m: &Member, id: &[u8], ev: &mut Evidence) -> Result<(), String> {
+    elf_machine(file, m, id, ev, 62)
+}
+fn elf_machine(
+    file: &mut File,
+    m: &Member,
+    id: &[u8],
+    ev: &mut Evidence,
+    machine: u16,
+) -> Result<(), String> {
     let mut h = [0; 64];
     let header = member_range(m, 0, 64, "ELF header")?;
     read_at(file, header, &mut h, "ELF header")?;
-    if &h[..6] != b"\x7fELF\x02\x01" || u16le(&h[16..]) != 1 || u16le(&h[18..]) != 62 {
-        return Err("expected x86_64 ELF64 relocatable object".into());
+    if &h[..6] != b"\x7fELF\x02\x01" || u16le(&h[16..]) != 1 || u16le(&h[18..]) != machine {
+        return Err(format!(
+            "expected {} ELF64 relocatable object",
+            if machine == 62 { "x86_64" } else { "aarch64" }
+        ));
     }
     let shoff = u64le(&h[40..]);
     let ents = u16le(&h[58..]) as usize;
@@ -789,6 +941,9 @@ fn validate_with_scan_limit(
     let build_id_prefix = kmp_prefix(expected_build_id)?;
     let mut ev = Evidence {
         symbols: BTreeSet::new(),
+        required: REQUIRED.into_iter().map(Vec::from).collect(),
+        tls: true,
+        rust_static: false,
         symbol_count: 0,
         build_id: false,
         build_id_scan_bytes: 0,
@@ -815,6 +970,9 @@ fn validate_with_scan_limit(
         match format {
             NativeTlsArchiveFormat::CoffX86_64 => coff(file, &m, expected_build_id, &mut ev)?,
             NativeTlsArchiveFormat::ElfX86_64 => elf(file, &m, expected_build_id, &mut ev)?,
+            NativeTlsArchiveFormat::ElfArm64 => {
+                elf_machine(file, &m, expected_build_id, &mut ev, 183)?
+            }
             NativeTlsArchiveFormat::MachOArm64 => macho(file, &m, expected_build_id, &mut ev)?,
         }
     }
@@ -848,6 +1006,140 @@ pub(crate) fn validate(
         expected_build_id,
         file_len.min(MAX_BUILD_ID_SCAN_BYTES),
     )
+}
+
+/// Validate an ordinary C static archive with the same bounded member, object,
+/// section and symbol readers. TLS packs still use `validate` and its original
+/// Rust object/build-id requirements; codec libraries cannot bypass that API.
+pub(crate) fn validate_static(
+    file: &mut File,
+    file_len: u64,
+    format: NativeTlsArchiveFormat,
+    required: &[&[u8]],
+) -> Result<(), String> {
+    if file_len > MAX_ARCHIVE_BYTES {
+        return Err(format!(
+            "archive exceeds the {MAX_ARCHIVE_BYTES}-byte validation limit"
+        ));
+    }
+    if required.is_empty()
+        || required.len() > 128
+        || required
+            .iter()
+            .any(|name| name.is_empty() || name.len() > MAX_NAME || name.contains(&0))
+    {
+        return Err("invalid required static library API symbol list".into());
+    }
+    let mut ev = Evidence {
+        symbols: BTreeSet::new(),
+        required: required.iter().map(|name| name.to_vec()).collect(),
+        tls: false,
+        rust_static: false,
+        symbol_count: 0,
+        build_id: false,
+        build_id_scan_bytes: 0,
+        build_id_scan_limit: 0,
+        build_id_scan_ranges: 0,
+        build_id_prefix: Vec::new(),
+        section_count: 0,
+        rcgu: false,
+        objects: 0,
+    };
+    for member in members(file, file_len)? {
+        match format {
+            NativeTlsArchiveFormat::CoffX86_64 => coff(file, &member, &[], &mut ev)?,
+            NativeTlsArchiveFormat::ElfX86_64 => elf(file, &member, &[], &mut ev)?,
+            NativeTlsArchiveFormat::ElfArm64 => elf_machine(file, &member, &[], &mut ev, 183)?,
+            NativeTlsArchiveFormat::MachOArm64 => macho(file, &member, &[], &mut ev)?,
+        }
+    }
+    if ev.objects == 0 {
+        return Err("static archive contains no target objects".into());
+    }
+    for symbol in &ev.required {
+        if !ev.symbols.contains(symbol.as_slice()) {
+            return Err(format!(
+                "missing defined static library API symbol {}",
+                String::from_utf8_lossy(symbol)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a Rust staticlib with a private C ABI. Windows Rust std includes
+/// system import members, unlike an ordinary codec archive. Imports never
+/// satisfy the required defined API and cannot supply the build identity.
+/// The TLS and ordinary C archive validators keep their separate contracts.
+pub(crate) fn validate_rust_static(
+    file: &mut File,
+    file_len: u64,
+    format: NativeTlsArchiveFormat,
+    required: &[&[u8]],
+    expected_build_id: &[u8],
+) -> Result<(), String> {
+    if file_len > MAX_ARCHIVE_BYTES {
+        return Err(format!(
+            "archive exceeds the {MAX_ARCHIVE_BYTES}-byte validation limit"
+        ));
+    }
+    if required.is_empty()
+        || required.len() > 128
+        || required
+            .iter()
+            .any(|name| name.is_empty() || name.len() > MAX_NAME || name.contains(&0))
+    {
+        return Err("invalid required static library API symbol list".into());
+    }
+    if expected_build_id.is_empty() || expected_build_id.len() > 1024 {
+        return Err("expected build id is invalid".into());
+    }
+    let mut evidence = Evidence {
+        symbols: BTreeSet::new(),
+        required: required.iter().map(|name| name.to_vec()).collect(),
+        tls: false,
+        rust_static: true,
+        symbol_count: 0,
+        build_id: false,
+        build_id_scan_bytes: 0,
+        build_id_scan_limit: file_len.min(MAX_BUILD_ID_SCAN_BYTES),
+        build_id_scan_ranges: 0,
+        build_id_prefix: kmp_prefix(expected_build_id)?,
+        section_count: 0,
+        rcgu: false,
+        objects: 0,
+    };
+    for member in members(file, file_len)? {
+        match format {
+            NativeTlsArchiveFormat::CoffX86_64 => {
+                coff(file, &member, expected_build_id, &mut evidence)?
+            }
+            NativeTlsArchiveFormat::ElfX86_64 => {
+                elf(file, &member, expected_build_id, &mut evidence)?
+            }
+            NativeTlsArchiveFormat::ElfArm64 => {
+                elf_machine(file, &member, expected_build_id, &mut evidence, 183)?
+            }
+            NativeTlsArchiveFormat::MachOArm64 => {
+                macho(file, &member, expected_build_id, &mut evidence)?
+            }
+        }
+    }
+    if evidence.objects == 0 {
+        return Err("Rust static archive contains no target objects".into());
+    }
+    if !evidence.build_id {
+        return Err("expected Rust static build id is absent from object data".into());
+    }
+    for symbol in &evidence.required {
+        if !evidence.symbols.contains(symbol.as_slice()) {
+            return Err(format!(
+                "missing defined static library API symbol {}",
+                String::from_utf8_lossy(symbol)
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -928,9 +1220,12 @@ mod tests {
         temp_with_clock(bytes, clock)
     }
     fn names() -> (Vec<u8>, Vec<u32>) {
+        names_for(&REQUIRED)
+    }
+    fn names_for(required: &[&[u8]]) -> (Vec<u8>, Vec<u32>) {
         let mut table = vec![0];
         let mut offsets = Vec::new();
-        for name in REQUIRED {
+        for name in required {
             offsets.push(table.len() as u32);
             table.extend_from_slice(name);
             table.push(0);
@@ -938,14 +1233,17 @@ mod tests {
         (table, offsets)
     }
     fn coff_fixture(id: &[u8]) -> Vec<u8> {
-        let (strings, offsets) = names();
+        coff_with_symbols(id, &REQUIRED)
+    }
+    fn coff_with_symbols(id: &[u8], required: &[&[u8]]) -> Vec<u8> {
+        let (strings, offsets) = names_for(required);
         let raw = 60u32;
         let symbols = raw + id.len() as u32;
-        let mut out = vec![0; symbols as usize + REQUIRED.len() * 18 + 4 + strings.len()];
+        let mut out = vec![0; symbols as usize + required.len() * 18 + 4 + strings.len()];
         out[0..2].copy_from_slice(&0x8664u16.to_le_bytes());
         out[2..4].copy_from_slice(&1u16.to_le_bytes());
         out[8..12].copy_from_slice(&symbols.to_le_bytes());
-        out[12..16].copy_from_slice(&(REQUIRED.len() as u32).to_le_bytes());
+        out[12..16].copy_from_slice(&(required.len() as u32).to_le_bytes());
         out[20..26].copy_from_slice(b".rdata");
         out[36..40].copy_from_slice(&(id.len() as u32).to_le_bytes());
         out[40..44].copy_from_slice(&raw.to_le_bytes());
@@ -957,10 +1255,23 @@ mod tests {
             out[at + 12..at + 14].copy_from_slice(&1i16.to_le_bytes());
             out[at + 16] = 2;
         }
-        let at = symbols as usize + REQUIRED.len() * 18;
+        let at = symbols as usize + required.len() * 18;
         out[at..at + 4].copy_from_slice(&((strings.len() + 4) as u32).to_le_bytes());
         out[at + 4..].copy_from_slice(&strings);
         out
+    }
+
+    fn short_import(symbol: &[u8], dll: &[u8]) -> Vec<u8> {
+        let mut output = vec![0; 20];
+        output[..4].copy_from_slice(&[0, 0, 0xff, 0xff]);
+        output[6..8].copy_from_slice(&0x8664u16.to_le_bytes());
+        output[12..16].copy_from_slice(&((symbol.len() + dll.len() + 2) as u32).to_le_bytes());
+        output[18..20].copy_from_slice(&4u16.to_le_bytes()); // CODE, IMPORT_OBJECT_NAME.
+        output.extend_from_slice(symbol);
+        output.push(0);
+        output.extend_from_slice(dll);
+        output.push(0);
+        output
     }
     fn elf_fixture(id: &[u8]) -> Vec<u8> {
         let (strings, offsets) = names();
@@ -1097,6 +1408,9 @@ mod tests {
         let id = b"fixture-build-id";
         let mut evidence = Evidence {
             symbols: BTreeSet::new(),
+            required: REQUIRED.into_iter().map(Vec::from).collect(),
+            tls: true,
+            rust_static: false,
             symbol_count: 0,
             build_id: false,
             build_id_scan_bytes: 0,
@@ -1129,6 +1443,11 @@ mod tests {
             NativeTlsArchiveFormat::ElfX86_64 => {
                 ar("ku_native_tls.fixture.rcgu.o", &elf_fixture(id))
             }
+            NativeTlsArchiveFormat::ElfArm64 => {
+                let mut object = elf_fixture(id);
+                object[18..20].copy_from_slice(&183u16.to_le_bytes());
+                ar("ku_native_tls.fixture.rcgu.o", &object)
+            }
             NativeTlsArchiveFormat::MachOArm64 => {
                 ar("ku_native_tls.fixture.rcgu.o", &macho_fixture(id))
             }
@@ -1160,6 +1479,173 @@ mod tests {
             drop(file);
             std::fs::remove_file(path).ok();
         }
+    }
+
+    #[test]
+    fn ordinary_static_archives_keep_target_and_symbol_checks_without_tls_identity() {
+        for (object, format, other) in [
+            (
+                coff_fixture(b"ordinary-C-data"),
+                NativeTlsArchiveFormat::CoffX86_64,
+                NativeTlsArchiveFormat::ElfX86_64,
+            ),
+            (
+                elf_fixture(b"ordinary-C-data"),
+                NativeTlsArchiveFormat::ElfX86_64,
+                NativeTlsArchiveFormat::MachOArm64,
+            ),
+            (
+                macho_fixture(b"ordinary-C-data"),
+                NativeTlsArchiveFormat::MachOArm64,
+                NativeTlsArchiveFormat::CoffX86_64,
+            ),
+        ] {
+            let bytes = ar("codec.o", &object);
+            let (path, mut file) = temp(&bytes);
+            validate_static(&mut file, bytes.len() as u64, format, &[REQUIRED[0]]).unwrap();
+            assert!(validate(&mut file, bytes.len() as u64, format, b"ordinary-C-data").is_err());
+            assert!(validate_static(&mut file, bytes.len() as u64, other, &[REQUIRED[0]]).is_err());
+            assert!(validate_static(
+                &mut file,
+                bytes.len() as u64,
+                format,
+                &[b"missing_codec_entry"]
+            )
+            .is_err());
+            assert!(
+                validate_static(&mut file, bytes.len() as u64 - 1, format, &[REQUIRED[0]]).is_err()
+            );
+            drop(file);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    const CALENDAR_API: [&[u8]; 4] = [
+        b"__ku_calendar_abi_version",
+        b"__ku_calendar_v1_build_id",
+        b"__ku_calendar_call_v1",
+        b"__ku_calendar_release_v1",
+    ];
+
+    fn rust_validation(bytes: &[u8], id: &[u8]) -> Result<(), String> {
+        let (path, mut file) = temp(bytes);
+        let result = validate_rust_static(
+            &mut file,
+            bytes.len() as u64,
+            NativeTlsArchiveFormat::CoffX86_64,
+            &CALENDAR_API,
+            id,
+        );
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+        result
+    }
+
+    #[test]
+    fn rust_static_accepts_system_short_imports_without_relaxing_codecs() {
+        let id = b"calendar-build-identity";
+        let mut bytes = ar("calendar.rcgu.o", &coff_with_symbols(id, &CALENDAR_API));
+        for (symbol, dll) in [
+            (b"Sleep".as_slice(), b"kernel32.dll".as_slice()),
+            (
+                b"GetSystemTimePreciseAsFileTime".as_slice(),
+                b"KERNEL32.DLL".as_slice(),
+            ),
+            (
+                b"WaitOnAddress".as_slice(),
+                b"api-ms-win-core-synch-l1-2-0.dll".as_slice(),
+            ),
+        ] {
+            let import = short_import(symbol, dll);
+            bytes.extend_from_slice(&ar("kernel32.dll", &import)[8..]);
+        }
+        let mut idata = coff_with_symbols(b"import-only-data", &[b"__IMPORT_DESCRIPTOR_kernel32"]);
+        idata[20..28].copy_from_slice(b".idata$2");
+        bytes.extend_from_slice(&ar("descriptor.o", &idata)[8..]);
+        rust_validation(&bytes, id).unwrap();
+        let (path, mut file) = temp(&bytes);
+        let error = validate_static(
+            &mut file,
+            bytes.len() as u64,
+            NativeTlsArchiveFormat::CoffX86_64,
+            &CALENDAR_API,
+        )
+        .unwrap_err();
+        assert!(error.contains("COFF import member"), "{error}");
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rust_static_rejects_malformed_short_imports() {
+        let id = b"calendar-build-identity";
+        let valid = short_import(b"GetSystemTimePreciseAsFileTime", b"kernel32.dll");
+        assert!(valid.len() > 56, "exercise a long short-import member");
+        let mut variants = Vec::new();
+        let mut wrong_machine = valid.clone();
+        wrong_machine[6..8].copy_from_slice(&0xaa64u16.to_le_bytes());
+        variants.push(wrong_machine);
+        variants.push(valid[..19].to_vec());
+        let mut bad_size = valid.clone();
+        bad_size[12..16].copy_from_slice(&1u32.to_le_bytes());
+        variants.push(bad_size);
+        let mut unterminated = valid.clone();
+        *unterminated.last_mut().unwrap() = b'x';
+        variants.push(unterminated);
+        let mut bad_flags = valid.clone();
+        bad_flags[18..20].copy_from_slice(&0x8004u16.to_le_bytes());
+        variants.push(bad_flags);
+        let mut bad_version = valid.clone();
+        bad_version[4..6].copy_from_slice(&1u16.to_le_bytes());
+        variants.push(bad_version);
+        variants.push(short_import(b"Sleep", b"../kernel32.dll"));
+        variants.push(short_import(b"Sleep", b"custom-runtime.dll"));
+        variants.push(short_import(b"Sleep", b"api-ms-win-.dll"));
+        variants.push(short_import(b"Sleep", b"api-ms-win-core-synch.dll"));
+        variants.push(short_import(b"", b"kernel32.dll"));
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        let size = trailing.len() as u32 - 20;
+        trailing[12..16].copy_from_slice(&size.to_le_bytes());
+        variants.push(trailing);
+        for bad in variants {
+            let mut bytes = ar("calendar.o", &coff_with_symbols(id, &CALENDAR_API));
+            bytes.extend_from_slice(&ar("kernel32.dll", &bad)[8..]);
+            assert!(rust_validation(&bytes, id).is_err());
+        }
+    }
+
+    #[test]
+    fn rust_static_requires_real_definitions_and_nonimport_build_identity() {
+        let id = b"calendar-build-identity";
+        let mut bytes = ar("data.o", &coff_with_symbols(id, &[]));
+        for symbol in CALENDAR_API {
+            bytes.extend_from_slice(
+                &ar("kernel32.dll", &short_import(symbol, b"kernel32.dll"))[8..],
+            );
+        }
+        assert!(rust_validation(&bytes, id)
+            .unwrap_err()
+            .contains("missing defined"));
+        let mut idata = coff_with_symbols(id, &CALENDAR_API);
+        idata[20..28].copy_from_slice(b".idata$5");
+        let mut bytes = ar("data.o", &coff_with_symbols(id, &[]));
+        bytes.extend_from_slice(&ar("thunk.o", &idata)[8..]);
+        assert!(rust_validation(&bytes, id)
+            .unwrap_err()
+            .contains("missing defined"));
+        let mut bytes = ar(
+            "calendar.o",
+            &coff_with_symbols(b"different-build", &CALENDAR_API),
+        );
+        bytes.extend_from_slice(&ar("kernel32.dll", &short_import(id, b"kernel32.dll"))[8..]);
+        assert!(rust_validation(&bytes, id)
+            .unwrap_err()
+            .contains("build id is absent"));
+        let bytes = ar("kernel32.dll", &short_import(id, b"kernel32.dll"));
+        assert!(rust_validation(&bytes, id)
+            .unwrap_err()
+            .contains("no target objects"));
     }
 
     #[test]
@@ -1238,7 +1724,19 @@ mod tests {
         ] {
             assert!(!is_bsd_symbol_table(trim_bsd_name_padding(name).unwrap()));
         }
-        assert!(trim_bsd_name_padding(b"name\0\0\0\0\0\0\0\0").is_err());
+        assert!(trim_bsd_name_padding(b"name\0\0\0\0\0\0\0\0\0\0\0\0").is_err());
+        // cctools' round(name,8)+4 layout for a nine-byte member name.
+        let mut archive = b"!<arch>\n".to_vec();
+        let mut name = b"adler32.o".to_vec();
+        name.extend_from_slice(&[0; 11]);
+        append_bsd_member(&mut archive, &name, b"payload");
+        let (path, mut file) = temp(&archive);
+        let parsed = members(&mut file, archive.len() as u64).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, b"adler32.o");
+        assert_eq!(parsed[0].len, 7);
+        drop(file);
+        std::fs::remove_file(path).ok();
     }
 
     #[test]
@@ -1471,5 +1969,9 @@ mod tests {
         validate(&mut file, len, NativeTlsArchiveFormat::CoffX86_64,
             b"ku-native-tls/0.1.0;abi=1;rustls=0.23.40;ring=0.17.14;webpki-roots=1.0.7;buffer=65536;handshake=1048576;record-staging=65540;resumption=disabled")
             .expect("real MSVC ku-native-tls staticlib must validate");
+        validate_rust_static(&mut file, len, NativeTlsArchiveFormat::CoffX86_64,
+            &REQUIRED[..4],
+            b"ku-native-tls/0.1.0;abi=1;rustls=0.23.40;ring=0.17.14;webpki-roots=1.0.7;buffer=65536;handshake=1048576;record-staging=65540;resumption=disabled")
+            .expect("Rust static reader must retain existing MSVC runtime system imports");
     }
 }

@@ -578,6 +578,24 @@ impl<'a> FunctionEmitter<'a> {
                         self.generator.llvm_type(&args[0].ty)?;
                         return Ok(false);
                     }
+                    if name == "__ku_loop_scope_cleanup" {
+                        // This is a source-name list for C's owning-local table,
+                        // not a runtime call. LLVM still uses its existing
+                        // by-value/string-pointer prototype without native RAII.
+                        if value.ty != IrType::Void
+                            || args.is_empty()
+                            || !args.iter().all(|arg| {
+                                arg.ty == IrType::Str
+                                    && matches!(&arg.kind, IrExprKind::Literal(name)
+                                        if name.len()>2 && name.starts_with('"') && name.ends_with('"'))
+                            })
+                        {
+                            return Err(unsupported(
+                                "LLVM loop cleanup placeholder expects quoted owner names and void type",
+                            ));
+                        }
+                        return Ok(false);
+                    }
                 }
                 self.emit_expr(out, value)?;
             }

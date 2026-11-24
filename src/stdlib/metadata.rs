@@ -13,6 +13,8 @@ pub(crate) enum TypePattern {
     StringOrStringArray,
     ArrayElementOfArg(usize),
     ResultOf(Box<TypePattern>),
+    /// A flat T-or-null result, used by non-consuming array first/last.
+    NullableOf(Box<TypePattern>),
     SameAsArg(usize),
     /// A dynamic tagged value (e.g. `json.parse` result). Maps to `Type::KuValue`.
     KuValue,
@@ -84,6 +86,12 @@ pub(crate) fn argument_modes(name: &str, count: usize) -> Vec<crate::ast::ParamM
             | "string.ends_with"
             | "string.replace"
             | "string.slice"
+            | "zstd.compress"
+            | "zstd.decompress"
+            | "gzip.compress"
+            | "gzip.decompress"
+            | "deflate.compress"
+            | "deflate.decompress"
             | "array.len"
             | "array.is_empty"
             | "array.first"
@@ -112,6 +120,16 @@ pub(crate) fn argument_modes(name: &str, count: usize) -> Vec<crate::ast::ParamM
             | "time.elapsed"
             | "time.from_unix"
             | "time.from_millis"
+            | "time.duration"
+            | "time.datetime"
+            | "time.format"
+            | "time.parse"
+            | "time.parts"
+            | "time.weekday"
+            | "time.add"
+            | "time.sub"
+            | "time.diff"
+            | "time.compare"
             | "time.is_leap"
             | "time.days_in_month"
             | "time.sleep"
@@ -184,7 +202,16 @@ pub(crate) fn argument_modes(name: &str, count: usize) -> Vec<crate::ast::ParamM
 pub(crate) fn supports_borrowed_call(name: &str) -> bool {
     matches!(
         name,
-        "len"
+        "zstd.compress"
+            | "zstd.decompress"
+            | "gzip.compress"
+            | "gzip.decompress"
+            | "deflate.compress"
+            | "deflate.decompress"
+            | "string.trim"
+            | "string.lower"
+            | "string.upper"
+            | "len"
             | "str"
             | "print"
             | "println"
@@ -233,6 +260,9 @@ pub(crate) fn builtin_signature(name: &str) -> Option<Signature> {
 pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature> {
     let name = format!("{module}.{function}");
     let args = match (module, function) {
+        ("zstd" | "gzip" | "deflate", "compress" | "decompress") => {
+            vec![ArgRule::Is(TypePattern::Native(BYTES)), int_arg()]
+        }
         ("fs", "read") => vec![str_arg()],
         ("fs", "try_read") => vec![str_arg()],
         ("fs", "write") => vec![str_arg(), str_arg()],
@@ -260,12 +290,32 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("config", "env") => vec![],
         ("config", "env_file") => vec![str_arg()],
         ("config", "yaml") => vec![str_arg()],
-        ("time", "now" | "instant" | "unix" | "millis" | "steady_millis" | "date") => {
+        ("time", "now" | "instant" | "steady_millis" | "date") => {
             vec![]
         }
-        ("time", "elapsed") => vec![ArgRule::Is(TypePattern::ObjectAny)],
+        // The checker owns time's overload/arity rules. These signatures keep
+        // optional inputs read-only and provide the public object shape; native
+        // IR refines Time/Duration to separate, tagged Copy ABI values.
+        ("time", "elapsed" | "unix" | "millis") => vec![ArgRule::Is(TypePattern::ObjectAny)],
         ("time", "from_unix" | "from_millis" | "is_leap") => vec![int_arg()],
+        ("time", "duration") => vec![int_arg(), str_arg()],
+        ("time", "add" | "sub" | "diff" | "compare") => vec![
+            ArgRule::Is(TypePattern::ObjectAny),
+            ArgRule::Is(TypePattern::ObjectAny),
+        ],
         ("time", "days_in_month") => vec![int_arg(), int_arg()],
+        ("time", "datetime") => vec![
+            int_arg(),
+            int_arg(),
+            int_arg(),
+            int_arg(),
+            int_arg(),
+            int_arg(),
+            str_arg(),
+        ],
+        ("time", "format") => vec![ArgRule::Is(TypePattern::ObjectAny), str_arg(), str_arg()],
+        ("time", "parse") => vec![str_arg(), str_arg(), str_arg()],
+        ("time", "parts" | "weekday") => vec![ArgRule::Is(TypePattern::ObjectAny), str_arg()],
         ("time", "sleep") => vec![ArgRule::Is(TypePattern::Any)],
         ("task", "stats") => vec![],
         ("task", "stress") => vec![int_arg(), int_arg(), int_arg()],
@@ -333,6 +383,9 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         )))),
         ("lexer", "scan") => TypePattern::ArrayOf(Box::new(TypePattern::String)),
         ("parser", "parse") => TypePattern::String,
+        ("zstd" | "gzip" | "deflate", "compress" | "decompress") => {
+            TypePattern::ResultOf(Box::new(TypePattern::Native(BYTES)))
+        }
         ("string", "len" | "byte_len") => TypePattern::Int,
         ("string", "chars") => TypePattern::ArrayOf(Box::new(TypePattern::String)),
         ("string", "contains" | "starts_with" | "ends_with") => TypePattern::Bool,
@@ -340,7 +393,9 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("string", "trim" | "lower" | "upper" | "replace") => TypePattern::String,
         ("array", "len") => TypePattern::Int,
         ("array", "is_empty") => TypePattern::Bool,
-        ("array", "first" | "last") => TypePattern::ArrayElementOfArg(0),
+        ("array", "first" | "last") => {
+            TypePattern::NullableOf(Box::new(TypePattern::ArrayElementOfArg(0)))
+        }
         ("array", "try_get") => TypePattern::ResultOf(Box::new(TypePattern::ArrayElementOfArg(0))),
         ("array", "push" | "concat") => TypePattern::SameAsArg(0),
         ("object", "get_or") => TypePattern::Unknown,
@@ -352,8 +407,19 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("json", "stringify" | "encode") => TypePattern::ResultOf(Box::new(TypePattern::String)),
         ("config", "env" | "env_file") => TypePattern::ObjectAny,
         ("config", "yaml") => TypePattern::ResultOf(Box::new(TypePattern::ObjectAny)),
-        ("time", "instant" | "date" | "from_unix" | "from_millis") => TypePattern::ObjectAny,
-        ("time", "now" | "elapsed" | "unix" | "millis" | "steady_millis") => TypePattern::Int,
+        ("time", "instant" | "from_unix" | "from_millis" | "add" | "sub" | "diff") => {
+            TypePattern::ObjectAny
+        }
+        ("time", "duration" | "datetime" | "parse") => {
+            TypePattern::ResultOf(Box::new(TypePattern::ObjectAny))
+        }
+        ("time", "format") => TypePattern::String,
+        ("time", "date") => calendar_date_pattern(),
+        ("time", "parts") => calendar_parts_pattern(),
+        ("time", "weekday") => TypePattern::Int,
+        ("time", "now" | "elapsed" | "unix" | "millis" | "steady_millis" | "compare") => {
+            TypePattern::Int
+        }
         ("time", "is_leap") => TypePattern::Bool,
         ("time", "days_in_month") => TypePattern::ResultOf(Box::new(TypePattern::Int)),
         ("time", "sleep") => TypePattern::ResultOf(Box::new(TypePattern::Null)),
@@ -585,7 +651,7 @@ fn dotted_failure_mode(module: &str, function: &str) -> FailureMode {
         | ("kuvalue", "as_int" | "as_str" | "take")
         | ("json", "parse" | "try_parse" | "decode" | "stringify" | "encode")
         | ("config", "yaml")
-        | ("time", "days_in_month" | "sleep")
+        | ("time", "duration" | "days_in_month" | "sleep" | "datetime" | "parse")
         | ("http", "get" | "post" | "request")
         | ("pg", "client")
         | ("pg_client", "query" | "query_one_typed")
@@ -594,7 +660,14 @@ fn dotted_failure_mode(module: &str, function: &str) -> FailureMode {
         | ("redis", "client")
         | ("bytes", "from_str" | "from_array")
         | ("net", "client") => FailureMode::ReturnsResult,
-        ("config", "env_file") | ("task", "stats" | "stress") => FailureMode::MayPanic,
+        ("zstd" | "gzip" | "deflate", "compress" | "decompress") => FailureMode::ReturnsResult,
+        ("config", "env_file")
+        | ("task", "stats" | "stress")
+        | (
+            "time",
+            "from_unix" | "from_millis" | "add" | "sub" | "diff" | "date" | "format" | "parts"
+            | "weekday",
+        ) => FailureMode::MayPanic,
         _ => FailureMode::Never,
     }
 }
@@ -615,7 +688,17 @@ pub(crate) const MYSQL_RESULT: &str = "__ku_mysql_result";
 pub(crate) fn module_requires_import(module: &str) -> bool {
     matches!(
         module,
-        "fs" | "http" | "config" | "task" | "pg" | "redis" | "mysql" | "bytes" | "net"
+        "fs" | "http"
+            | "config"
+            | "task"
+            | "pg"
+            | "redis"
+            | "mysql"
+            | "bytes"
+            | "net"
+            | "zstd"
+            | "gzip"
+            | "deflate"
     )
 }
 
@@ -637,6 +720,9 @@ pub(crate) fn is_std_module(module: &str) -> bool {
             | "mysql"
             | "bytes"
             | "net"
+            | "zstd"
+            | "gzip"
+            | "deflate"
     )
 }
 
@@ -751,6 +837,26 @@ fn task_stress_pattern() -> TypePattern {
     ])
 }
 
+fn calendar_date_pattern() -> TypePattern {
+    TypePattern::ObjectFields(vec![
+        ("kind".into(), TypePattern::String),
+        ("year".into(), TypePattern::Int),
+        ("month".into(), TypePattern::Int),
+        ("day".into(), TypePattern::Int),
+    ])
+}
+
+fn calendar_parts_pattern() -> TypePattern {
+    let TypePattern::ObjectFields(mut fields) = calendar_date_pattern() else {
+        unreachable!()
+    };
+    for name in ["hour", "minute", "second", "millis", "weekday"] {
+        fields.push((name.into(), TypePattern::Int));
+    }
+    fields.push(("zone".into(), TypePattern::String));
+    TypePattern::ObjectFields(fields)
+}
+
 #[cfg(test)]
 mod borrow_tests {
     use super::*;
@@ -814,6 +920,14 @@ mod borrow_tests {
         );
         assert_eq!(argument_modes("http.text", 2), [View, Owned]);
         assert_eq!(argument_modes("unregistered", 2), [Owned, Owned]);
+        for function in ["duration", "add", "sub", "diff", "compare"] {
+            let signature = dotted_signature("time", function).unwrap();
+            assert_eq!(signature.arg_modes, vec![View; signature.args.len()]);
+        }
+        assert_eq!(
+            dotted_signature("time", "duration").unwrap().failure,
+            FailureMode::ReturnsResult
+        );
         assert!(!supports_borrowed_call("array.push"));
         assert!(!supports_borrowed_call("array.first"));
         assert!(!supports_borrowed_call("unregistered"));

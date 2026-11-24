@@ -150,7 +150,14 @@ static uint32_t ku_http_task_start_{id}(void* raw,size_t owner,void* environment
 {captures}
   size_t previous=ku_task_driver_entry_owner;
   ku_task_driver_entry_owner=owner+1u;
+#if defined(KU_TASK_OUTBOUND_HTTP)
+  uint64_t previous_deadline=ku_task_http_entry_deadline;
+  ku_task_http_entry_deadline=deadline;
+#endif
   uint32_t status=ku_task_{id}_start_value(&runtime->driver{argument},&handle->value);
+#if defined(KU_TASK_OUTBOUND_HTTP)
+  ku_task_http_entry_deadline=previous_deadline;
+#endif
 {capture_drops}
   ku_task_driver_entry_owner=previous;
   ku_drop_struct___ku_http_request(req);

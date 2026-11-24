@@ -1,3 +1,5 @@
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
 use std::{
     collections::{HashMap, HashSet},
     io::{Read, Write},
@@ -7,8 +9,10 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
 use crate::{
     ast::{
@@ -23,8 +27,8 @@ use crate::{
         http_listener_registry,
         task::{
             current_cleanup_context, current_task_cancellation, set_execution_termination,
-            CancellationContext, CleanupGuard, ExecutionTerminationGuard, TaskRuntime,
-            TaskRuntimeSnapshot, TaskStressReport,
+            CancellationContext, CleanupGuard, ExecutionTerminationGuard, TaskHandle,
+            TaskRetirementWitness, TaskRuntime, TaskRuntimeSnapshot, TaskStressReport,
         },
     },
     span::{Position, Span},
@@ -32,7 +36,10 @@ use crate::{
     value::{BorrowProjection, BorrowedValue, HttpListenerLease, Value, ValueProjection},
 };
 
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_CALL_DEPTH: usize = 512;
+#[cfg(target_arch = "wasm32")]
+const MAX_CALL_DEPTH: usize = 32;
 const HTTP_HANDLER_TIMEOUT_MESSAGE: &str = "http handler timeout";
 const HTTP_HANDLER_CLEANUP_GRACE: Duration = Duration::from_secs(1);
 const HTTP_ACCEPT_BATCH: usize = 64;
@@ -129,6 +136,7 @@ struct HttpHandlerDeadline {
     timed_out: bool,
     cleanup_deadline: Option<Instant>,
     flight: Option<Arc<http_flight::FlightRecord>>,
+    peer_cancel: Option<Arc<http_io::HandlerCancellation>>,
 }
 
 impl HttpHandlerDeadline {
@@ -138,6 +146,7 @@ impl HttpHandlerDeadline {
             timed_out: false,
             cleanup_deadline: None,
             flight: http_flight::current(),
+            peer_cancel: None,
         }
     }
 
@@ -151,6 +160,69 @@ impl HttpHandlerDeadline {
         self.timed_out |= now >= self.deadline;
         self.timed_out
     }
+}
+
+struct PendingHttpTask {
+    task: Option<TaskHandle>,
+    retirement: TaskRetirementWitness,
+    cancellation: Arc<http_io::HandlerCancellation>,
+    token: http_io::HttpIoToken,
+    reply: Option<http_io::HttpIoReply>,
+}
+
+impl PendingHttpTask {
+    fn new(
+        task: TaskHandle,
+        cancellation: Arc<http_io::HandlerCancellation>,
+        token: http_io::HttpIoToken,
+        reply: http_io::HttpIoReply,
+    ) -> Self {
+        Self {
+            retirement: task.retirement_witness(),
+            task: Some(task),
+            cancellation,
+            token,
+            reply: Some(reply),
+        }
+    }
+
+    fn poll(&mut self, span: Span) -> KuResult<bool> {
+        if let Some(task) = &self.task {
+            if let Some(context) = self.cancellation.context() {
+                task.request_cancel_with(context);
+            }
+            if let Some(result) = task.take_internal_completion()? {
+                let mut reply = self.reply.take().expect("one reply per HTTP task");
+                let (response, origin) = match result {
+                    Ok(ref value) if http_task_admission_failed(value) => (
+                        status_response(503, "Service Unavailable"),
+                        http_io::HttpTraceOrigin::Response,
+                    ),
+                    result => http_handler_response(result),
+                };
+                reply.handler_finished(None, response.status, origin);
+                if self.cancellation.context().is_none() {
+                    reply.respond(self.token, response).map_err(|err| {
+                        KuError::runtime(format!("http handler reply failed: {err}"), span)
+                    })?;
+                }
+                self.task = None;
+            }
+        }
+        Ok(self.task.is_none() && self.retirement.observe().0)
+    }
+}
+
+fn poll_http_tasks(tasks: &mut Vec<PendingHttpTask>, span: Span) -> KuResult<()> {
+    let mut index = 0;
+    while index < tasks.len() {
+        if tasks[index].poll(span)? {
+            tasks.swap_remove(index);
+        } else {
+            index += 1;
+        }
+    }
+    Ok(())
 }
 
 // Opt-in, bounded timing only. Request fields never enter this diagnostic.
@@ -315,6 +387,7 @@ pub struct Interpreter {
     call_depth: usize,
     pending_fail: Option<Value>,
     std_modules: HashSet<String>,
+    checked_index_reads: bool,
     execution_deadline: Option<HttpHandlerDeadline>,
     task_runtime: Option<TaskRuntime>,
     async_execution: bool,
@@ -330,6 +403,7 @@ struct InterpreterTemplate {
     enums: HashMap<String, HashMap<String, usize>>,
     base_dir: PathBuf,
     std_modules: HashSet<String>,
+    checked_index_reads: bool,
 }
 
 impl Interpreter {
@@ -343,6 +417,7 @@ impl Interpreter {
             call_depth: 0,
             pending_fail: None,
             std_modules: HashSet::new(),
+            checked_index_reads: false,
             execution_deadline: None,
             task_runtime: None,
             async_execution: false,
@@ -355,6 +430,15 @@ impl Interpreter {
     pub fn with_base_dir(base_dir: impl Into<PathBuf>) -> Self {
         Self {
             base_dir: base_dir.into(),
+            ..Self::new()
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn with_checked_base_dir(base_dir: PathBuf) -> Self {
+        Self {
+            base_dir,
+            checked_index_reads: true,
             ..Self::new()
         }
     }
@@ -395,7 +479,10 @@ impl Interpreter {
                 Item::Import(_) => {}
             }
         }
-        self.task_runtime = Some(TaskRuntime::new());
+        #[cfg(not(target_arch = "wasm32"))]
+        if !cfg!(feature = "browser") || !crate_browser_active() {
+            self.task_runtime = Some(TaskRuntime::new());
+        }
         let result = (|| -> KuResult<Value> {
             let result = self.call_function("main", Vec::new(), entry_span(), 0)?;
             match result {
@@ -436,8 +523,10 @@ impl Interpreter {
         span: Span,
         depth: usize,
     ) -> KuResult<Value> {
-        self.call_function_flow(name, args, span, depth)?
-            .into_call_value(span, "function")
+        let result = self.call_function_flow(name, args, span, depth);
+        #[cfg(feature = "browser")]
+        let result = result.map_err(|error| crate::browser::contextualize(name, error));
+        result?.into_call_value(span, "function")
     }
 
     fn call_function_flow(
@@ -447,7 +536,13 @@ impl Interpreter {
         span: Span,
         depth: usize,
     ) -> KuResult<Flow> {
+        #[cfg(feature = "browser")]
+        crate::browser::charge(1, span)?;
         if depth >= MAX_CALL_DEPTH || self.call_depth >= MAX_CALL_DEPTH {
+            #[cfg(feature = "browser")]
+            if crate::browser::active() {
+                return Err(crate::browser::fail(span));
+            }
             return Err(KuError::structured(
                 crate::error::KuErrorKind::Runtime,
                 "runtime",
@@ -462,10 +557,20 @@ impl Interpreter {
         let function = source
             .get(name)
             .ok_or_else(|| KuError::runtime(format!("undefined function '{name}'"), span))?;
+        #[cfg(feature = "browser")]
+        if crate::browser::active() && function.is_async {
+            return Err(crate::browser::unsupported("async/await", span));
+        }
         if function.is_async {
             return self
                 .spawn_async_function(function.clone(), args, span)
                 .map(Flow::returned);
+        }
+        #[cfg(feature = "browser")]
+        if crate::browser::active() {
+            return self
+                .call_function_direct_flow(function.clone(), args, span, depth)
+                .map_err(|error| crate::browser::contextualize(name, error));
         }
         if let Some(result) =
             execution::try_execute_borrowed_string(self, function, &mut args, depth)
@@ -519,6 +624,8 @@ impl Interpreter {
 
             let mut leases = Vec::new();
             let mut env = Env::new();
+            #[cfg(feature = "browser")]
+            env.set_browser_origin(&function.name);
             for (param, value) in function.params.iter().zip(args) {
                 if param.mode == ParamMode::Owned {
                     value.require_owned_root(param.span)?;
@@ -589,6 +696,7 @@ impl Interpreter {
             enums: self.enums.clone(),
             base_dir: self.base_dir.clone(),
             std_modules: self.std_modules.clone(),
+            checked_index_reads: self.checked_index_reads,
         }
     }
 
@@ -602,6 +710,7 @@ impl Interpreter {
             call_depth: 0,
             pending_fail: None,
             std_modules: template.std_modules,
+            checked_index_reads: template.checked_index_reads,
             execution_deadline: None,
             task_runtime: Some(runtime),
             async_execution: true,
@@ -618,6 +727,10 @@ impl Interpreter {
     }
 
     fn call_function_value_flow(&mut self, call: FunctionValueCall<'_>) -> KuResult<Flow> {
+        #[cfg(feature = "browser")]
+        if crate::browser::active() && call.is_async {
+            return Err(crate::browser::unsupported("async/await", call.span));
+        }
         if call.is_async {
             let span = call.span;
             self.reject_cleanup_submission(span)?;
@@ -664,6 +777,10 @@ impl Interpreter {
         declared_async: bool,
     ) -> KuResult<Flow> {
         if call.depth >= MAX_CALL_DEPTH || self.call_depth >= MAX_CALL_DEPTH {
+            #[cfg(feature = "browser")]
+            if crate::browser::active() {
+                return Err(crate::browser::fail(call.span));
+            }
             return Err(KuError::structured(
                 crate::error::KuErrorKind::Runtime,
                 "runtime",
@@ -672,7 +789,7 @@ impl Interpreter {
                 call.span,
             ));
         }
-        if !declared_async {
+        if !declared_async && !crate_browser_active() {
             if let Some(result) = execution::try_execute_function_value(self, &call) {
                 return result;
             }
@@ -688,6 +805,11 @@ impl Interpreter {
             span,
             depth,
         } = call;
+        #[cfg(feature = "browser")]
+        let browser_origin = captures
+            .browser_origin()
+            .map(str::to_owned)
+            .or_else(|| self_name.clone());
         self.call_depth += 1;
         let result = (|| -> KuResult<Flow> {
             if params.len() != args.len() || params.len() != param_modes.len() {
@@ -742,6 +864,11 @@ impl Interpreter {
                 .into_call_flow(span, "function value")
         })();
         self.call_depth -= 1;
+        #[cfg(feature = "browser")]
+        let result = result.map_err(|error| match browser_origin.as_deref() {
+            Some(name) => crate::browser::contextualize(name, error),
+            None => error,
+        });
         result
     }
 
@@ -1089,10 +1216,7 @@ impl Interpreter {
                 if let Some(value) = self.take_pending_fail() {
                     return Ok(Flow::fail(value));
                 }
-                print!("{value}");
-                std::io::stdout().flush().map_err(|err| {
-                    KuError::runtime(format!("failed to flush stdout: {err}"), *span)
-                })?;
+                write_output(&value, false, *span)?;
                 Ok(Flow::Continue)
             }
             Stmt::Expr { expr, .. } => {
@@ -1185,6 +1309,9 @@ impl Interpreter {
             {
                 self.tick(expr.span)?;
                 let target = self.eval_borrow_argument(target, env, depth, leases)?;
+                if self.pending_fail.is_some() {
+                    return Ok(Value::Null);
+                }
                 return field_value(&target, name, expr.span);
             }
             ExprKind::Index { target, index } => {
@@ -1234,29 +1361,40 @@ impl Interpreter {
         leases: &mut Vec<BorrowLease>,
         values: &mut Vec<Value>,
     ) -> KuResult<()> {
-        // Reject either argument order before evaluating effects. Paths are
-        // deliberately conservative at the root, matching the checker contract.
+        // Reject either argument order before evaluating effects. A Copy field
+        // read does not move its enclosing owner, so only potential moves
+        // conflict with a View of the same root.
         if modes.contains(&ParamMode::View) && modes.contains(&ParamMode::Owned) {
-            let mut roots = HashMap::<String, u8>::new();
+            let borrowed_roots: HashSet<&str> = args
+                .iter()
+                .zip(modes)
+                .filter(|(_, mode)| **mode == ParamMode::View)
+                .filter_map(|(arg, _)| assignment_expr_root_name(arg))
+                .collect();
             for (index, arg) in args.iter().enumerate() {
-                if let Some(root) = assignment_expr_root(arg) {
-                    let mode = if modes.get(index) == Some(&ParamMode::View) {
-                        1
-                    } else {
-                        2
-                    };
-                    let previous = roots.entry(root.clone()).or_default();
-                    *previous |= mode;
-                    if *previous == 3
-                        && env.contains(&root)
-                        && env
-                            .with_value(&root, arg.span, |value| Ok(value.copy_value().is_none()))?
-                    {
-                        return Err(KuError::runtime(
-                            "borrow conflicts with move in the same call",
-                            arg.span,
-                        ));
-                    }
+                if modes.get(index) == Some(&ParamMode::View) {
+                    continue;
+                }
+                let Some(root) = assignment_expr_root_name(arg) else {
+                    continue;
+                };
+                if borrowed_roots.contains(root)
+                    && env.contains(root)
+                    // The checker already distinguishes Copy index reads from
+                    // moves. Looking up the index here would reorder evaluation
+                    // and could execute user code twice.
+                    && !(self.checked_index_reads && indexed_argument_place(arg))
+                    && !env.with_value(root, arg.span, |value| {
+                        value.with_read(arg.span, |value| {
+                            Ok(plain_field_argument(value, arg)
+                                .is_some_and(|field| field.copy_value().is_some()))
+                        })
+                    })?
+                {
+                    return Err(KuError::runtime(
+                        "borrow conflicts with move in the same call",
+                        arg.span,
+                    ));
                 }
             }
         }
@@ -1406,10 +1544,18 @@ impl Interpreter {
                     }
                     full_name
                 } else {
+                    let string_transform = matches!(name.as_str(), "trim" | "lower" | "upper");
                     if !matches!(
                         name.as_str(),
                         "len" | "byte_len" | "is_empty" | "contains" | "starts_with" | "ends_with"
-                    ) {
+                    ) && !string_transform
+                    {
+                        return Ok(None);
+                    }
+                    if string_transform
+                        && matches!(&target.kind, ExprKind::Variable(qualifier)
+                            if !env.contains(qualifier) && self.enums.contains_key(qualifier))
+                    {
                         return Ok(None);
                     }
                     let value = self.eval_read_argument(target, env, depth, &mut leases)?;
@@ -1627,6 +1773,10 @@ impl Interpreter {
                 Value::String(_) => "string",
                 Value::Array(_) if name != "map" => "array",
                 Value::Object(_) if name == "get_or" => "object",
+                #[cfg(not(target_arch = "wasm32"))]
+                Value::PgClient(_) => "pg_client",
+                #[cfg(not(target_arch = "wasm32"))]
+                Value::PgResult(_) => "pg_result",
                 _ => "",
             })
         })?;
@@ -1673,11 +1823,75 @@ impl Interpreter {
             "array" => stdlib::array::eval(name, &values, span),
             "object" => stdlib::object::eval(name, &values, span),
             "kuvalue" => eval_kuvalue_method(name, &mut values, span),
+            #[cfg(not(target_arch = "wasm32"))]
+            "pg_client" if name == "query" || name == "query_one_typed" => {
+                self.eval_pg_query(name, &values, span)
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            "pg_client" | "pg_result" => stdlib::pg::eval_method(module, name, &values, span),
             _ => Ok(None),
         }?;
         value
             .map(Some)
             .ok_or_else(|| KuError::runtime(format!("unknown {module} method '{name}'"), span))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn eval_pg_query(
+        &mut self,
+        method: &str,
+        values: &[Value],
+        span: Span,
+    ) -> KuResult<Option<Value>> {
+        use crate::runtime::task::{current_blocking_owner_cancelled, current_task_cancelled};
+
+        self.reject_cleanup_submission(span)?;
+        let deadline = self.execution_deadline.as_ref().map(|state| state.deadline);
+        let peer = self
+            .execution_deadline
+            .as_ref()
+            .and_then(|state| state.peer_cancel.clone());
+        let prepared = stdlib::pg::prepare_query(
+            method,
+            values,
+            span,
+            deadline,
+            self.async_execution,
+            &|| {
+                current_task_cancelled()
+                    || peer.as_ref().is_some_and(|peer| peer.context().is_some())
+            },
+        )?;
+        let query = match prepared {
+            Ok(query) => query,
+            Err(error) => {
+                self.poll_termination(span)?;
+                return Ok(Some(error));
+            }
+        };
+        let value = if self.async_execution {
+            let runtime = self
+                .task_runtime
+                .clone()
+                .ok_or_else(|| KuError::runtime("async task runtime is not initialized", span))?;
+            runtime.run_blocking(
+                move || {
+                    Ok(query.execute(&|| {
+                        current_blocking_owner_cancelled()
+                            || peer.as_ref().is_some_and(|peer| peer.context().is_some())
+                    }))
+                },
+                span,
+            )?
+        } else {
+            query.execute(&current_task_cancelled)
+        };
+        self.poll_termination(span)?;
+        if let Some(error) = task_error_payload(&value) {
+            self.pending_fail = Some(error);
+            return Ok(Some(Value::Null));
+        }
+        Ok(Some(value))
     }
 
     fn eval_dotted_builtin(
@@ -1687,6 +1901,33 @@ impl Interpreter {
         span: Span,
     ) -> KuResult<Option<Value>> {
         if let ExprKind::Field { target, name } = &callee.kind {
+            #[cfg(not(target_arch = "wasm32"))]
+            if matches!(&target.kind, ExprKind::Variable(module) if module == "pg")
+                && name == "client"
+            {
+                #[cfg(feature = "browser")]
+                if crate::browser::active() {
+                    return Err(crate::browser::unsupported("pg", span));
+                }
+                self.reject_cleanup_submission(span)?;
+                if self.async_execution {
+                    return Ok(Some(stdlib::errors::err(
+                        "pg",
+                        "backend_unsupported",
+                        "create the PostgreSQL client in synchronous setup before issuing Task queries",
+                    )));
+                }
+                let deadline = self.execution_deadline.as_ref().map(|state| state.deadline);
+                let value = stdlib::pg::eval(
+                    "client",
+                    args,
+                    span,
+                    deadline,
+                    &crate::runtime::task::current_task_cancelled,
+                )?;
+                self.poll_termination(span)?;
+                return Ok(value);
+            }
             if matches!(&target.kind, ExprKind::Variable(module) if module == "task")
                 && self.std_modules.contains("task")
             {
@@ -1742,9 +1983,39 @@ impl Interpreter {
         Ok(Some(value))
     }
 
+    fn eval_interop(
+        &mut self,
+        kind: crate::interop::ReturnKind,
+        args: &[Expr],
+        env: &mut Env,
+        depth: usize,
+        span: Span,
+    ) -> KuResult<Value> {
+        if self.async_execution
+            || self.execution_deadline.is_some()
+            || crate::runtime::task::current_task_id() != 0
+        {
+            return Ok(stdlib::errors::err(
+                "interop",
+                "unavailable",
+                "interop bridge calls may block and require synchronous CLI execution",
+            ));
+        }
+        let (library, operation) = crate::interop::binding_arguments(args, span)?;
+        let mut leases = Vec::new();
+        let mut values = Vec::with_capacity(args.len() - 2);
+        for argument in &args[2..] {
+            values.push(self.eval_read_argument(argument, env, depth, &mut leases)?);
+            if self.pending_fail.is_some() {
+                return Ok(Value::Null);
+            }
+        }
+        crate::interop::invoke(kind, library, operation, &values, span)
+    }
+
     fn eval(&mut self, expr: &Expr, env: &mut Env, depth: usize) -> KuResult<Value> {
         self.tick(expr.span)?;
-        match &expr.kind {
+        let browser_result = match &expr.kind {
             ExprKind::Literal(Literal::Int(value)) => Ok(Value::Int(*value)),
             ExprKind::Literal(Literal::Float(value)) => Ok(Value::Float(*value)),
             ExprKind::Literal(Literal::Bool(value)) => Ok(Value::Bool(*value)),
@@ -1828,6 +2099,11 @@ impl Interpreter {
                 eval_binary(*op, left, right, expr.span)
             }
             ExprKind::Call { callee, args } => {
+                if let ExprKind::Variable(name) = &callee.kind {
+                    if let Some(kind) = crate::interop::ReturnKind::for_bound(name) {
+                        return self.eval_interop(kind, args, env, depth, expr.span);
+                    }
+                }
                 // Register before even the first argument is evaluated: a later
                 // nested call can observe cancellation before this callee starts.
                 let previous_observers = self.caller_owners.len();
@@ -2198,7 +2474,12 @@ impl Interpreter {
                     )),
                 }
             }
+        };
+        #[cfg(feature = "browser")]
+        if let Ok(value) = &browser_result {
+            crate::browser::preflight_args(std::slice::from_ref(value), expr.span)?;
         }
+        browser_result
     }
 
     fn eval_index_expr(
@@ -2310,14 +2591,17 @@ impl Interpreter {
         span: Span,
     ) -> KuResult<()> {
         source.require_owned_root(span)?;
-        let Value::Object(mut fields) = source else {
-            return Err(KuError::runtime(
-                format!(
-                    "type error: object destructuring expects object but got {}",
-                    source.type_name()
-                ),
-                span,
-            ));
+        let mut fields = match source {
+            Value::Object(fields) | Value::Struct { fields, .. } => fields,
+            other => {
+                return Err(KuError::runtime(
+                    format!(
+                        "type error: object destructuring expects object but got {}",
+                        other.type_name()
+                    ),
+                    span,
+                ))
+            }
         };
         for binding in bindings {
             let value = match fields.remove(&binding.field) {
@@ -2692,17 +2976,13 @@ impl Interpreter {
                     )),
                 }));
             }
-            return Ok(Some(http_error_result(
-                "listen_failed",
-                match self.run_http_listener(
+            return Ok(Some(result_from_listener_operation(
+                self.run_http_listener(
                     http_listener_value(listener_id, bound_address, target_value, compiled_router),
                     span,
-                ) {
-                    Ok(()) => "http service listen returned unexpectedly".to_string(),
-                    Err(err) if err.runtime_termination().is_some() => return Err(err),
-                    Err(err) => err.message,
-                },
-            )));
+                ),
+                "listen_failed",
+            )?));
         }
         if args.len() != 2 {
             return Err(KuError::runtime(
@@ -2770,8 +3050,10 @@ impl Interpreter {
         let mut io = http_io::HttpIo::start(tcp, limits).map_err(|err| {
             KuError::runtime(format!("http I/O reactor setup failed: {err}"), span)
         })?;
+        let mut pending: Vec<PendingHttpTask> = Vec::new();
         loop {
             self.poll_termination(span)?;
+            poll_http_tasks(&mut pending, span)?;
             // Preserve the original termination observation interval. Socket
             // readiness and every connection deadline progress independently on
             // the single I/O thread, including while this handler is running.
@@ -2779,6 +3061,9 @@ impl Interpreter {
                 .next_job(HTTP_EVENT_LOOP_SLEEP)
                 .map_err(|err| KuError::runtime(format!("http I/O reactor failed: {err}"), span))?
             else {
+                if io.is_finished() {
+                    return self.drain_http_handlers(&mut pending, span);
+                }
                 continue;
             };
             job.reply.handler_started();
@@ -2786,12 +3071,49 @@ impl Interpreter {
             let trace_start = slow_trace
                 .as_ref()
                 .and_then(|trace| trace.begin(job.deadline, limits.handler_timeout));
-            let (response, origin) = self.execute_http_handler_job_traced(
-                job.request,
-                &compiled_router,
-                span,
-                job.deadline,
-            );
+            let (response, origin) =
+                match prepare_http_handler(job.request, &compiled_router, span, job.deadline) {
+                    Err(response) => response,
+                    Ok((handler, request))
+                        if matches!(handler, Value::Function { is_async: true, .. }) =>
+                    {
+                        if pending.len() < limits.max_active_requests
+                            && pending.try_reserve(1).is_ok()
+                        {
+                            let cancellation = job.reply.watch_peer().map_err(|err| {
+                                KuError::runtime(
+                                    format!("http handler peer watch failed: {err}"),
+                                    span,
+                                )
+                            })?;
+                            let task = self.spawn_http_handler(
+                                handler,
+                                request,
+                                span,
+                                job.deadline,
+                                job.flight,
+                                Arc::clone(&cancellation),
+                            )?;
+                            pending.push(PendingHttpTask::new(
+                                task,
+                                cancellation,
+                                job.token,
+                                job.reply,
+                            ));
+                            continue;
+                        }
+                        (
+                            status_response(503, "Service Unavailable"),
+                            http_io::HttpTraceOrigin::Response,
+                        )
+                    }
+                    Ok((handler, request)) => http_handler_response(self.call_http_handler(
+                        handler,
+                        request,
+                        span,
+                        job.deadline,
+                    )),
+                };
             let trace_sample = trace_start.map(HttpSlowTraceStart::finish);
             let status = response.status;
             job.reply
@@ -2808,6 +3130,40 @@ impl Interpreter {
         }
     }
 
+    fn drain_http_handlers(
+        &mut self,
+        pending: &mut Vec<PendingHttpTask>,
+        span: Span,
+    ) -> KuResult<()> {
+        let mut deadline = http_deadline(HTTP_HANDLER_CLEANUP_GRACE);
+        loop {
+            self.poll_termination(span)?;
+            poll_http_tasks(pending, span)?;
+            if pending.is_empty() {
+                return Ok(());
+            }
+            for handler in pending.iter() {
+                for context in [
+                    handler.cancellation.context(),
+                    handler.retirement.observe().1,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    deadline = deadline.min(context.cleanup_deadline);
+                }
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(KuError::runtime(
+                    "async HTTP handler cleanup timed out",
+                    span,
+                ));
+            }
+            std::thread::sleep(remaining.min(HTTP_EVENT_LOOP_SLEEP));
+        }
+    }
+
     #[cfg(test)]
     fn execute_http_handler_job(
         &mut self,
@@ -2816,59 +3172,38 @@ impl Interpreter {
         span: Span,
         deadline: Instant,
     ) -> HttpWireResponse {
-        self.execute_http_handler_job_traced(request, compiled_router, span, deadline)
-            .0
+        match prepare_http_handler(request, compiled_router, span, deadline) {
+            Ok((handler, request)) => {
+                http_handler_response(self.call_http_handler(handler, request, span, deadline)).0
+            }
+            Err((response, _)) => response,
+        }
     }
 
-    fn execute_http_handler_job_traced(
-        &mut self,
-        request: ParsedHttpRequest,
-        compiled_router: &Value,
+    fn spawn_http_handler(
+        &self,
+        handler: Value,
+        request: Value,
         span: Span,
         deadline: Instant,
-    ) -> (HttpWireResponse, http_io::HttpTraceOrigin) {
-        use http_io::HttpTraceOrigin;
-        // Queueing spends the same handler deadline. Do not prepare an expired
-        // job or enter its handler/cleanup state after the original deadline.
-        let now = Instant::now();
-        if now >= deadline {
-            if let Some(flight) = http_flight::current() {
-                flight.expire_at(http_flight::Stage::QueueExpired, now);
+        flight: Option<Arc<http_flight::FlightRecord>>,
+        cancellation: Arc<http_io::HandlerCancellation>,
+    ) -> KuResult<TaskHandle> {
+        let runtime = self
+            .task_runtime
+            .clone()
+            .ok_or_else(|| KuError::runtime("async task runtime is not initialized", span))?;
+        let child_runtime = runtime.clone();
+        runtime.spawn_deferred(|| {
+            let template = self.template();
+            move || {
+                let _flight = http_flight::FlightGuard::enter(flight);
+                let mut interpreter = Self::from_template(template, child_runtime);
+                let mut state = HttpHandlerDeadline::new(deadline);
+                state.peer_cancel = Some(cancellation);
+                interpreter.invoke_http_handler(handler, request, span, state)
             }
-            return (
-                status_response(504, "Gateway Timeout"),
-                HttpTraceOrigin::QueueExpired,
-            );
-        }
-        let route = match find_http_route(compiled_router, &request, span) {
-            Ok(route) => route,
-            Err(_) => {
-                return (
-                    status_response(500, "Internal Server Error"),
-                    HttpTraceOrigin::Response,
-                )
-            }
-        };
-        let response = match route {
-            RouteLookup::Found(handler, params) => {
-                let req = http_request_value(request, params);
-                match self.call_http_handler(handler, req, span, deadline) {
-                    Ok(value) => value_to_http_response(value).unwrap_or_else(|| {
-                        status_response(500, "handler did not return HttpResponse")
-                    }),
-                    Err(err) if err.message == HTTP_HANDLER_TIMEOUT_MESSAGE => {
-                        return (
-                            status_response(504, "Gateway Timeout"),
-                            HttpTraceOrigin::HandlerExpired,
-                        );
-                    }
-                    Err(_) => status_response(500, "Internal Server Error"),
-                }
-            }
-            RouteLookup::MethodNotAllowed => status_response(405, "Method Not Allowed"),
-            RouteLookup::NotFound => status_response(404, "Not Found"),
-        };
-        (response, HttpTraceOrigin::Response)
+        })
     }
 
     fn call_http_handler(
@@ -2877,6 +3212,16 @@ impl Interpreter {
         req: Value,
         span: Span,
         deadline: Instant,
+    ) -> KuResult<Value> {
+        self.invoke_http_handler(handler, req, span, HttpHandlerDeadline::new(deadline))
+    }
+
+    fn invoke_http_handler(
+        &mut self,
+        handler: Value,
+        req: Value,
+        span: Span,
+        deadline: HttpHandlerDeadline,
     ) -> KuResult<Value> {
         let _execution = ExecutionTerminationGuard::enter();
         let Value::Function {
@@ -2890,12 +3235,6 @@ impl Interpreter {
         else {
             return Err(KuError::runtime("http handler must be a function", span));
         };
-        if is_async {
-            return Err(KuError::runtime(
-                "async HTTP handlers are not supported in the first async runtime",
-                span,
-            ));
-        }
         let args = match params.len() {
             0 => Vec::new(),
             1 => vec![req],
@@ -2909,9 +3248,7 @@ impl Interpreter {
         let previous_termination = self.termination.take();
         let previous_cleanup_recorded =
             std::mem::replace(&mut self.cleanup_timeout_recorded, false);
-        let previous_deadline = self
-            .execution_deadline
-            .replace(HttpHandlerDeadline::new(deadline));
+        let previous_deadline = self.execution_deadline.replace(deadline);
         if let Some(flight) = self
             .execution_deadline
             .as_ref()
@@ -2919,16 +3256,25 @@ impl Interpreter {
         {
             flight.mark(http_flight::Stage::ActualHandlerStart);
         }
-        let result = self.call_function_value(FunctionValueCall {
+        let call = FunctionValueCall {
             params: &params,
             param_modes: &param_modes,
             body: &body,
             captures: &captures,
             self_name: &self_name,
-            is_async: false,
+            is_async,
             args,
             span,
             depth: 0,
+        };
+        let result = self.poll_termination(span).and_then(|()| {
+            if is_async {
+                // The enclosing listener already admitted this request as
+                // a Task. Run that Task's owned body without spawning it again.
+                self.call_function_value_direct(call, true)
+            } else {
+                self.call_function_value(call)
+            }
         });
         let timed_out = self.execution_deadline.as_mut().is_some_and(|state| {
             state.poll(Instant::now());
@@ -3006,7 +3352,18 @@ impl Interpreter {
             if self.pending_fail.is_some() {
                 return Ok(String::new());
             }
-            output.push_str(&value.to_string());
+            #[cfg(feature = "browser")]
+            crate::browser::preflight_args(std::slice::from_ref(&value), span)?;
+            let rendered = value.to_string();
+            #[cfg(feature = "browser")]
+            crate::browser::allocation(
+                output
+                    .len()
+                    .checked_add(rendered.len())
+                    .ok_or_else(|| crate::browser::fail(span))?,
+                span,
+            )?;
+            output.push_str(&rendered);
         }
         Ok(output)
     }
@@ -3081,10 +3438,78 @@ impl Interpreter {
     }
 
     fn tick(&mut self, span: Span) -> KuResult<()> {
+        #[cfg(feature = "browser")]
+        crate::browser::charge(1, span)?;
         self.poll_termination(span)?;
         self.steps = self.steps.saturating_add(1);
         Ok(())
     }
+}
+
+fn http_task_admission_failed(value: &Value) -> bool {
+    let Value::Result { ok: false, value } = value else {
+        return false;
+    };
+    let Value::Object(fields) = value.as_ref() else {
+        return false;
+    };
+    matches!(fields.get("domain"), Some(Value::String(domain)) if domain == "task")
+        && matches!(
+            fields.get("code"),
+            Some(Value::String(code)) if matches!(
+                code.as_str(), "too_many_tasks" | "queue_full" | "runtime_stopped"
+            )
+        )
+}
+
+fn prepare_http_handler(
+    request: ParsedHttpRequest,
+    compiled_router: &Value,
+    span: Span,
+    deadline: Instant,
+) -> Result<(Value, Value), (HttpWireResponse, http_io::HttpTraceOrigin)> {
+    use http_io::HttpTraceOrigin;
+    // Do not materialize the request or enter its handler after the original D.
+    let now = Instant::now();
+    if now >= deadline {
+        if let Some(flight) = http_flight::current() {
+            flight.expire_at(http_flight::Stage::QueueExpired, now);
+        }
+        return Err((
+            status_response(504, "Gateway Timeout"),
+            HttpTraceOrigin::QueueExpired,
+        ));
+    }
+    let response = match find_http_route(compiled_router, &request, span) {
+        Ok(RouteLookup::Found(handler, params)) => {
+            return Ok((handler, http_request_value(request, params)));
+        }
+        Ok(RouteLookup::MethodNotAllowed) => status_response(405, "Method Not Allowed"),
+        Ok(RouteLookup::NotFound) => status_response(404, "Not Found"),
+        Err(_) => status_response(500, "Internal Server Error"),
+    };
+    Err((response, HttpTraceOrigin::Response))
+}
+
+fn http_handler_response(result: KuResult<Value>) -> (HttpWireResponse, http_io::HttpTraceOrigin) {
+    use http_io::HttpTraceOrigin;
+    let response = match result {
+        Ok(value) => value_to_http_response(value)
+            .unwrap_or_else(|| status_response(500, "handler did not return HttpResponse")),
+        Err(err)
+            if err.message == HTTP_HANDLER_TIMEOUT_MESSAGE
+                || err
+                    .runtime_termination()
+                    .is_some_and(|context| context.reason == TerminationReason::TimedOut) =>
+        {
+            return (
+                status_response(504, "Gateway Timeout"),
+                HttpTraceOrigin::HandlerExpired,
+            );
+        }
+        Err(_) => status_response(500, "Internal Server Error"),
+    };
+    (response, HttpTraceOrigin::Response)
 }
 
 #[cfg(test)]
@@ -4630,12 +5055,39 @@ fn assignment_target_root(target: &AssignTarget) -> Option<String> {
 }
 
 fn assignment_expr_root(expr: &Expr) -> Option<String> {
+    assignment_expr_root_name(expr).map(str::to_owned)
+}
+
+fn assignment_expr_root_name(expr: &Expr) -> Option<&str> {
     match &expr.kind {
-        ExprKind::Variable(name) => Some(name.clone()),
+        ExprKind::Variable(name) => Some(name),
         ExprKind::Index { target, .. } | ExprKind::Field { target, .. } => {
-            assignment_expr_root(target)
+            assignment_expr_root_name(target)
         }
         _ => None,
+    }
+}
+
+/// Inspect a named place without evaluating its expression or cloning its owner.
+/// Index expressions are left to the real argument evaluation.
+fn plain_field_argument<'a>(root: &'a Value, expr: &Expr) -> Option<&'a Value> {
+    match &expr.kind {
+        ExprKind::Variable(_) => Some(root),
+        ExprKind::Field { target, name } => match plain_field_argument(root, target)? {
+            Value::Struct { fields, .. } | Value::Object(fields) => fields.get(name),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn indexed_argument_place(mut expr: &Expr) -> bool {
+    loop {
+        match &expr.kind {
+            ExprKind::Index { .. } => return true,
+            ExprKind::Field { target, .. } => expr = target,
+            _ => return false,
+        }
     }
 }
 
@@ -4670,6 +5122,9 @@ fn readonly_dotted_name(module: &str, method: &str) -> Option<&'static str> {
         ("string", "contains") => "string.contains",
         ("string", "starts_with") => "string.starts_with",
         ("string", "ends_with") => "string.ends_with",
+        ("string", "trim") => "string.trim",
+        ("string", "lower") => "string.lower",
+        ("string", "upper") => "string.upper",
         ("array", "len") => "array.len",
         ("array", "is_empty") => "array.is_empty",
         ("json", "parse") => "json.parse",
@@ -4735,10 +5190,7 @@ fn eval_readonly_builtin(name: &str, values: &[Value], span: Span) -> KuResult<O
             return stdlib::json::eval(method, std::slice::from_ref(first), span);
         }
         if name == "print" {
-            print!("{first}");
-            std::io::stdout()
-                .flush()
-                .map_err(|err| KuError::runtime(format!("failed to flush stdout: {err}"), span))?;
+            write_output(first, false, span)?;
             return Ok(Some(Value::Null));
         }
         stdlib::eval_builtin(name, std::slice::from_ref(first), span)
@@ -6589,6 +7041,11 @@ fn dotted_builtin_module(expr: &Expr) -> Option<&str> {
 }
 
 fn eval_binary(op: BinaryOp, left: Value, right: Value, span: Span) -> KuResult<Value> {
+    #[cfg(feature = "browser")]
+    {
+        crate::browser::preflight_args(std::slice::from_ref(&left), span)?;
+        crate::browser::preflight_args(std::slice::from_ref(&right), span)?;
+    }
     if matches!(left, Value::Borrowed(_)) || matches!(right, Value::Borrowed(_)) {
         return left.with_read(span, |left| {
             right.with_read(span, |right| {
@@ -7728,6 +8185,42 @@ mod collection_tests {
     use super::*;
 
     #[test]
+    fn copy_field_does_not_hide_a_conflicting_owned_sibling() {
+        let span = Span::default();
+        let mut env = Env::new();
+        env.define_owned(
+            "person".into(),
+            Value::Object(HashMap::from([
+                ("number".into(), Value::Int(1)),
+                ("text".into(), Value::String("still owned".into())),
+            ])),
+            true,
+            span,
+        )
+        .unwrap();
+        let input = "Check(1 / 0, person.number, person, person.text)";
+        let call = Parser::new(Lexer::new(input).tokenize().unwrap())
+            .parse_expression_only()
+            .unwrap();
+        let ExprKind::Call { args, .. } = call.kind else {
+            panic!("expected call arguments");
+        };
+        let modes = [
+            ParamMode::Owned,
+            ParamMode::Owned,
+            ParamMode::View,
+            ParamMode::Owned,
+        ];
+        let mut leases = Vec::new();
+        let mut values = Vec::new();
+        let error = Interpreter::new()
+            .eval_call_arguments(&args, &modes, &mut env, 0, &mut leases, &mut values)
+            .unwrap_err();
+        assert_eq!(error.message, "borrow conflicts with move in the same call");
+        assert!(leases.is_empty() && values.is_empty());
+    }
+
+    #[test]
     fn failed_pure_append_argument_leaves_the_receiver_unchanged() {
         let span = Span::default();
         let integer = |value| Expr::new(ExprKind::Literal(Literal::Int(value)), span);
@@ -7912,6 +8405,9 @@ mod collection_tests {
                 "contains",
                 "starts_with",
                 "ends_with",
+                "trim",
+                "lower",
+                "upper",
                 "parse",
                 "decode",
                 "try_parse",
@@ -7926,4 +8422,32 @@ mod collection_tests {
             }
         }
     }
+}
+
+#[inline(always)]
+fn crate_browser_active() -> bool {
+    #[cfg(feature = "browser")]
+    {
+        crate::browser::active()
+    }
+    #[cfg(not(feature = "browser"))]
+    {
+        false
+    }
+}
+
+pub(crate) fn write_output(value: &Value, newline: bool, span: Span) -> KuResult<()> {
+    #[cfg(feature = "browser")]
+    if crate::browser::active() {
+        return crate::browser::write_output(value, newline, span);
+    }
+    if newline {
+        println!("{value}");
+    } else {
+        print!("{value}");
+        std::io::stdout()
+            .flush()
+            .map_err(|err| KuError::runtime(format!("failed to flush stdout: {err}"), span))?;
+    }
+    Ok(())
 }

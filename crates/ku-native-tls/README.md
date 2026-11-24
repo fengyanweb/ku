@@ -38,7 +38,9 @@ The archive is not the complete final link input. Target-pack creation must run
 `cargo rustc --release -p ku-native-tls -- --print native-static-libs` with the
 exact target toolchain and preserve the reported library order, including
 duplicates. Do not guess or silently omit that platform list. The checked
-Rust 1.89 contracts are encoded in `scripts/build-native-tls-pack.ps1` and
-`src/cli.rs`; the target-pack builder rejects any different report before it
-publishes a pack. The Windows MSVC consumer must use the matching dynamic MSVC
+Rust 1.99.1 candidate contracts are encoded in `scripts/build-native-tls-pack.ps1`
+and `src/cli.rs`; the target-pack builder rejects any different report before it
+publishes a pack. Each platform still requires an actual build and consumption
+check; historical published packs retain their original contract. The Windows
+MSVC consumer must use the matching dynamic MSVC
 CRT, while Linux and macOS retain their recorded system-library dependencies.

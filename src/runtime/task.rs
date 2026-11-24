@@ -1,3 +1,5 @@
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
@@ -8,8 +10,10 @@ use std::{
         Arc, Condvar, Mutex, Weak,
     },
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
 use crate::{
     error::{KuError, KuResult, TerminationReason},
@@ -3027,6 +3031,11 @@ pub fn current_task_cancelled() -> bool {
             .and_then(Weak::upgrade)
             .is_some_and(|state| state.is_cancelled())
     })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn current_blocking_owner_cancelled() -> bool {
+    blocking_owner_cancellation().is_some()
 }
 
 pub(crate) fn current_task_cancellation() -> Option<CancellationContext> {

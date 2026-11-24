@@ -15,6 +15,8 @@ const MAX_JSON_DEPTH: usize = 32;
 const MAX_JSON_OUTPUT_BYTES: usize = 1_000_000;
 
 pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value>> {
+    #[cfg(feature = "browser")]
+    crate::browser::preflight_args(args, span)?;
     match function {
         "parse" | "try_parse" | "decode" => {
             expect_arg_count(&format!("json.{function}"), args.len(), 1, span)?;
@@ -51,6 +53,8 @@ fn parse_result(text: &str, span: Span) -> Value {
 }
 
 pub fn stringify_value(value: &Value, span: Span) -> KuResult<String> {
+    #[cfg(feature = "browser")]
+    crate::browser::preflight_args(std::slice::from_ref(value), span)?;
     let mut output = String::new();
     write_json(value, &mut output, 0, span)?;
     if output.len() > MAX_JSON_OUTPUT_BYTES {
@@ -60,6 +64,13 @@ pub fn stringify_value(value: &Value, span: Span) -> KuResult<String> {
 }
 
 fn parse_json(text: &str, span: Span) -> KuResult<Value> {
+    #[cfg(feature = "browser")]
+    crate::browser::allocation(
+        text.len()
+            .checked_mul(8)
+            .ok_or_else(|| crate::browser::fail(span))?,
+        span,
+    )?;
     if text.len() > MAX_JSON_INPUT_BYTES {
         return Err(KuError::runtime("json input is too large", span));
     }
@@ -391,6 +402,13 @@ fn write_json(value: &Value, output: &mut String, depth: usize, span: Span) -> K
                 write_json(value, output, depth + 1, span)?;
             }
             output.push('}');
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        Value::PgClient(_) | Value::PgResult(_) => {
+            return Err(KuError::runtime(
+                format!("json.stringify does not support {}", value.type_name()),
+                span,
+            ));
         }
         Value::Enum { .. }
         | Value::Result { .. }
