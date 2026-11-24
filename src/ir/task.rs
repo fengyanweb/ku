@@ -173,6 +173,17 @@ pub enum TaskCollectionOperation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskOp {
+    /// A checked, finite ordinary computation. C generation must bind this
+    /// identity and signature to the same ordinary IR program before emitting it.
+    SyncCall {
+        dst: SlotId,
+        callsite: Span,
+        function: super::FunctionId,
+        name: String,
+        parameters: Vec<IrType>,
+        result: IrType,
+        arguments: Vec<SlotId>,
+    },
     /// Move the sole owned string between its enum alternative and a string slot.
     EnumStringMove {
         dst: SlotId,
@@ -891,6 +902,16 @@ fn copy_type(ty: &IrType) -> bool {
         || matches!(ty, IrType::Nullable(inner) if copy_type(inner))
 }
 
+pub(crate) fn sync_call_value_type(ty: &IrType) -> bool {
+    primitive(ty) || nullable_leaf(ty)
+}
+
+pub(crate) fn sync_call_result_type(ty: &IrType) -> bool {
+    *ty == IrType::Void
+        || sync_call_value_type(ty)
+        || matches!(ty, IrType::Result(inner) if sync_call_value_type(inner))
+}
+
 /// These operations need the current allocation host even in a leaf Task.
 /// Share this selection with C frame validation and adapter charge projection.
 pub(crate) fn requires_string_allocation_host(operation: &TaskOp) -> bool {
@@ -898,13 +919,15 @@ pub(crate) fn requires_string_allocation_host(operation: &TaskOp) -> bool {
     // Only its str branch clones; int/bool branches neither clone nor allocate.
     matches!(
         operation,
-        TaskOp::Collection {
-            operation: TaskCollectionOperation::Concat
-                | TaskCollectionOperation::First
-                | TaskCollectionOperation::Last
-                | TaskCollectionOperation::NullableClone,
-            ..
-        } | TaskOp::Bytes { .. }
+        TaskOp::SyncCall { .. }
+            | TaskOp::Collection {
+                operation: TaskCollectionOperation::Concat
+                    | TaskCollectionOperation::First
+                    | TaskCollectionOperation::Last
+                    | TaskCollectionOperation::NullableClone,
+                ..
+            }
+            | TaskOp::Bytes { .. }
             | TaskOp::ErrorField { .. }
             | TaskOp::RecordField { take: false, .. }
             | TaskOp::HttpMapGet { .. }
@@ -1142,8 +1165,9 @@ fn preflight(
                         "operation limit exceeded",
                     )?;
                 }
-                if let TaskOp::Start { arguments, .. } | TaskOp::StartIndirect { arguments, .. } =
-                    operation
+                if let TaskOp::Start { arguments, .. }
+                | TaskOp::StartIndirect { arguments, .. }
+                | TaskOp::SyncCall { arguments, .. } = operation
                 {
                     if arguments.len() > limits.max_slots {
                         return Err(invalid("Start argument limit exceeded"));
@@ -1151,6 +1175,23 @@ fn preflight(
                     add_bounded(
                         &mut operation_count,
                         arguments.len(),
+                        limits.max_operations,
+                        "operation limit exceeded",
+                    )?;
+                }
+                if let TaskOp::SyncCall {
+                    name, parameters, ..
+                } = operation
+                {
+                    add_bounded(
+                        &mut literal_bytes,
+                        name.len(),
+                        limits.max_literal_bytes,
+                        "literal byte limit exceeded",
+                    )?;
+                    add_bounded(
+                        &mut operation_count,
+                        parameters.len(),
                         limits.max_operations,
                         "operation limit exceeded",
                     )?;
@@ -2094,6 +2135,49 @@ fn validate_shape(
                         }
                     }
                 }
+                TaskOp::SyncCall {
+                    dst,
+                    name,
+                    parameters,
+                    result,
+                    arguments,
+                    ..
+                } => {
+                    has_error_projection = true;
+                    if name.is_empty()
+                        || name.len() > 4096
+                        || arguments.len() > 64
+                        || parameters.len() != arguments.len()
+                        || !parameters.iter().all(sync_call_value_type)
+                        || !sync_call_result_type(result)
+                        || slot_type(get_slot(*dst)?)?
+                            != (
+                                if *result == IrType::Void {
+                                    &IrType::Null
+                                } else {
+                                    result
+                                },
+                                false,
+                            )
+                    {
+                        return Err(invalid("SyncCall requires a bounded scalar signature"));
+                    }
+                    let mut owners = 0u64;
+                    for (argument, expected) in arguments.iter().zip(parameters) {
+                        if argument == dst || slot_type(get_slot(*argument)?)? != (expected, false)
+                        {
+                            return Err(invalid(
+                                "SyncCall argument type does not match its signature",
+                            ));
+                        }
+                        if !copy_type(expected) {
+                            if owners & bit(*argument) != 0 {
+                                return Err(invalid("SyncCall repeats an owned argument"));
+                            }
+                            owners |= bit(*argument);
+                        }
+                    }
+                }
                 TaskOp::JsonDecode { dst, text } => {
                     has_error_projection = true;
                     if dst == text
@@ -2891,6 +2975,7 @@ fn operation_destination(operation: &TaskOp) -> Option<SlotId> {
         | TaskOp::PgResult { dst, .. }
         | TaskOp::JsonEncodeObject { dst, .. }
         | TaskOp::JsonDecode { dst, .. }
+        | TaskOp::SyncCall { dst, .. }
         | TaskOp::JsonValue { dst, .. }
         | TaskOp::JsonObject { dst, .. }
         | TaskOp::ArrayMake { dst, .. }
@@ -3338,6 +3423,7 @@ fn transfer(mut state: Initialized, operation: &TaskOp, owned: u64) -> Initializ
             dst,
             elements: arguments,
         }
+        | TaskOp::SyncCall { dst, arguments, .. }
         | TaskOp::Start { dst, arguments, .. }
         | TaskOp::StartIndirect { dst, arguments, .. } => {
             let consumed = arguments.iter().fold(0, |mask, slot| mask | bit(*slot)) & owned;
@@ -3370,6 +3456,7 @@ fn operation_work(operation: &TaskOp, budget: &mut Budget) -> KuResult<()> {
             elements: arguments,
             ..
         }
+        | TaskOp::SyncCall { arguments, .. }
         | TaskOp::Start { arguments, .. }
         | TaskOp::StartIndirect { arguments, .. } => budget.spend_many(arguments.len())?,
         TaskOp::Collection { .. } => budget.spend_many(2)?,
@@ -3742,6 +3829,12 @@ fn live_states(
                         live = (live & !bit(*dst))
                             | fields.iter().fold(0, |mask, (_, slot)| mask | bit(*slot));
                     }
+                    TaskOp::SyncCall { dst, arguments, .. } => {
+                        live = (live & !bit(*dst))
+                            | arguments
+                                .iter()
+                                .fold(0, |mask, argument| mask | bit(*argument));
+                    }
                     TaskOp::JsonDecode { dst, text } => live = (live & !bit(*dst)) | bit(*text),
                     TaskOp::JsonValue {
                         dst, source, key, ..
@@ -3938,6 +4031,14 @@ fn validate_ownership_and_plan(
                 budget.spend_many(fields.len())?;
                 if fields.iter().any(|(_, slot)| state.must & bit(*slot) == 0) {
                     return Err(invalid("JSON literal reads an uninitialized field"));
+                }
+            }
+            if let TaskOp::SyncCall { arguments, .. } = operation {
+                if arguments
+                    .iter()
+                    .any(|argument| state.must & bit(*argument) == 0)
+                {
+                    return Err(invalid("SyncCall reads an uninitialized argument"));
                 }
             }
             if let TaskOp::JsonValue { key: Some(key), .. } = operation {
@@ -4965,6 +5066,12 @@ fn source_op_slots(operation: &mut TaskOp, visit: &mut impl FnMut(&mut SlotId)) 
             visit(dst);
             for (_, slot) in fields {
                 visit(slot);
+            }
+        }
+        TaskOp::SyncCall { dst, arguments, .. } => {
+            visit(dst);
+            for argument in arguments {
+                visit(argument);
             }
         }
         TaskOp::JsonDecode { dst, text } => {

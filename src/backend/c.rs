@@ -51,6 +51,8 @@ mod task_mixed;
 mod task_range;
 #[path = "c_task_root.rs"]
 mod task_root;
+#[path = "c_task_sync.rs"]
+mod task_sync;
 
 fn c_object_type_name(name: &str) -> bool {
     matches!(
@@ -452,10 +454,44 @@ pub fn generate_native_task_c_source(
             "native Task entry must return null! without parameters",
         ));
     }
-    let sync = IrProgram {
+    let mut sync = native.synchronous.clone().unwrap_or_else(|| IrProgram {
         functions: Vec::new(),
         layouts: native.layouts.clone(),
-    };
+    });
+    if native.synchronous.is_some() {
+        let used = task_sync::used_functions(&sync, &native.tasks)?;
+        sync.functions
+            .retain(|function| used.contains(&function.id));
+        for layout in &native.layouts.structs {
+            if sync
+                .layouts
+                .structs
+                .iter()
+                .any(|existing| existing.name == layout.name)
+            {
+                return Err(unsupported(
+                    "synchronous helper and Task record layouts collide",
+                ));
+            }
+            sync.layouts.structs.push(layout.clone());
+        }
+        for layout in &native.layouts.enums {
+            if let Some(existing) = sync
+                .layouts
+                .enums
+                .iter()
+                .find(|existing| existing.name == layout.name)
+            {
+                if existing != layout {
+                    return Err(unsupported(
+                        "synchronous helper and Task enum layouts disagree",
+                    ));
+                }
+            } else {
+                sync.layouts.enums.push(layout.clone());
+            }
+        }
+    }
     generate_c_source_with_frames_bounded(
         &sync,
         options,
@@ -501,6 +537,11 @@ fn generate_c_source_with_frames_attempt(
 ) -> KuResult<String> {
     crate::ir::verify_borrow_contract(program)?;
     sync::validate_program(program)?;
+    let synchronous_helpers = frames
+        .map(|(tasks, _, _)| task_sync::used_functions(program, tasks))
+        .transpose()?
+        .unwrap_or_default();
+    let synchronous_allocation = !synchronous_helpers.is_empty();
     let checked_integer_runtime = time::uses_runtime(program)
         || sync::uses_checked_integer(program)
         || frames.is_some_and(|(tasks, _, _)| task::uses_checked_integer(tasks));
@@ -748,6 +789,9 @@ fn generate_c_source_with_frames_attempt(
          #else\n#define KU_THREAD_LOCAL _Thread_local\n#endif\n\
          static KU_THREAD_LOCAL long __ku_call_depth = 0;\n\n",
     );
+    if synchronous_allocation {
+        out.push_str(include_str!("c_task_sync_alloc.c"));
+    }
     // Cooperative handler cancellation is thread-local: the worker that invokes
     // a route owns both the deadline flag and the socket. Generated Ku functions
     // only poll and follow explicit IR control-flow edges; no watchdog thread can
@@ -1067,10 +1111,17 @@ fn generate_c_source_with_frames_attempt(
     emit_mysql_runtime(&mut out, program);
     for function in &program.functions {
         out.check()?;
-        emit_function(&mut out, function)?;
+        emit_function(
+            &mut out,
+            function,
+            synchronous_helpers.contains(&function.id),
+        )?;
         out.push('\n');
     }
     emit_closure_thunks(&mut out, program)?;
+    if synchronous_allocation {
+        out.push_str("\n#undef malloc\n#undef calloc\n#undef realloc\n#undef ku_string_clone\n#undef ku_string_concat\n#undef ku_string_from_int\n#undef ku_error_clone\n");
+    }
     if let Some((frames, plan, entry)) = frames {
         task::emit_frames(
             &mut out,
@@ -2683,7 +2734,7 @@ fn entry_zero_drop_temps(function: &IrFunction) -> HashSet<usize> {
     eligible
 }
 
-fn emit_function(out: &mut COutput, function: &IrFunction) -> KuResult<()> {
+fn emit_function(out: &mut COutput, function: &IrFunction, allocation_guard: bool) -> KuResult<()> {
     out.check()?;
     let for_each_states = collect_for_each_states(function)?;
     let initial_temps = entry_zero_drop_temps(function);
@@ -2751,6 +2802,7 @@ fn emit_function(out: &mut COutput, function: &IrFunction) -> KuResult<()> {
             &owned_locals,
             &for_each_states,
             &initial_temps,
+            allocation_guard,
         )?;
     }
     if function.return_type == IrType::Void {
@@ -2772,6 +2824,7 @@ fn emit_block(
     owned_locals: &[OwnedLocal],
     for_each_states: &[ForEachState],
     initial_temps: &HashSet<usize>,
+    allocation_guard: bool,
 ) -> KuResult<()> {
     out.check()?;
     if block.id.0 != 0 {
@@ -2792,6 +2845,12 @@ fn emit_block(
             for_each_states,
             initial_temps,
         )?;
+        if allocation_guard {
+            // Every emitted owner has already been published into its ordinary
+            // hoisted local. The existing epilogue drops it and moved inputs;
+            // no later user instruction can observe a failed allocation.
+            out.push_str("  if (__ku_task_sync_allocation.status) goto __ku_sync_epilogue;\n");
+        }
     }
     if block.terminator == IrTerminator::Unreachable
         && matches!(
@@ -18827,7 +18886,7 @@ mod tests {
             is_closure_body: false,
             captures: Vec::new(),
         };
-        let error = emit_function(&mut output, &function).unwrap_err();
+        let error = emit_function(&mut output, &function, false).unwrap_err();
         assert!(
             error.message.contains("native C output limit exceeded"),
             "{error}"

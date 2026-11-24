@@ -36,7 +36,7 @@ use crate::{
     ast::*,
     backend,
     checker::Checker,
-    error::{DiagnosticId, KuError, KuResult},
+    error::{unique_spelling_candidate, DiagnosticId, KuError, KuResult},
     interpreter::Interpreter,
     ir,
     lexer::Lexer,
@@ -1307,6 +1307,7 @@ fn run_create_command(args: &[String]) -> Result<(), KuError> {
     }
     write_project_template(&path, name, template)?;
     println!("create ok: {}", path.display());
+    println!("entry: {}", path.join("src/main.ku").display());
     println!("next: cd {name} && ku run");
     Ok(())
 }
@@ -1329,6 +1330,7 @@ fn run_init_command(args: &[String]) -> Result<(), KuError> {
         .unwrap_or("ku_app");
     write_project_template(&cwd, name, template)?;
     println!("init ok: {}", cwd.display());
+    println!("entry: src/main.ku");
     println!("next: ku run");
     Ok(())
 }
@@ -2020,7 +2022,8 @@ fn run_build_command(args: &[String]) -> Result<(), KuError> {
                 options.profile,
                 options.static_link,
                 options.verbose,
-            )?;
+            )
+            .map_err(native_build_tool_error)?;
             println!("build ok: {}", plan.output.display());
         }
         BuildBackend::Llvm => {
@@ -2034,6 +2037,16 @@ fn run_build_command(args: &[String]) -> Result<(), KuError> {
     }
 
     Ok(())
+}
+
+fn native_build_tool_error(mut error: KuError) -> KuError {
+    if let Ok(executable) = env::current_exe() {
+        error.message.push_str(&format!(
+            "\nku executable: {}\nhelp: run `ku doctor --backend c` for compiler checks; keep the dependency-specific help above",
+            executable.display()
+        ));
+    }
+    error
 }
 
 fn parse_build_options(args: &[String]) -> Result<BuildOptions, KuError> {
@@ -2879,7 +2892,15 @@ fn write_native_c_for_delivery(
     let c_source = if native_task_entry {
         // A separate verified state machine, never synchronous lowering with
         // erased async flags. Unsupported source fails before artifact writes.
-        let tasks = ir::task_lower::lower_program(&program)?;
+        let tasks = if ir::task_lower::requires_sync_helpers(&program) {
+            let (ordinary, _) = ir::lower_mixed_http_setup_with_fields(&program, fields)?;
+            ir::task_lower::lower_program_with_synchronous(
+                &program,
+                ir::optimize_program(&ordinary),
+            )?
+        } else {
+            ir::task_lower::lower_program(&program)?
+        };
         backend::c::generate_native_task_c_source(&tasks, &options)?
     } else {
         // Preserve each async handler's real lexical capture cells before
@@ -2889,8 +2910,9 @@ fn write_native_c_for_delivery(
         if bindings.is_empty() {
             backend::c::generate_c_source_with_options(&optimized, &options)?
         } else {
-            let tasks =
-                ir::task_lower::lower_bound_service_handlers_with_layouts(&program, &bindings)?;
+            let tasks = ir::task_lower::lower_bound_service_handlers_with_sync(
+                &program, &bindings, &optimized,
+            )?;
             backend::c::generate_mixed_http_task_c_source(&optimized, &tasks, &options)?
         }
     };
@@ -5356,7 +5378,7 @@ fn validate_libmysql_link_mode(needs_libmysql: bool, static_link: bool) -> Resul
 
 fn missing_shared_libpq_error() -> KuError {
     KuError::message(
-        "native PostgreSQL linking requires an exact shared/import libpq library\nhelp: set KU_PG_LIB to an absolute, dedicated directory containing the target-compatible shared/import library; Ku does not fall back to an unverified compiler search path",
+        "native PostgreSQL linking requires an exact shared/import libpq library\nhelp: set KU_PG_LIB to the absolute directory containing the target-compatible shared/import library; Ku does not fall back to an unverified compiler search path\nhelp: for a host PostgreSQL development installation, `pg_config --libdir` reports its library directory; cross builds need the target's library instead",
     )
 }
 
@@ -8882,8 +8904,17 @@ fn command_error(message: impl Into<String>) -> KuError {
 
 fn diagnostic_json_line(error: &KuError, file: &str, source: &str) -> String {
     let diagnostic = error.diagnostic_data(file, source);
+    let related = if diagnostic.related_information.is_empty() {
+        String::new()
+    } else {
+        let entries = diagnostic.related_information.iter().map(|related| format!(
+            "{{\"message\":{},\"file\":{},\"line\":{},\"column\":{},\"endLine\":{},\"endColumn\":{}}}",
+            json_string(&related.message), json_string(&related.file), related.line, related.column, related.end_line, related.end_column,
+        )).collect::<Vec<_>>().join(",");
+        format!(",\"relatedInformation\":[{entries}]")
+    };
     format!(
-        "{{\"level\":{},\"code\":{},\"message\":{},\"file\":{},\"line\":{},\"column\":{},\"endLine\":{},\"endColumn\":{},\"notes\":{},\"helps\":{}}}",
+        "{{\"level\":{},\"code\":{},\"message\":{},\"file\":{},\"line\":{},\"column\":{},\"endLine\":{},\"endColumn\":{},\"notes\":{},\"helps\":{}{}}}",
         json_string(diagnostic.level),
         json_string(diagnostic.code),
         json_string(&diagnostic.message),
@@ -8894,13 +8925,14 @@ fn diagnostic_json_line(error: &KuError, file: &str, source: &str) -> String {
         diagnostic.end_column,
         json_string_array(&diagnostic.notes),
         json_string_array(&diagnostic.helps),
+        related,
     )
 }
 
-fn json_string_array(values: &[&str]) -> String {
+fn json_string_array<T: AsRef<str>>(values: &[T]) -> String {
     let values = values
         .iter()
-        .map(|value| json_string(value))
+        .map(|value| json_string(value.as_ref()))
         .collect::<Vec<_>>()
         .join(",");
     format!("[{values}]")
@@ -10297,8 +10329,14 @@ impl ModuleLoader {
         result
     }
 
-    fn load_module(&mut self, path: &Path, span: Span) -> KuResult<Arc<ModuleExports>> {
-        let canonical = canonical_file(path, span)?;
+    fn load_module(
+        &mut self,
+        path: &Path,
+        span: Span,
+        requested_import: &str,
+    ) -> KuResult<Arc<ModuleExports>> {
+        let canonical = canonical_file(path, span)
+            .map_err(|error| local_import_error(error, path, requested_import))?;
         if self.states.get(&canonical) == Some(&LoadState::Visiting) {
             return Err(KuError::runtime(
                 format!("circular import detected at {}", canonical.display()),
@@ -10521,7 +10559,7 @@ impl ModuleLoader {
                 .and_then(|path| path.split_once('/'))
                 .zip(self.package.as_ref())
                 .is_some_and(|((name, _), package)| name != package.manifest.name);
-            let module = self.load_module(&import_path, import.span)?;
+            let module = self.load_module(&import_path, import.span, &import.path)?;
             closure.union_with(&module.closure);
             match &import.kind {
                 ImportKind::Named(names) => {
@@ -10681,6 +10719,71 @@ fn check_library_program(program: &Program) -> KuResult<()> {
     Checker::new().check(&program)
 }
 
+fn unknown_std_module_error(module: &str, span: Span) -> KuError {
+    // Filter the diagnostic vocabulary through the authoritative registry.
+    let registered = [
+        "fs", "lexer", "parser", "string", "array", "object", "json", "config", "time", "task",
+        "http", "pg", "redis", "mysql", "bytes", "net", "zstd", "gzip", "deflate",
+    ];
+    let mut error = KuError::runtime(format!("unknown std module '{module}'"), span);
+    if let Some(candidate) = unique_spelling_candidate(
+        module.strip_prefix("std.").unwrap_or(module),
+        registered
+            .into_iter()
+            .filter(|name| stdlib::metadata::is_std_module(name)),
+    ) {
+        error =
+            error.with_diagnostic_help(format!("did you mean standard module 'std.{candidate}'?"));
+    }
+    error
+}
+
+fn local_import_error(mut error: KuError, path: &Path, requested: &str) -> KuError {
+    if !fs::symlink_metadata(path)
+        .is_err_and(|failure| failure.kind() == std::io::ErrorKind::NotFound)
+    {
+        return error;
+    }
+    let Some(parent) = path.parent() else {
+        return error;
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return error;
+    };
+    let entries = entries.take(257).collect::<Vec<_>>();
+    if entries.len() > 256 {
+        return error;
+    }
+    let names = entries
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            if !entry.file_type().ok()?.is_file() {
+                return None;
+            }
+            let name = entry.file_name().into_string().ok()?;
+            name.ends_with(".ku").then_some(name)
+        })
+        .collect::<Vec<_>>();
+    if let Some(candidate) = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| unique_spelling_candidate(name, names.iter().map(String::as_str)))
+    {
+        let replacement = if requested.ends_with(".ku") {
+            candidate
+        } else {
+            candidate.trim_end_matches(".ku")
+        };
+        let corrected = requested
+            .rsplit_once('/')
+            .map(|(prefix, _)| format!("{prefix}/{replacement}"))
+            .unwrap_or_else(|| replacement.to_string());
+        error = error.with_diagnostic_help(format!("did you mean import path '{corrected}'? A matching module file exists beside the requested path"));
+    }
+    error
+}
+
 fn std_import_modules(import: &ImportDecl) -> KuResult<Option<Vec<String>>> {
     if import.path == "std" {
         let ImportKind::Named(names) = &import.kind else {
@@ -10699,10 +10802,7 @@ fn std_import_modules(import: &ImportDecl) -> KuResult<Option<Vec<String>>> {
                 ));
             }
             if !stdlib::metadata::is_std_module(&name.source) {
-                return Err(KuError::runtime(
-                    format!("unknown std module '{}'", name.source),
-                    name.span,
-                ));
+                return Err(unknown_std_module_error(&name.source, name.span));
             }
             if !seen.insert(name.source.clone()) {
                 return Err(KuError::runtime(
@@ -10720,10 +10820,7 @@ fn std_import_modules(import: &ImportDecl) -> KuResult<Option<Vec<String>>> {
         return Ok(None);
     };
     if !stdlib::metadata::is_std_module(module) {
-        return Err(KuError::runtime(
-            format!("unknown std module '{}'", import.path),
-            import.span,
-        ));
+        return Err(unknown_std_module_error(&import.path, import.span));
     }
     match &import.kind {
         ImportKind::Namespace(namespace) if namespace == module => Ok(Some(vec![module.to_string()])),
@@ -10796,7 +10893,9 @@ fn resolve_import_path(
             current_scope,
             import_path,
             span,
-        )? {
+        ).map_err(|error| if error.domain.as_deref() == Some("package") && error.code.as_deref() == Some("unknown_dependency") {
+            error.with_diagnostic_help("declare the intended dependency in ku.mod and run 'ku i' explicitly in that project; checking does not install undeclared packages")
+        } else { error })? {
             return Ok(path);
         }
     }
@@ -10831,7 +10930,8 @@ fn resolve_import_path(
         ));
     }
     if let Some(scope) = current_scope {
-        path = package::canonical_import_in_scope(&path, scope, span)?;
+        path = package::canonical_import_in_scope(&path, scope, span)
+            .map_err(|error| local_import_error(error, &path, import_path))?;
     }
     Ok(path)
 }
@@ -12019,7 +12119,7 @@ mod tests {
         let mut loader = ModuleLoader::new(None).expect("create module loader");
 
         let first_error = loader
-            .load_module(&dependency, Span::default())
+            .load_module(&dependency, Span::default(), "value")
             .err()
             .expect("invalid dependency must fail checking");
         assert!(
@@ -12033,7 +12133,7 @@ mod tests {
 
         fs::write(&dependency, "fn Value(): int { return 1 }\n").expect("repair dependency");
         let module = loader
-            .load_module(&dependency, Span::default())
+            .load_module(&dependency, Span::default(), "value")
             .expect("a repaired dependency must not look circular");
         assert_eq!(
             module.exports.get("Value").map(String::as_str),

@@ -415,6 +415,15 @@ pub(super) fn emit_frames(
         .iter()
         .flat_map(|function| &function.states)
         .flat_map(|state| &state.operations)
+        .any(|operation| matches!(operation, TaskOp::SyncCall { .. }))
+    {
+        out.push_str("typedef char KuTaskSyncStatusContract[(KU_TASK_DRIVER_OK==0u && KU_TASK_DRIVER_LIMIT==9u && KU_TASK_DRIVER_INVALID_STATE==10u && KU_TASK_HOST_ALLOCATION_FAILED==98u)?1:-1];\nstatic uint32_t __ku_task_sync_reserve(const void* ticket,size_t bytes) { return ku_task_driver_grow_charge((const KuTaskDriverTicketV1*)ticket,bytes); }\n");
+    }
+    if tasks
+        .functions
+        .iter()
+        .flat_map(|function| &function.states)
+        .flat_map(|state| &state.operations)
         .any(|operation| matches!(operation, TaskOp::StringContainsStep { .. }))
     {
         out.push_str(STRING_CONTAINS_STEP);
@@ -3283,6 +3292,61 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         operation_id: usize,
     ) -> KuResult<()> {
         match operation {
+            TaskOp::SyncCall {
+                dst,
+                name,
+                result,
+                arguments,
+                ..
+            } => {
+                let result_type = self.slot_type(*dst)?;
+                let drop_result = drop_statement(result_type, &self.place(*dst))?;
+                out.push_str("  {\n  KuTaskAdapterHostV1* __ku_call_host=(KuTaskAdapterHostV1*)clock->host;\n  if (!__ku_call_host || __ku_call_host->allocation_host_bytes!=sizeof(*__ku_call_host) || __ku_call_host->allocation_host_abi!=KU_TASK_ALLOCATION_HOST_ABI_VERSION || !__ku_call_host->ticket || !__ku_call_host->control || !__ku_call_host->allocation_context || !__ku_call_host->reconcile_charge) { frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }\n  uint32_t __ku_call_charge=__ku_call_host->reconcile_charge(__ku_call_host->allocation_context);\n");
+                self.emit_string_allocation_check(out, "__ku_call_charge")?;
+                out.push_str("  if (__ku_task_sync_allocation.reserve) { frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }\n  __ku_task_sync_allocation=(KuTaskSyncAllocation){__ku_task_sync_reserve,__ku_call_host->ticket,0u,false};\n");
+                let values = arguments
+                    .iter()
+                    .map(|argument| {
+                        c_move_value(self.slot_type(*argument)?, &self.place(*argument))
+                    })
+                    .collect::<KuResult<Vec<_>>>()?
+                    .join(", ");
+                // The ordinary function owns these arguments and its own
+                // return/error/finally boundary. No Task or hidden clone exists.
+                if *result == IrType::Void {
+                    out.push_str(&format!(
+                        "  {}({values});\n  {}=0;\n",
+                        super::c_symbol(name),
+                        self.place(*dst)
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "  {}={}({values});\n",
+                        self.place(*dst),
+                        super::c_symbol(name)
+                    ));
+                }
+                out.push_str("  uint32_t __ku_call_allocation=__ku_task_sync_allocation.status;\n  __ku_task_sync_allocation=(KuTaskSyncAllocation){0};\n");
+                for argument in arguments {
+                    if self.owns_slot(*argument) {
+                        self.set_init(out, *argument, false);
+                    }
+                }
+                self.set_init(out, *dst, true);
+                out.push_str("  KuSyncExitSignal __ku_call_signal=__ku_sync_take();\n  if (__ku_call_signal.kind!=KU_SYNC_EXIT_NONE && __ku_call_allocation==KU_TASK_DRIVER_OK) {\n");
+                out.push_str(&format!("  {drop_result}\n"));
+                self.set_init(out, *dst, false);
+                self.emit_runtime_error(out, "ku_error_make(ku_string_static((const uint8_t*)\"native\",6),ku_string_static((const uint8_t*)\"helper_failed\",13),ku_string_static((const uint8_t*)__ku_sync_error_message(__ku_call_signal),__ku_sync_error_message_length(__ku_call_signal)))")?;
+                out.push_str("  }\n  if (__ku_call_allocation!=KU_TASK_DRIVER_OK) {\n");
+                out.push_str(&format!("  {drop_result}\n"));
+                self.set_init(out, *dst, false);
+                self.emit_string_allocation_check(out, "__ku_call_allocation")?;
+                out.push_str("  }\n  __ku_call_charge=__ku_call_host->reconcile_charge(__ku_call_host->allocation_context);\n  if (__ku_call_charge!=KU_TASK_DRIVER_OK) {\n");
+                out.push_str(&format!("  {drop_result}\n"));
+                self.set_init(out, *dst, false);
+                self.emit_string_allocation_check(out, "__ku_call_charge")?;
+                out.push_str("  }\n  }\n");
+            }
             TaskOp::FinallyEnter { .. } | TaskOp::FinallyLeave { .. } => {}
             TaskOp::FinallyUnwindBegin => {
                 out.push_str("  if (cleanup) { frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }\n  if (!frame->finally_unwind_active) { frame->finally_unwind_active=1u; frame->finally_unwind_deadline=ku_task_host_deadline((KuTaskAdapterHostV1*)clock->host,UINT64_MAX,1); }\n");

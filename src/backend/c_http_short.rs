@@ -1182,6 +1182,9 @@ fn task_request_fields(function: &crate::ir::task::TaskFunction) -> Option<u32> 
     for state in &function.states {
         for operation in &state.operations {
             match operation {
+                // Ordinary helpers are checked by the general mixed Task
+                // path, not this request-projection-only admission proof.
+                TaskOp::SyncCall { .. } => return None,
                 TaskOp::HttpMapGet {
                     request: source,
                     map,

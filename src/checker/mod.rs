@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{
     ast::*,
-    error::{DiagnosticId, KuError, KuResult},
+    error::{unique_spelling_candidate, DiagnosticId, KuError, KuResult},
     span::Span,
     stdlib::metadata::{self, ArgRule, Signature, TypePattern},
 };
@@ -75,6 +75,21 @@ enum MoveMark {
     /// re-initialized.
     MaybeMoved,
 }
+
+#[derive(Debug, Clone, Copy)]
+struct MoveState {
+    mark: MoveMark,
+    origin: Option<Span>,
+}
+
+// Source locations are diagnostic metadata, never part of ownership joins,
+// closure-effect equality or a speculative analysis fixed point.
+impl PartialEq for MoveState {
+    fn eq(&self, other: &Self) -> bool {
+        self.mark == other.mark
+    }
+}
+impl Eq for MoveState {}
 
 /// True when `prefix` is a (non-strict) projection prefix of `full`: `[]` is a
 /// prefix of everything, `["user"]` is a prefix of `["user", "name"]`.
@@ -317,7 +332,7 @@ struct VarType {
     /// — and everything under it — has been moved out; an absent path is live.
     /// Array/object index projections are never tracked here (they cannot be
     /// partially moved; the checker requires an explicit `.clone()`).
-    moves: BTreeMap<Vec<String>, MoveMark>,
+    moves: BTreeMap<Vec<String>, MoveState>,
     /// True only for a `catch` error binding. Its checker type is `Type::Object`
     /// (so `fail {...}` can pass an object literal), but the runtime backs it with
     /// a `KuError` struct whose fields the C backend can move-and-clear — unlike a
@@ -359,7 +374,7 @@ impl VarType {
     /// The move mark on the whole variable (`[]`), if any. Used for the bare
     /// "use of moved value" diagnostic and for task/closure whole-value checks.
     fn whole_move(&self) -> Option<MoveMark> {
-        self.moves.get(&Vec::new()).copied()
+        self.moves.get(&Vec::new()).map(|state| state.mark)
     }
 
     /// The move mark blocking a read of the place at `path`, if any. A move at `q`
@@ -367,16 +382,53 @@ impl VarType {
     /// ancestor of `p` (a parent was moved) or `p` is an ancestor of `q` (a part
     /// of `p` was moved, so `p` can no longer be used as a whole).
     fn read_block(&self, path: &[String]) -> Option<MoveMark> {
-        self.moves.iter().find_map(|(q, mark)| {
-            (path_is_prefix(q, path) || path_is_prefix(path, q)).then_some(*mark)
+        self.moves.iter().find_map(|(q, state)| {
+            (path_is_prefix(q, path) || path_is_prefix(path, q)).then_some(state.mark)
         })
     }
 
+    fn with_move_origin(&self, error: KuError, path: &[String]) -> KuError {
+        let blocking = self
+            .moves
+            .iter()
+            .filter(|(q, _)| path_is_prefix(q, path) || path_is_prefix(path, q));
+        let mut origin = None;
+        let mut conditional = false;
+        for (_, state) in blocking {
+            let Some(span) = state.origin else {
+                return error;
+            };
+            if origin.is_some_and(|previous| previous != span) {
+                return error;
+            }
+            origin = Some(span);
+            conditional |= state.mark == MoveMark::MaybeMoved;
+        }
+        if let Some(span) = origin {
+            error.with_related_span(
+                span,
+                if conditional {
+                    "ownership may have transferred here"
+                } else {
+                    "ownership transferred here"
+                },
+            )
+        } else {
+            error
+        }
+    }
+
     /// Mark `path` moved. Any finer moves strictly under `path` are subsumed.
-    fn mark_moved(&mut self, path: Vec<String>, mark: MoveMark) {
+    fn mark_moved(&mut self, path: Vec<String>, mark: MoveMark, origin: Span) {
         self.moves
             .retain(|q, _| !(q.len() > path.len() && path_is_prefix(&path, q)));
-        self.moves.insert(path, mark);
+        self.moves.insert(
+            path,
+            MoveState {
+                mark,
+                origin: Some(origin),
+            },
+        );
     }
 
     /// Re-initialize `path` and everything under it (an assignment to that place).
@@ -528,6 +580,7 @@ struct FunctionType {
     type_params: Vec<String>,
     params: Vec<Type>,
     value_params: Vec<FunctionValueParam>,
+    parameter_spans: Vec<Span>,
     return_type: Option<Type>,
     returns: Type,
     body: Vec<Stmt>,
@@ -896,6 +949,11 @@ impl Checker {
                     function.name.clone(),
                     FunctionType {
                         type_params: function.type_params.clone(),
+                        parameter_spans: function
+                            .params
+                            .iter()
+                            .map(|parameter| parameter.span)
+                            .collect(),
                         params: function
                             .params
                             .iter()
@@ -2194,13 +2252,14 @@ impl Checker {
                             let mut generic_bindings = HashMap::new();
                             self.check_call_borrow_conflicts(args, &function.value_params, expr.span, None)?;
                             let mut actual_arg_types = Vec::with_capacity(args.len());
-                            for ((arg, expected), param) in args.iter().zip(function.params.iter()).zip(&function.value_params) {
+                            for (index, ((arg, expected), param)) in args.iter().zip(function.params.iter()).zip(&function.value_params).enumerate() {
                                 let actual =
                                     self.check_arg_mode(arg, Some(expected), param.mode)?;
                                 if !bind_generic_type(expected, &actual, &mut generic_bindings)
                                     || !type_matches(expected, &actual)
                                 {
-                                    return Err(type_error(arg.span, expected, &actual));
+                                    return Err(argument_type_error(arg, expected, &actual, name, index, &param.name,
+                                        (!name.starts_with("__ku_import")).then(|| function.parameter_spans[index])));
                                 }
                                 actual_arg_types.push(actual);
                                 argument_provenance.push(self.expression_closure_provenance(arg));
@@ -2539,10 +2598,7 @@ impl Checker {
                                 ));
                             };
                             struct_type.fields.get(name).cloned().ok_or_else(|| {
-                                KuError::runtime(
-                                    format!("struct '{struct_name}' has no field '{name}'"),
-                                    expr.span,
-                                )
+                                unknown_struct_field_error(&struct_name, name, &struct_type.fields, expr.span)
                             })
                         }
                         Type::Object(fields) => {
@@ -2613,10 +2669,7 @@ impl Checker {
                             ));
                         }
                         let Some(expected) = struct_type.fields.get(field_name) else {
-                            return Err(KuError::runtime(
-                                format!("struct '{name}' has no field '{field_name}'"),
-                                value.span,
-                            ));
+                            return Err(unknown_struct_field_error(name, field_name, &struct_type.fields, value.span));
                         };
                         let actual = self.consume_expr_expecting(value, Some(expected))?;
                         if self.type_may_contain_function_value(&actual) {
@@ -3182,8 +3235,10 @@ impl Checker {
                             ));
                         };
                         struct_type.fields.get(name).cloned().ok_or_else(|| {
-                            KuError::runtime(
-                                format!("struct '{struct_name}' has no field '{name}'"),
+                            unknown_struct_field_error(
+                                &struct_name,
+                                name,
+                                &struct_type.fields,
                                 span,
                             )
                         })
@@ -5246,15 +5301,24 @@ impl Checker {
             argument_provenance.push(self.expression_closure_provenance(arg));
         }
         let mut arg_types = Vec::new();
-        for ((param, actual), arg) in function
+        for (index, ((param, actual), arg)) in function
             .params
             .iter()
             .zip(actual_arg_types.iter())
             .zip(args.iter())
+            .enumerate()
         {
             if let Some(expected) = &param.ty {
                 if !type_matches(expected, actual) {
-                    return Err(type_error(arg.span, expected, actual));
+                    return Err(argument_type_error(
+                        arg,
+                        expected,
+                        actual,
+                        name.unwrap_or("function value"),
+                        index,
+                        &param.name,
+                        None,
+                    ));
                 }
                 if self.readonly_capture.is_some() && matches!(actual, Type::FunctionValue { .. }) {
                     // Preserve the concrete body through a typed higher-order
@@ -6045,12 +6109,12 @@ impl Checker {
                 // moved), so the partial read-block is enforced at the value node,
                 // not here where field-projection bases are also resolved.
                 if var.whole_move().is_some() {
-                    return Err(KuError::runtime(
+                    return Err(var.with_move_origin(KuError::runtime(
                         format!(
                             "use of moved value '{name}'; call '{name}.clone()' before moving when an explicit copy is required"
                         ),
                         span,
-                    ));
+                    ), &[]));
                 }
                 let mut readable = var.clone();
                 if let Some(narrowed) = &var.narrowed_type {
@@ -8296,7 +8360,10 @@ impl Checker {
     fn check_place_fully_live(&self, place: &PlacePath, span: Span) -> KuResult<()> {
         if let Ok(var) = self.get_allow_moved(&place.root, span) {
             if let Some(mark) = var.read_block(&place.path) {
-                return Err(read_of_moved_error(&place.root, &place.path, mark, span));
+                return Err(var.with_move_origin(
+                    read_of_moved_error(&place.root, &place.path, mark, span),
+                    &place.path,
+                ));
             }
         }
         Ok(())
@@ -8309,9 +8376,12 @@ impl Checker {
         let Ok(var) = self.get_allow_moved(&place.root, span) else {
             return Ok(());
         };
-        for (q, mark) in &var.moves {
+        for (q, state) in &var.moves {
             if path_is_prefix(q, &place.path) {
-                return Err(read_of_moved_error(&place.root, &place.path, *mark, span));
+                return Err(var.with_move_origin(
+                    read_of_moved_error(&place.root, &place.path, state.mark, span),
+                    &place.path,
+                ));
             }
         }
         Ok(())
@@ -8354,9 +8424,12 @@ impl Checker {
                     ));
                 }
                 if var.read_block(&place.path).is_some() {
-                    return Err(move_of_moved_error(&place.root, &place.path, span));
+                    return Err(var.with_move_origin(
+                        move_of_moved_error(&place.root, &place.path, span),
+                        &place.path,
+                    ));
                 }
-                var.mark_moved(place.path.clone(), MoveMark::Moved);
+                var.mark_moved(place.path.clone(), MoveMark::Moved, span);
                 return Ok(());
             }
         }
@@ -10078,6 +10151,88 @@ fn http_side_effect_response_call_name(callee: &Expr) -> Option<String> {
     blocked.then(|| format!("{root}.{name}"))
 }
 
+fn unknown_struct_field_error(
+    struct_name: &str,
+    field: &str,
+    fields: &HashMap<String, Type>,
+    span: Span,
+) -> KuError {
+    let mut error = KuError::runtime(
+        format!("struct '{struct_name}' has no field '{field}'"),
+        span,
+    )
+    .with_diagnostic_note(format!(
+        "the receiver has the declared struct type '{struct_name}'"
+    ));
+    if let Some(candidate) = unique_spelling_candidate(field, fields.keys().map(String::as_str)) {
+        error = error.with_diagnostic_help(format!(
+            "did you mean field '{candidate}' of struct '{struct_name}'?"
+        ));
+    }
+    error
+}
+
+fn nullable_type(ty: &Type) -> bool {
+    matches!(ty, Type::Null)
+        || matches!(ty, Type::Union(options) if options.iter().any(|option| matches!(option, Type::Null)))
+}
+
+fn diagnostic_expression(expr: &Expr) -> String {
+    let mut current = expr;
+    let mut fields = Vec::new();
+    for _ in 0..16 {
+        match &current.kind {
+            ExprKind::Variable(name) => {
+                let mut result = name.clone();
+                for (name, optional) in fields.into_iter().rev() {
+                    result.push_str(if optional { "?." } else { "." });
+                    result.push_str(name);
+                }
+                return result;
+            }
+            ExprKind::Field { target, name } | ExprKind::OptionalField { target, name } => {
+                fields.push((
+                    name.as_str(),
+                    matches!(current.kind, ExprKind::OptionalField { .. }),
+                ));
+                current = target;
+            }
+            _ => break,
+        }
+    }
+    "argument expression".to_string()
+}
+
+fn argument_type_error(
+    arg: &Expr,
+    expected: &Type,
+    actual: &Type,
+    function: &str,
+    index: usize,
+    parameter: &str,
+    declaration: Option<Span>,
+) -> KuError {
+    let mut error = type_error(arg.span, expected, actual);
+    if nullable_type(actual) && !type_matches(expected, &Type::Null) {
+        error = error.with_diagnostic_note(format!(
+            "argument {} ('{}') to '{function}' must match parameter '{parameter}: {}'",
+            index + 1,
+            diagnostic_expression(arg),
+            type_name(expected)
+        ));
+        if let Some(span) = declaration {
+            error = error.with_related_span(
+                span,
+                format!(
+                    "parameter '{parameter}: {}' is declared here",
+                    type_name(expected)
+                ),
+            );
+        }
+    }
+    error
+}
+
 fn type_error(span: Span, expected: &Type, actual: &Type) -> KuError {
     if let (Type::FunctionValue { params: left, .. }, Type::FunctionValue { params: right, .. }) =
         (expected, actual)
@@ -10091,14 +10246,19 @@ fn type_error(span: Span, expected: &Type, actual: &Type) -> KuError {
             return KuError::runtime("callable parameter mode mismatch", span);
         }
     }
-    KuError::runtime(
+    let error = KuError::runtime(
         format!(
             "type error: expected {} but got {}",
             type_name(expected),
             type_name(actual)
         ),
         span,
-    )
+    );
+    if nullable_type(actual) && !type_matches(expected, &Type::Null) {
+        error.with_diagnostic_help("check for null explicitly and pass a non-null value in that branch; handle the null case according to the application instead of inserting a default")
+    } else {
+        error
+    }
 }
 
 fn http_handler_return_error(span: Span, actual: &Type) -> KuError {
@@ -10778,19 +10938,35 @@ fn merge_function_value_branch_types(base: &Type, branches: &[Option<&Type>]) ->
 }
 
 /// Merge the per-path move state of one variable across the branch scopes.
-fn merge_var_moves(var: &mut VarType, branch_moves: &[Option<&BTreeMap<Vec<String>, MoveMark>>]) {
+fn merge_var_moves(var: &mut VarType, branch_moves: &[Option<&BTreeMap<Vec<String>, MoveState>>]) {
     let mut paths: std::collections::BTreeSet<Vec<String>> = std::collections::BTreeSet::new();
     for moves in branch_moves.iter().flatten() {
         paths.extend(moves.keys().cloned());
     }
     let mut merged = BTreeMap::new();
     for path in paths {
-        let marks: Vec<Option<MoveMark>> = branch_moves
+        let states: Vec<Option<MoveState>> = branch_moves
             .iter()
             .map(|moves| moves.and_then(|m| m.get(&path)).copied())
             .collect();
+        let marks = states
+            .iter()
+            .map(|state| state.map(|state| state.mark))
+            .collect::<Vec<_>>();
         if let Some(mark) = join_move_marks(&marks) {
-            merged.insert(path, mark);
+            // Multiple reaching transfers must not be presented as one proven
+            // origin. A unique conditional transfer may still be shown as such.
+            let origins = states
+                .iter()
+                .flatten()
+                .map(|state| state.origin)
+                .collect::<Vec<_>>();
+            let origin = origins
+                .first()
+                .copied()
+                .flatten()
+                .filter(|first| origins.iter().all(|origin| *origin == Some(*first)));
+            merged.insert(path, MoveState { mark, origin });
         }
     }
     var.moves = merged;
@@ -10879,7 +11055,7 @@ fn merge_moved_scope_paths(
                     .and_then(|scope| scope.get(name))
                     .is_some_and(|value| value.captured)
             });
-            let branch_moves: Vec<Option<&BTreeMap<Vec<String>, MoveMark>>> = paths
+            let branch_moves: Vec<Option<&BTreeMap<Vec<String>, MoveState>>> = paths
                 .iter()
                 .map(|path| {
                     path.get(index)

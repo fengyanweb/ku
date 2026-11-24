@@ -25,6 +25,7 @@ use super::{
 mod captures;
 mod nullable;
 use captures::{LocalBinding, LocalScope};
+mod reassign;
 mod records;
 
 #[derive(Debug)]
@@ -32,12 +33,21 @@ pub struct NativeTaskProgram {
     pub tasks: TaskProgram,
     pub(crate) layouts: super::IrLayoutTable,
     pub entry: TaskFunctionId,
+    pub(crate) synchronous: Option<super::IrProgram>,
 }
 
 #[derive(Clone)]
 struct Signature {
     id: TaskFunctionId,
     parameters: Vec<TaskSlotType>,
+    result: IrType,
+}
+
+#[derive(Clone)]
+struct SyncSignature {
+    function: super::FunctionId,
+    parameters: Vec<IrType>,
+    modes: Vec<ParamMode>,
     result: IrType,
 }
 
@@ -287,6 +297,31 @@ pub fn lower_program(program: &Program) -> KuResult<NativeTaskProgram> {
     lower_program_impl(program, true)
 }
 
+pub(crate) fn requires_sync_helpers(program: &Program) -> bool {
+    program.items.iter().any(|item| {
+        matches!(item, Item::Function(function)
+        if !function.is_async && object_constructor(function).is_none())
+    })
+}
+
+pub(crate) fn lower_program_with_synchronous(
+    program: &Program,
+    synchronous: super::IrProgram,
+) -> KuResult<NativeTaskProgram> {
+    let mut native = lower_program_with_sync(program, true, Some(&synchronous))?;
+    if native
+        .tasks
+        .functions
+        .iter()
+        .flat_map(|function| &function.states)
+        .flat_map(|state| &state.operations)
+        .any(|operation| matches!(operation, TaskOp::SyncCall { .. }))
+    {
+        native.synchronous = Some(synchronous);
+    }
+    Ok(native)
+}
+
 /// Async bodies used by the native HTTP service's synchronous setup/main.
 /// The normal checker runs on the complete source before this bounded split.
 pub fn lower_service_handlers(program: &Program) -> KuResult<TaskProgram> {
@@ -303,6 +338,22 @@ pub fn lower_bound_service_handlers(
 pub(crate) fn lower_bound_service_handlers_with_layouts(
     program: &Program,
     bindings: &[super::MixedAsyncHandler],
+) -> KuResult<NativeTaskProgram> {
+    lower_bound_service_handlers_impl(program, bindings, None)
+}
+
+pub(crate) fn lower_bound_service_handlers_with_sync(
+    program: &Program,
+    bindings: &[super::MixedAsyncHandler],
+    synchronous: &super::IrProgram,
+) -> KuResult<NativeTaskProgram> {
+    lower_bound_service_handlers_impl(program, bindings, Some(synchronous))
+}
+
+fn lower_bound_service_handlers_impl(
+    program: &Program,
+    bindings: &[super::MixedAsyncHandler],
+    synchronous: Option<&super::IrProgram>,
 ) -> KuResult<NativeTaskProgram> {
     let supported = |name: &str| {
         matches!(
@@ -368,10 +419,18 @@ pub(crate) fn lower_bound_service_handlers_with_layouts(
         }
         filtered.items.push(Item::Function(declaration));
     }
-    lower_program_impl(&filtered, false)
+    lower_program_with_sync(&filtered, false, synchronous)
 }
 
 fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<NativeTaskProgram> {
+    lower_program_with_sync(program, require_entry, None)
+}
+
+fn lower_program_with_sync(
+    program: &Program,
+    require_entry: bool,
+    synchronous: Option<&super::IrProgram>,
+) -> KuResult<NativeTaskProgram> {
     let limits = TaskLimits::default();
     if program
         .items
@@ -392,6 +451,22 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
     };
     let mut layouts = records::layouts(program);
     let mut signatures = HashMap::new();
+    let sync_signatures: HashMap<_, _> = synchronous
+        .into_iter()
+        .flat_map(|program| &program.functions)
+        .filter(|function| !function.is_closure_body)
+        .map(|function| {
+            (
+                function.name.clone(),
+                SyncSignature {
+                    function: function.id,
+                    parameters: function.params.iter().map(|p| p.ty.clone()).collect(),
+                    modes: function.params.iter().map(|p| p.mode).collect(),
+                    result: function.return_type.clone(),
+                },
+            )
+        })
+        .collect();
     let mut object_constructors = HashMap::new();
     let mut declarations = Vec::new();
     let mut entry = None;
@@ -540,6 +615,9 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
             }
             continue;
         }
+        if !function.is_async && sync_signatures.contains_key(&function.name) {
+            continue;
+        }
         if !function.is_async || !function.type_params.is_empty() {
             return Err(unsupported(
                 "synchronous or generic functions in a native async program",
@@ -630,6 +708,7 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
             FunctionLowerer::new(
                 declaration,
                 &signatures,
+                &sync_signatures,
                 &object_constructors,
                 &mut layouts,
                 &mut budget,
@@ -653,11 +732,13 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
         tasks,
         entry,
         layouts,
+        synchronous: None,
     })
 }
 
 struct FunctionLowerer<'a> {
     signatures: &'a HashMap<String, Signature>,
+    sync_signatures: &'a HashMap<String, SyncSignature>,
     object_constructors: &'a HashMap<&'a str, (&'a FnDecl, &'a Expr)>,
     layouts: &'a mut super::IrLayoutTable,
     std_time: bool,
@@ -677,6 +758,8 @@ struct FunctionLowerer<'a> {
     // across these owners are deliberately outside this first scoped subset.
     slot_owners: Vec<Option<TaskScopeId>>,
     stable_slots: Vec<bool>,
+    sync_reassignment_candidate: bool,
+    has_sync_calls: bool,
     scopes: Vec<TaskScopeId>,
     next_scope: usize,
     loops: Vec<LoopContext>,
@@ -738,6 +821,7 @@ impl<'a> FunctionLowerer<'a> {
     fn new(
         declaration: &'a FnDecl,
         signatures: &'a HashMap<String, Signature>,
+        sync_signatures: &'a HashMap<String, SyncSignature>,
         object_constructors: &'a HashMap<&'a str, (&'a FnDecl, &'a Expr)>,
         layouts: &'a mut super::IrLayoutTable,
         budget: &'a mut Budget,
@@ -749,8 +833,18 @@ impl<'a> FunctionLowerer<'a> {
         std_json: bool,
     ) -> KuResult<Self> {
         let signature = &signatures[&declaration.name];
+        let sync_reassignment_candidate = if sync_signatures.is_empty() {
+            false
+        } else {
+            reassign::sync_candidate(declaration, budget, |name| {
+                sync_signatures.contains_key(name)
+                    && !signatures.contains_key(name)
+                    && !object_constructors.contains_key(name)
+            })?
+        };
         let mut lowerer = Self {
             signatures,
+            sync_signatures,
             object_constructors,
             layouts,
             std_time,
@@ -776,6 +870,8 @@ impl<'a> FunctionLowerer<'a> {
             nullable_views: HashMap::new(),
             slot_owners: Vec::new(),
             stable_slots: Vec::new(),
+            sync_reassignment_candidate,
+            has_sync_calls: false,
             scopes: Vec::new(),
             next_scope: 0,
             loops: Vec::new(),
@@ -2216,7 +2312,22 @@ impl<'a> FunctionLowerer<'a> {
                 if self.function.slots[slot.0].ty != value_slot(IrType::Str) {
                     return Err(unsupported("HTTP response body type", span));
                 }
-                Some(self.copy_or_move(slot)?)
+                // Body is the final argument. No later expression can change
+                // its owner before HttpResponse consumes it. Limit this path
+                // to functions with an emitted ordinary call; legacy lowering
+                // and all protected/borrowed ownership paths stay unchanged.
+                let direct = self.has_sync_calls
+                    && !self.protected
+                    && !self.in_finally_body
+                    && self.finalies.is_empty()
+                    && self.pending_primaries.is_empty()
+                    && !self.nullable_views.contains_key(&slot)
+                    && !self.nullable_views.values().any(|owner| *owner == slot);
+                Some(if direct {
+                    slot
+                } else {
+                    self.copy_or_move(slot)?
+                })
             } else {
                 None
             };
@@ -2795,6 +2906,11 @@ impl<'a> FunctionLowerer<'a> {
         if let Some((declaration, body)) = self.object_constructors.get(name.as_str()).copied() {
             return self.call_object_constructor(declaration, body, args, span, depth);
         }
+        if !self.signatures.contains_key(name) {
+            if let Some(signature) = self.sync_signatures.get(name).cloned() {
+                return self.call_synchronous(name, &signature, args, span, depth);
+            }
+        }
         // The ordinary checker resolves declared functions before
         // builtin fallback. Native lowering must preserve that choice.
         let declared_function = self.signatures.contains_key(name);
@@ -2867,6 +2983,77 @@ impl<'a> FunctionLowerer<'a> {
             arguments,
         })?;
         Ok(destination)
+    }
+
+    #[inline(never)]
+    fn call_synchronous(
+        &mut self,
+        name: &str,
+        signature: &SyncSignature,
+        args: &[Expr],
+        span: Span,
+        depth: usize,
+    ) -> KuResult<SlotId> {
+        if signature.parameters.len() > 64
+            || signature.parameters.len() != args.len()
+            || signature.modes.iter().any(|mode| *mode != ParamMode::Owned)
+            || !signature.parameters.iter().all(task::sync_call_value_type)
+            || !task::sync_call_result_type(&signature.result)
+        {
+            return Err(unsupported(&format!("synchronous helper `{name}` with this signature; native Task calls require owned scalar parameters and scalar/Result output"), span));
+        }
+        self.budget.analysis(args.len() + 1, span)?;
+        self.budget.text(name.len(), span)?;
+        let mut arguments = Vec::with_capacity(args.len());
+        // Argument expressions run exactly once, left to right, before the C
+        // call. A list of plain reads/literals cannot replace an earlier
+        // operand, so SyncCall can consume its actual owned slots directly.
+        // Other lists keep snapshots before evaluating later side effects.
+        self.budget.analysis(args.len(), span)?;
+        let direct_arguments = args.iter().all(|argument| {
+            matches!(
+                &argument.kind,
+                ExprKind::Variable(_)
+                    | ExprKind::Literal(
+                        Literal::Int(_) | Literal::Bool(_) | Literal::Null | Literal::String(_)
+                    )
+            )
+        });
+        for (argument, expected) in args.iter().zip(&signature.parameters) {
+            let expected = value_slot(expected.clone());
+            let value = self.direct_argument_expression(argument, &expected, depth + 1)?;
+            if !self.nullable_argument_matches(value, &expected) {
+                return Err(unsupported(
+                    &format!("argument type for synchronous helper `{name}`"),
+                    argument.span,
+                ));
+            }
+            let direct = direct_arguments
+                && self.function.slots[value.0].ty == expected
+                && !self.nullable_views.contains_key(&value)
+                && !self.nullable_views.values().any(|owner| *owner == value);
+            arguments.push(if direct {
+                value
+            } else {
+                self.copy_or_move(value)?
+            });
+        }
+        let dst = self.slot(value_slot(if signature.result == IrType::Void {
+            IrType::Null
+        } else {
+            signature.result.clone()
+        }))?;
+        self.emit(TaskOp::SyncCall {
+            dst,
+            callsite: span,
+            function: signature.function,
+            name: name.to_owned(),
+            parameters: signature.parameters.clone(),
+            result: signature.result.clone(),
+            arguments,
+        })?;
+        self.has_sync_calls = true;
+        Ok(dst)
     }
 
     #[inline(never)]
@@ -3703,6 +3890,31 @@ impl<'a> FunctionLowerer<'a> {
                     ));
                 }
                 self.budget.text(name.len(), span)?;
+                if self.sync_reassignment_candidate
+                    && expected == value_slot(IrType::Str)
+                    && !self.protected
+                    && !self.in_finally_body
+                    && self.finalies.is_empty()
+                    && !self.nullable_views.contains_key(&destination)
+                    && !self
+                        .nullable_views
+                        .values()
+                        .any(|owner| *owner == destination)
+                {
+                    if let ExprKind::Literal(Literal::String(text)) = &value.kind {
+                        // C Init uses immutable static storage: unlike a
+                        // general RHS, this cannot fail or observe the old
+                        // owner. Retain ordinary expression/text accounting.
+                        self.budget.expression(depth, value.span)?;
+                        self.budget.text(text.len(), value.span)?;
+                        self.nullable_facts.remove(&destination);
+                        self.emit(TaskOp::DropIfInit { slot: destination })?;
+                        return self.emit(TaskOp::Init {
+                            dst: destination,
+                            value: TaskConstant::Str(text.clone()),
+                        });
+                    }
+                }
                 // Resolve and finish the RHS in the original lexical environment.
                 // Await, ? and short circuit may change the current state; only
                 // their successful endpoint may replace the existing binding.

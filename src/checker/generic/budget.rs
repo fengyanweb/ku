@@ -404,6 +404,7 @@ mod tests {
         FunctionType {
             type_params: vec!["T".into()],
             params: vec![Type::Generic("T".into())],
+            parameter_spans: vec![],
             value_params: vec![],
             return_type: None,
             returns: Type::Null,

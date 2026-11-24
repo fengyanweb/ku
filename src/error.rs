@@ -179,6 +179,9 @@ pub struct KuError {
 #[derive(Clone, Default, PartialEq, Eq)]
 struct ErrorContext {
     diagnostic: Option<DiagnosticContext>,
+    notes: Vec<String>,
+    helps: Vec<String>,
+    related: Vec<RelatedDiagnostic>,
     cleanup: Option<RuntimeTermination>,
     terminating: bool,
 }
@@ -187,6 +190,23 @@ struct ErrorContext {
 struct DiagnosticContext {
     file: String,
     source: String,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct RelatedDiagnostic {
+    file: Option<String>,
+    span: Span,
+    message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelatedDiagnosticData {
+    pub message: String,
+    pub file: String,
+    pub line: usize,
+    pub column: usize,
+    pub end_line: usize,
+    pub end_column: usize,
 }
 
 struct DiagnosticContextSummary<'a> {
@@ -214,8 +234,9 @@ pub struct DiagnosticData {
     pub column: usize,
     pub end_line: usize,
     pub end_column: usize,
-    pub notes: Vec<&'static str>,
-    pub helps: Vec<&'static str>,
+    pub notes: Vec<String>,
+    pub helps: Vec<String>,
+    pub related_information: Vec<RelatedDiagnosticData>,
 }
 
 const MAX_DIAGNOSTIC_MARKER_INDENT: usize = 256;
@@ -225,6 +246,61 @@ const MAX_DIAGNOSTIC_LINE_CHARS: usize =
 const DIAGNOSTIC_LINE_TRUNCATION: &str = "… [line truncated]";
 const MAX_DIAGNOSTIC_INLINE_CHARS: usize = 1024;
 const DIAGNOSTIC_INLINE_TRUNCATION: &str = "… [text truncated]";
+
+/// Suggest only one close, actually registered name. Both the candidate set and
+/// edit-distance work are bounded; ties and oversized inventories stay silent.
+pub(crate) fn unique_spelling_candidate<'a>(
+    name: &str,
+    candidates: impl IntoIterator<Item = &'a str>,
+) -> Option<&'a str> {
+    let input = name.chars().take(65).collect::<Vec<_>>();
+    if input.is_empty() || input.len() > 64 {
+        return None;
+    }
+    let candidates = candidates.into_iter().take(257).collect::<Vec<_>>();
+    if candidates.len() > 256 {
+        return None;
+    }
+    let limit = if input.len() >= 8 { 2 } else { 1 };
+    let mut best = None;
+    let mut best_distance = limit + 1;
+    let mut ambiguous = false;
+    for candidate in candidates {
+        let target = candidate.chars().take(65).collect::<Vec<_>>();
+        if target.len() > 64 || input.len().abs_diff(target.len()) > limit {
+            continue;
+        }
+        let mut previous_previous = vec![0; target.len() + 1];
+        let mut previous = (0..=target.len()).collect::<Vec<_>>();
+        let mut current = vec![0; target.len() + 1];
+        for (i, character) in input.iter().enumerate() {
+            current[0] = i + 1;
+            for (j, other) in target.iter().enumerate() {
+                current[j + 1] = (previous[j + 1] + 1)
+                    .min(current[j] + 1)
+                    .min(previous[j] + usize::from(character != other));
+                if i > 0 && j > 0 && input[i] == target[j - 1] && input[i - 1] == target[j] {
+                    current[j + 1] = current[j + 1].min(previous_previous[j - 1] + 1);
+                }
+            }
+            std::mem::swap(&mut previous_previous, &mut previous);
+            std::mem::swap(&mut previous, &mut current);
+        }
+        let distance = previous[target.len()];
+        if distance < best_distance {
+            best_distance = distance;
+            best = Some(candidate);
+            ambiguous = false;
+        } else if distance == best_distance && best != Some(candidate) {
+            ambiguous = true;
+        }
+    }
+    if best_distance <= limit && !ambiguous {
+        best
+    } else {
+        None
+    }
+}
 
 impl fmt::Debug for KuError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -447,6 +523,66 @@ impl KuError {
         self
     }
 
+    pub fn with_diagnostic_note(mut self, note: impl Into<String>) -> Self {
+        let notes = &mut self.context.get_or_insert_with(Default::default).notes;
+        if notes.len() < 8 {
+            notes.push(note.into());
+        }
+        self
+    }
+
+    pub fn with_diagnostic_help(mut self, help: impl Into<String>) -> Self {
+        let helps = &mut self.context.get_or_insert_with(Default::default).helps;
+        if helps.len() < 8 {
+            helps.push(help.into());
+        }
+        self
+    }
+
+    /// A proven location in the diagnostic's own source. Keep optional editor
+    /// metadata behind the existing cold context pointer, not in every KuResult.
+    pub fn with_related_span(mut self, span: Span, message: impl Into<String>) -> Self {
+        let related = &mut self.context.get_or_insert_with(Default::default).related;
+        if related.len() < 4 {
+            related.push(RelatedDiagnostic {
+                file: None,
+                span,
+                message: message.into(),
+            });
+        }
+        self
+    }
+
+    fn related_information(&self, file: &str) -> Vec<RelatedDiagnosticData> {
+        self.context
+            .as_ref()
+            .map(|context| {
+                context
+                    .related
+                    .iter()
+                    .map(|related| {
+                        let line = related.span.start.line.max(1);
+                        let column = related.span.start.column.max(1);
+                        let end_line = related.span.end.line.max(line);
+                        let end_column = if end_line == line {
+                            related.span.end.column.max(column.saturating_add(1))
+                        } else {
+                            related.span.end.column.max(1)
+                        };
+                        RelatedDiagnosticData {
+                            message: related.message.clone(),
+                            file: related.file.as_deref().unwrap_or(file).to_string(),
+                            line,
+                            column,
+                            end_line,
+                            end_column,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn diagnostic_id(&self) -> DiagnosticId {
         self.diagnostic_id
             .unwrap_or_else(|| self.legacy_diagnostic_id())
@@ -484,6 +620,7 @@ impl KuError {
             1
         };
         let marker = diagnostic_marker(column, caret_len);
+        let related_information = self.related_information(file);
         let (message, message_suffix) = diagnostic_inline_preview(&self.message);
         let (file, file_suffix) = diagnostic_inline_preview(file);
 
@@ -496,6 +633,25 @@ impl KuError {
         }
         for help in info.helps {
             output.push_str(&format!("\nhelp: {help}"));
+        }
+        if let Some(context) = &self.context {
+            for note in &context.notes {
+                let (note, suffix) = diagnostic_inline_preview(note);
+                output.push_str(&format!("\n   |\nnote: {note}{suffix}"));
+            }
+            for help in &context.helps {
+                let (help, suffix) = diagnostic_inline_preview(help);
+                output.push_str(&format!("\nhelp: {help}{suffix}"));
+            }
+        }
+        for related in related_information {
+            let (message, suffix) = diagnostic_inline_preview(&related.message);
+            let (file, file_suffix) = diagnostic_inline_preview(&related.file);
+            // Preserve the single primary --> block used by old text clients.
+            output.push_str(&format!(
+                "\nnote: {message}{suffix} at {file}{file_suffix}:{}:{}",
+                related.line, related.column
+            ));
         }
         output
     }
@@ -518,8 +674,27 @@ impl KuError {
             column,
             end_line,
             end_column,
-            notes: info.notes.to_vec(),
-            helps: info.helps.to_vec(),
+            notes: info
+                .notes
+                .iter()
+                .map(|note| (*note).to_string())
+                .chain(
+                    self.context
+                        .iter()
+                        .flat_map(|context| context.notes.iter().cloned()),
+                )
+                .collect(),
+            helps: info
+                .helps
+                .iter()
+                .map(|help| (*help).to_string())
+                .chain(
+                    self.context
+                        .iter()
+                        .flat_map(|context| context.helps.iter().cloned()),
+                )
+                .collect(),
+            related_information: self.related_information(file),
         }
     }
 
