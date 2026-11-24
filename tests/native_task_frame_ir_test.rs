@@ -1843,11 +1843,28 @@ fn blocking_read_preserves_view_and_initializes_only_ready_string_result() {
     let plan = verify_and_plan(&fixture, TaskLimits::default()).unwrap();
     assert!(plan.functions[0].hosted);
     assert!(plan.functions[0].slots.contains(&SlotId(0)));
+    fixture.functions[0].slots[0].ty = TaskSlotType::Value {
+        ty: IrType::Nullable(Box::new(IrType::Str)),
+        borrowed: false,
+    };
+    let plan = verify_and_plan(&fixture, TaskLimits::default()).unwrap();
+    assert!(plan.functions[0].slots.contains(&SlotId(0)));
     fixture.functions[0].slots[1].ty = TaskSlotType::Value {
         ty: result(IrType::Null),
         borrowed: false,
     };
     assert!(verify_and_plan(&fixture, TaskLimits::default()).is_err());
+    fixture.functions[0].slots[1].ty = TaskSlotType::Value {
+        ty: result(IrType::Str),
+        borrowed: false,
+    };
+    for (inner, borrowed) in [(IrType::Int, false), (IrType::Str, true)] {
+        fixture.functions[0].slots[0].ty = TaskSlotType::Value {
+            ty: IrType::Nullable(Box::new(inner)),
+            borrowed,
+        };
+        assert!(verify_and_plan(&fixture, TaskLimits::default()).is_err());
+    }
 }
 
 #[test]
@@ -1873,6 +1890,15 @@ fn blocking_read_dir_preserves_view_and_initializes_only_ready_array_result() {
     let plan = verify_and_plan(&fixture, TaskLimits::default()).unwrap();
     assert!(plan.functions[0].hosted);
     assert!(plan.functions[0].slots.contains(&SlotId(0)));
+    fixture.functions[0].slots[0].ty = TaskSlotType::Value {
+        ty: IrType::Nullable(Box::new(IrType::Str)),
+        borrowed: false,
+    };
+    assert!(verify_and_plan(&fixture, TaskLimits::default()).is_err());
+    fixture.functions[0].slots[0].ty = TaskSlotType::Value {
+        ty: IrType::Str,
+        borrowed: false,
+    };
     fixture.functions[0].slots[1].ty = TaskSlotType::Value {
         ty: result(IrType::Null),
         borrowed: false,

@@ -104,6 +104,98 @@ fn main() {
 }
 
 #[test]
+fn array_edges_have_real_nullable_types_and_retain_inputs() {
+    let source = r#"
+fn main() {
+    empty: [int] = []
+    zero = array.first([0])
+    flag = array.last([false])
+    text = array.first([""])
+    values = ["owned", "last"]
+    first = array.first(values)
+    last = array.last(values)
+    if (array.first(empty) != null || array.last(empty) != null) panic("empty")
+    if (zero == null || flag == null || text == null) panic("sentinel collision")
+    if (zero != null && zero != 0) panic("zero")
+    if (flag != null && flag != false) panic("false")
+    if (text != null && text.len() != 0) panic("empty string")
+    if (first != null && first != "owned") panic("first")
+    if (null != last && last != "last") panic("last")
+    if (values.len() != 2 || values[0] != "owned") panic("input consumed")
+}
+"#;
+    check_source("inline.ku", source).expect("array edges have T|null types");
+    run_source("inline.ku", source).expect("array edge values remain distinct from null");
+}
+
+#[test]
+fn array_nullable_values_flow_through_parameters_returns_and_guards() {
+    let source = r#"
+fn edge(values: [str]): str | null { return array.first(values) }
+fn generic_edge<T>(values: [T]): T | null { return array.first(values) }
+fn size(value: str | null): int {
+    if (value == null) { return -1 }
+    return value.len()
+}
+fn main() {
+    values = ["Ku"]
+    item: str | null = edge(values)
+    if (item != null) {
+        if (item.len() != 2) panic("narrowed string")
+    }
+    if (size(item) != 2) panic("nullable argument")
+    empty: [str] = []
+    if (size(edge(empty)) != -1) panic("nullable return")
+    generic = generic_edge([0])
+    if (generic != null && generic + 1 != 1) panic("generic nullable return")
+}
+"#;
+    check_source("inline.ku", source).expect("nullable parameters and returns check");
+    run_source("inline.ku", source).expect("nullable parameters and returns execute");
+}
+
+#[test]
+fn array_nullable_requires_a_guard_and_assignment_invalidates_it() {
+    for source in [
+        "fn main() { value = array.first([1]); print(value + 1) }",
+        "fn main() { value = array.first([\"x\"]); print(value.len()) }",
+        "fn main() { value: str | null = \"x\"; if (value != null) { value = null; print(value.len()) } }",
+    ] {
+        check_source("inline.ku", source).expect_err("nullable value needs a current null check");
+    }
+    check_source(
+        "inline.ku",
+        "fn main() { value: str | null = \"x\"; if (value != null) { value = null } }",
+    )
+    .expect("refinement does not change nullable assignment storage");
+}
+
+#[test]
+fn nullable_facts_do_not_cross_captured_writes_or_delayed_closures() {
+    for source in [
+        r#"fn main() {
+            value: str | null = "x"
+            reset = () => { value = null }
+            if (value != null) { reset(); print(value.len()) }
+        }"#,
+        r#"fn main() {
+            value: str | null = "x"
+            if (value != null) {
+                later = () => { return value.len() }
+                print(later())
+            }
+        }"#,
+        r#"fn main() {
+            value: str | null = "x"
+            reset = () => { value = null; return true }
+            if (value != null && reset()) { print(value.len()) }
+        }"#,
+    ] {
+        check_source("inline.ku", source).expect_err("captured nullable proof must remain current");
+    }
+}
+
+#[test]
 fn local_function_value_can_shadow_builtin_name() {
     let source = r#"
 fn main() {

@@ -876,6 +876,43 @@ fn main() {
 }
 
 #[test]
+fn matching_an_owned_payload_checks_the_scrutinee_once() {
+    let source = r#"
+enum Report { Ready, Rejected(label: str) }
+fn Parse(label: str): Report { return Report.Rejected(label) }
+fn main(): null! {
+    label = "第 3 行" + "🙂"
+    text = match Parse(label) { Report.Ready => "ok" Report.Rejected(value) => value }
+    if (text != "第 3 行🙂") { fail "lost report label" }
+    return ok(null)
+}
+"#;
+    checks("match-owned-argument.ku", source);
+    run_source("match-owned-argument.ku", source)
+        .expect("an owning scrutinee call should run once");
+}
+
+#[test]
+fn matching_an_awaited_owned_payload_consumes_the_task_once() {
+    let body = r#"
+enum Report { Ready, Rejected(label: str) }
+async fn Parse(): Report! { return ok(Report.Rejected("第 3 行" + "🙂")) }
+async fn main(): null! {
+    pending = Parse()
+    text = match (await pending)? { Report.Ready => "ok" Report.Rejected(value) => value }
+    if (text != "第 3 行🙂") { fail "lost report label" }
+"#;
+    let source = format!("{body}    return ok(null)\n}}\n");
+    checks("match-await-once.ku", &source);
+    run_source("match-await-once.ku", &source).expect("an awaited scrutinee should run once");
+    rejects(
+        "match-await-twice.ku",
+        &format!("{body}    again = (await pending)?\n    return ok(null)\n}}\n"),
+        "error[E0804]: error: task 'pending' has already been awaited",
+    );
+}
+
+#[test]
 fn matching_a_tag_only_enum_does_not_consume_it() {
     // No owned payload is bound, so the enum stays usable.
     checks(
@@ -1622,6 +1659,65 @@ fn main() {
     println(down(2))
 }
 "#,
+    );
+}
+
+#[test]
+fn calling_immutable_helpers_with_data_only_captures_does_not_create_a_cycle() {
+    checks(
+        "local-function-data-helpers-in-loop.ku",
+        r#"
+fn main() {
+    count = 0
+    fn Add(): null { count = count + 1 return null }
+    fn Record(): null { count = count + 1 return null }
+    fn Close(limit: int): null {
+        while (count < limit) { Add() Record() }
+        return null
+    }
+    Close(2)
+    println(count)
+}
+"#,
+    );
+
+    rejects(
+        "local-function-loop-can-write-a-captured-callable.ku",
+        r#"
+fn Noop(): null { return null }
+fn main() {
+    f: fn(): null = Noop
+    current: fn(): null = Noop
+    fn Store(): null { f = current.clone() return null }
+    fn Close(): null {
+        rounds = 1
+        while (rounds > 0) { Store() rounds = rounds - 1 }
+        return null
+    }
+    fn Read(): null { f() return null }
+    current = Read
+    Close()
+}
+"#,
+        "E0904 cannot create closure reference cycle",
+    );
+
+    rejects(
+        "local-function-loop-can-retain-a-callable-argument.ku",
+        r#"
+fn Noop(): null { return null }
+fn main() {
+    f: fn(): null = Noop
+    fn Store(value: fn(): null): null { f = value return null }
+    fn Close(value: fn(): null): null {
+        rounds = 1
+        while (rounds > 0) { Store(value.clone()) rounds = rounds - 1 }
+        return null
+    }
+    Close(() => { f() return null })
+}
+"#,
+        "E0904 cannot create closure reference cycle",
     );
 }
 

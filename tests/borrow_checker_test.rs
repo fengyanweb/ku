@@ -1,4 +1,4 @@
-use ku::cli::check_source;
+use ku::cli::{check_source, run_source};
 
 #[path = "support/bounded_process.rs"]
 pub mod bounded_process;
@@ -215,7 +215,61 @@ fn borrow_checker_same_call_borrow_move_conflicts_are_order_independent() {
 fn borrow_checker_same_call_capture_mutation_and_copy_field() {
     rejects("fn main() { text = \"old\" change = () => { text = \"new\" return \"old\" } println(text.contains(change())) }", "E0916", "borrow conflicts with move or mutation");
     rejects("fn Both(&value: str, n: int) {} fn main() { text = \"Ku\" change = () => { text = \"new\" return 1 } Both(text, change()) }", "E0916", "borrow conflicts with move or mutation");
-    accepts("struct User { name: str, age: int } fn Both(&value: User, age: int) {} fn main() { user = User { name: \"Ku\", age: 1 } Both(user, user.age) }");
+    const COPY_FIELD_CALL_SOURCE: &str = r#"
+struct Profile { flags: int }
+struct User { name: str, profile: Profile, active: bool, score: int | null }
+fn Forward(&user: User, flags: int, score: int | null): int {
+    if (score != null) { panic("nullable Copy field lost its null value") }
+    return user.name.len() + flags
+}
+fn Reverse(flags: int, &name: str, active: bool): int {
+    if (!active) { panic("Copy field read after the View changed the value") }
+    return flags + name.len()
+}
+fn main(): null {
+    user = User { name: "Ku", profile: Profile { flags: 5 }, active: true, score: null }
+    if (Forward(user, user.profile.flags, user.score) != 7) { panic("View before Copy") }
+    if (Reverse(user.profile.flags, user.name, user.active) != 7) { panic("Copy before View") }
+    if (user.name != "Ku") { panic("Copy field arguments consumed their owner") }
+    return null
+}
+"#;
+    accepts(COPY_FIELD_CALL_SOURCE);
+    run_source("borrow-copy-fields.ku", COPY_FIELD_CALL_SOURCE)
+        .expect("Copy fields do not move a borrowed owner");
+}
+
+#[test]
+fn borrow_checker_same_call_indexed_copy_preserves_argument_order() {
+    const COPY_INDEX_CALL_SOURCE: &str = r#"
+struct Item { label: str, count: int | null }
+fn Read(&items: [Item], count: int | null): int {
+    if (count != null) { panic("null lost") }
+    return items.len()
+}
+fn Forward(value: int, &numbers: [int]): int { return value + numbers[1] }
+fn Mark(&numbers: [int], index: int): int { return numbers[index] }
+fn main(): null {
+    numbers = [1, 2, 8, 3]
+    calls = 0
+    next = (): int => { calls += 1 return calls - 1 }
+    if (Mark(numbers, numbers[next()]) != 2) { panic("View before index") }
+    if (Forward(numbers[next()], numbers) != 4) { panic("index before View") }
+    if (calls != 2 || numbers[0] != 1) { panic("index evaluated more than once or owner consumed") }
+    items = [Item { label: "Ku", count: 0 }, Item { label: "data", count: null }]
+    if (Read(items, items[1].count) != 2 || items[0].label != "Ku") { panic("nested index") }
+    return null
+}
+"#;
+    accepts(COPY_INDEX_CALL_SOURCE);
+    run_source("borrow-copy-index.ku", COPY_INDEX_CALL_SOURCE)
+        .expect("indexed Copy reads preserve a shared View");
+
+    rejects(
+        r#"fn Take(&items: [str], owned: str) {} fn main() { items = ["Ku"] Take(items, items[0]) }"#,
+        "E0916",
+        "borrow conflicts with move or mutation",
+    );
 }
 
 #[test]
@@ -313,6 +367,30 @@ fn main(): null! {
         "E0901",
         "use of moved value",
     );
+}
+
+#[test]
+fn unicode_transforms_borrow_input_and_return_independent_strings() {
+    let source = include_str!("fixtures/native_string_view_transforms/main.ku");
+    accepts(source);
+    run_source("borrow-unicode-transforms.ku", source).expect("namespace and method both borrow");
+}
+
+#[test]
+fn unicode_transform_names_preserve_enum_and_object_calls() {
+    let source = r#"
+enum Choice { trim(value: str) }
+fn main() {
+    value = Choice.trim("enum")
+    string = { trim: (): str => "custom" }
+    if (str(value) != "Choice.trim(enum)" || string.trim() != "custom") {
+        panic("read-only dispatch intercepted a different call")
+    }
+}
+"#;
+    accepts(source);
+    run_source("borrow-unicode-transform-names.ku", source)
+        .expect("non-string calls still resolve");
 }
 
 #[test]
