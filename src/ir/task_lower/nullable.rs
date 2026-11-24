@@ -175,13 +175,12 @@ impl FunctionLowerer<'_> {
                 .unwrap_or_else(|| self.expression(tested, depth + 1)),
             _ => self.expression(tested, depth + 1),
         }?;
-        if !matches!(
-            self.function.slots[source.0].ty,
-            TaskSlotType::Value {
-                ty: IrType::Nullable(_),
-                ..
-            }
-        ) {
+        // A dynamic JSON value can contain null without having a statically
+        // nullable IR type. Inspect its tag at runtime, just like the wrapper's
+        // null bit, rather than folding every Named value to non-null.
+        if !matches!(&self.function.slots[source.0].ty,
+            TaskSlotType::Value { ty, .. } if matches!(ty, IrType::Nullable(_)) || task::json_value_type(ty))
+        {
             return self
                 .constant(
                     TaskConstant::Bool(

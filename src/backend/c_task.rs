@@ -3834,9 +3834,16 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                         self.set_init(out, *dst, true);
                     }
                     TaskCollectionOperation::NullableIsNull => {
-                        let source = self
-                            .place(source.ok_or_else(|| unsupported("nullable predicate source"))?);
-                        out.push_str(&format!("  {destination}={source}.is_null;\n"));
+                        let source_slot =
+                            source.ok_or_else(|| unsupported("nullable predicate source"))?;
+                        let source = self.place(source_slot);
+                        let predicate =
+                            if crate::ir::task::json_value_type(self.slot_type(source_slot)?) {
+                                format!("({source}.tag==KU_NULL)")
+                            } else {
+                                format!("{source}.is_null")
+                            };
+                        out.push_str(&format!("  {destination}={predicate};\n"));
                         self.set_init(out, *dst, true);
                     }
                     TaskCollectionOperation::NullableViewEnd => {

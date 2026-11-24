@@ -1429,7 +1429,7 @@ fn validate_shape(
                             matches!(source, Some((IrType::Nullable(inner),false)) if destination == inner.as_ref() && !destination_borrowed && other.is_none())
                         }
                         TaskCollectionOperation::NullableIsNull => {
-                            matches!(source, Some((source,false)) if (nullable_leaf(source) || nullable_record(source)) && destination == &IrType::Bool && !destination_borrowed && other.is_none())
+                            matches!(source, Some((source,false)) if (nullable_leaf(source) || nullable_record(source) || json_value_type(source)) && destination == &IrType::Bool && !destination_borrowed && other.is_none())
                         }
                     };
                     if !valid {
