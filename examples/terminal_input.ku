@@ -1,0 +1,5 @@
+fn main(): null! {
+    name = input("请输入名字：")?
+    println("你好，" + name + "！")
+    return ok(null)
+}

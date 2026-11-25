@@ -6,6 +6,20 @@
 ku run examples/hello.ku
 ```
 
+## 终端输入
+
+把 [`terminal_input.ku`](terminal_input.ku) 复制到任意工作目录，用支持 `input` 的 Ku 安装版执行：
+
+```sh
+ku run terminal_input.ku
+ku build --release terminal_input.ku -o greet
+./greet
+ku build --release --backend runner terminal_input.ku -o greet-runner
+./greet-runner
+```
+
+看到 `请输入名字：` 后在同一行键入 `小明` 并回车，程序会输出 `你好，小明！`。直接回车得到空字符串，输入结束时没有剩余字符则得到 `input.eof`。管道也可送入数据，例如 `printf '小明\r\n' | ./greet`。多值输入和整数模板见 [终端输入](../docs-site/guide/getting-started.md#终端输入)。
+
 ## JSON 编码与解析
 
 `json.ku` 是真实可运行的 `std.json` 示例，包含中文、emoji、引号、反斜杠、换行、内嵌 NUL、数字、bool、null 与嵌套数组；编码后继续使用原对象，解码后读取字段并参与整数运算，再捕获非法 JSON 的错误与 UTF-8 字节位置。
