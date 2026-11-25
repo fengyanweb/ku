@@ -1528,7 +1528,11 @@ impl Checker {
                         let args = input::direct_call(call).expect("direct input call");
                         if let [argument] = args {
                             if let Some(template) = input::template(argument)? {
-                                return self.check_input_destructure(names, template, values[0].span);
+                                return self.check_input_destructure(
+                                    names,
+                                    template,
+                                    values[0].span,
+                                );
                             }
                         }
                     }
