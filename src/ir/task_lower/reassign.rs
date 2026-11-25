@@ -163,7 +163,8 @@ pub(super) fn sync_candidate(
                     | Literal::Float(_)
                     | Literal::Bool(_)
                     | Literal::Null
-                    | Literal::String(_),
+                    | Literal::String(_)
+                    | Literal::InputTemplate(_),
                 ) => {}
                 ExprKind::Literal(Literal::TemplateString(_)) => return Ok(true),
             },

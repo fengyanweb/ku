@@ -6,12 +6,20 @@ use crate::span::Span;
 use super::{Expr, ExprKind, Literal};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 pub enum Field {
     Text,
     Int,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 pub struct Template {
     /// Text before each field, followed by the final suffix.
     pub(crate) segments: Vec<String>,
@@ -48,7 +56,19 @@ pub(crate) fn prepare_argument(argument: &mut Expr) {
 
 pub(crate) fn template(argument: &Expr) -> KuResult<Option<&Template>> {
     match &argument.kind {
-        ExprKind::Literal(Literal::InputTemplate(plan)) => Ok(Some(plan)),
+        ExprKind::Literal(Literal::InputTemplate(plan)) => {
+            // A packaged Runner also reconstructs this AST from its embedded data.
+            if plan.fields.is_empty()
+                || plan.fields.len() > MAX_FIELDS
+                || plan.segments.len() != plan.fields.len() + 1
+            {
+                return Err(KuError::parse(
+                    "invalid input template layout",
+                    argument.span,
+                ));
+            }
+            Ok(Some(plan))
+        }
         ExprKind::Literal(Literal::TemplateString(raw)) => {
             // Valid fill templates have already been prepared by the parser.
             let _ = parse_template(raw, argument.span)?;

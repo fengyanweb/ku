@@ -18,7 +18,7 @@ ku build --release --backend runner terminal_input.ku -o greet-runner
 ./greet-runner
 ```
 
-看到 `请输入名字：` 后在同一行键入 `小明` 并回车，程序会输出 `你好，小明！`。直接回车得到空字符串，输入结束时没有剩余字符则得到 `input.eof`。管道也可送入数据，例如 `printf '小明\r\n' | ./greet`。多值输入和整数模板见 [终端输入](../docs-site/guide/getting-started.md#终端输入)。
+看到 `请输入名字：` 后在同一行键入 `小明` 并回车，程序会输出 `你好，小明！`。直接回车得到空字符串，输入结束时没有剩余字符则得到 `input.eof`。管道也可送入数据，例如 `printf '小明\r\n' | ./greet`。多值输入和整数模板见 [读取用户输入](../docs-site/guide/getting-started.md#读取用户输入)。
 
 ## JSON 编码与解析
 
