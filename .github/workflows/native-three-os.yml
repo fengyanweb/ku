@@ -2,6 +2,7 @@ name: Native three-OS gate
 
 on:
   push:
+    branches-ignore: ['codex/ku-input-01-installed-ci']
     tags-ignore: ['**']
   pull_request:
   workflow_dispatch:

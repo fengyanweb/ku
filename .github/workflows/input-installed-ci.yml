@@ -1,0 +1,40 @@
+name: Ku installed terminal input
+run-name: Installed terminal input · 825e89f2
+
+on:
+  push:
+    branches: [codex/ku-input-01-installed-ci]
+
+permissions:
+  contents: read
+
+jobs:
+  installed:
+    name: Installed input ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 24
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu, python: python3}
+          - {runner: windows-2025, target: x86_64-pc-windows-msvc, python: python}
+          - {runner: windows-2025, target: x86_64-pc-windows-gnu, python: python}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: 825e89f20ee5ffd46c06f43abd60629a15d5cd94
+          path: input-product
+          persist-credentials: false
+      - name: Build, verify and use the private SDK with the exact product checkout
+        shell: pwsh
+        run: |
+          & ${{ matrix.python }} -B .github/scripts/verify-input-installed.py `
+            --repo input-product `
+            --commit 825e89f20ee5ffd46c06f43abd60629a15d5cd94 `
+            --target '${{ matrix.target }}' `
+            --work-root (Join-Path $env:RUNNER_TEMP 'ku-input-825e89f2')
+          exit $LASTEXITCODE
