@@ -237,8 +237,8 @@ def verify_installed(repo, commit, target, work, env, ku, suffix):
     cwd.mkdir()
     doctor = json.loads(invoke([str(ku), "doctor", "--backend", "runner", "--json"], cwd, env).stdout)
     assert doctor["ready"] and doctor["installation_mode"] == "release-bundle", doctor
-    assert Path(doctor["installation_root"]).resolve() == ku.parent, doctor
-    assert Path(doctor["runtime_rlib"]).resolve() == ku.with_name("libku.rlib"), doctor
+    assert os.path.samefile(doctor["installation_root"], ku.parent), doctor
+    assert os.path.samefile(doctor["runtime_rlib"], ku.with_name("libku.rlib")), doctor
     assert doctor["runtime_source_commit"] == commit, doctor
     installed = json.loads(ku.with_name("ku-runtime.json").read_text(encoding="utf-8"))
     assert doctor["bundle_id"] == installed["bundle_id"] and installed["host"] == target, doctor
